@@ -16,6 +16,8 @@ export interface AcpToolState {
   output?: string
   isError: boolean
   done: boolean
+  /** Internal calls (for example a "think" tool) that should not become cards. */
+  hidden?: boolean
 }
 
 const MAX_OUTPUT = 32_000
@@ -31,6 +33,22 @@ function literal(value: unknown): string | undefined {
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
+}
+
+/** codex-acp reports the file path of a read call here instead of in `rawInput`. */
+function locationPath(update: SessionUpdate) {
+  const locations = Array.isArray(update.locations) ? update.locations : []
+  for (const item of locations) {
+    const path = firstText(record(item)?.path)
+    if (path) return path
+  }
+  return undefined
+}
+
+/** codex-acp streams shell and read output through `_meta` rather than `content`. */
+function terminalOutputDelta(update: SessionUpdate) {
+  const data = record(record(update._meta)?.terminal_output_delta)?.data
+  return typeof data === "string" ? data : undefined
 }
 
 function firstText(...values: unknown[]): string | undefined {
@@ -69,9 +87,9 @@ function toolName(kind: string | undefined, title: string | undefined): string {
   }
 }
 
-function normalize(name: string, raw: Record<string, unknown>) {
+function normalize(name: string, raw: Record<string, unknown>, fallbackPath?: string) {
   const input: Record<string, unknown> = { ...raw }
-  const path = firstText(raw.path, raw.file_path, raw.filePath, raw.file)
+  const path = firstText(raw.path, raw.file_path, raw.filePath, raw.file) ?? fallbackPath
   const command = commandOf(raw.command) ?? firstText(raw.cmd, raw.shell_command)
   const workdir = firstText(raw.workdir, raw.cwd, raw.working_directory)
   switch (name) {
@@ -113,15 +131,7 @@ function normalize(name: string, raw: Record<string, unknown>) {
 }
 
 /** Human-readable output from an ACP tool update, bounded for the card. */
-function outputOf(update: SessionUpdate): string | undefined {
-  const raw = update.rawOutput
-  if (typeof raw === "string") return clip(raw)
-  const rawRecord = record(raw)
-  if (rawRecord) {
-    const value = firstText(rawRecord.output, rawRecord.stdout, rawRecord.text, rawRecord.result, rawRecord.content)
-    if (value) return clip(value)
-  }
-  const content = update.content
+function textFromContent(content: unknown): string | undefined {
   if (!Array.isArray(content)) return undefined
   const parts: string[] = []
   for (const item of content) {
@@ -140,7 +150,25 @@ function outputOf(update: SessionUpdate): string | undefined {
       parts.push([path, oldText && `-${oldText}`, newText && `+${newText}`].filter(Boolean).join("\n"))
     }
   }
-  return parts.length ? clip(parts.join("\n")) : undefined
+  return parts.length ? parts.join("\n") : undefined
+}
+
+function outputOf(update: SessionUpdate): string | undefined {
+  const raw = update.rawOutput
+  if (typeof raw === "string") return clip(raw)
+  const rawRecord = record(raw)
+  if (rawRecord) {
+    const value = firstText(rawRecord.output, rawRecord.stdout, rawRecord.text, rawRecord.result, rawRecord.content)
+    if (value) return clip(value)
+    // MCP tool results arrive as `{ result: { content: [{ type: "text", text }] } }`.
+    const result = record(rawRecord.result)
+    if (result) {
+      const nested = firstText(result.output, result.stdout, result.text) ?? textFromContent(result.content)
+      if (nested) return clip(nested)
+    }
+  }
+  const content = textFromContent(update.content)
+  return content ? clip(content) : undefined
 }
 
 function clip(value: string) {
@@ -173,11 +201,40 @@ export function applyToolUpdate(update: SessionUpdate, states: Map<string, AcpTo
   const existing = states.get(id)
   if (existing?.done) return undefined
   const kind = text(update.kind) ?? existing?.kind
+  // `think` calls (for example codex's Guardian Review) are internal reasoning,
+  // not actions on the workspace, and their raw input is not card-friendly.
+  // Remember the id so later updates cannot surface the call as a generic card.
+  if (existing?.hidden) return undefined
+  if (!existing && kind === "think") {
+    states.set(id, {
+      id,
+      name: "tool",
+      kind,
+      input: {},
+      status: "completed",
+      isError: false,
+      done: true,
+      hidden: true,
+    })
+    return undefined
+  }
   const title = text(update.title) ?? existing?.title
   const status = text(update.status) ?? existing?.status ?? "pending"
   const raw = record(update.rawInput)
-  const name = existing?.name ?? toolName(kind, title)
-  const input = raw ? normalize(name, raw) : { ...(existing?.input ?? {}) }
+  const isMcpCall = record(update._meta)?.is_mcp_tool_call === true
+  const name = existing?.name ?? (isMcpCall ? "shell" : toolName(kind, title))
+  const path = locationPath(update)
+  const input = raw ? normalize(name, raw, path) : { ...(existing?.input ?? {}) }
+  if (path && !input.path) input.path = path
+  if (isMcpCall && raw) {
+    // OpenCode's generic tool card has no detail view, so render the bridge call
+    // as a console card where the command names the MCP tool and its arguments.
+    const server = firstText(raw.server) ?? "mcp"
+    const tool = firstText(raw.tool) ?? title ?? "tool"
+    const args = record(raw.arguments)
+    const rendered = args && Object.keys(args).length ? ` ${JSON.stringify(args)}` : ""
+    input.command = `mcp.${server}.${tool}${rendered}`
+  }
   if (name === "edit" && input.oldString === undefined) {
     // Agents that send no edit fields in `rawInput` still report the change as
     // a diff, which is what the edit card renders.
@@ -188,6 +245,8 @@ export function applyToolUpdate(update: SessionUpdate, states: Map<string, AcpTo
       if (diff.newText !== undefined) input.newString = diff.newText
     }
   }
+  const delta = terminalOutputDelta(update)
+  const streamed = delta === undefined ? existing?.output : clip(`${existing?.output ?? ""}${delta}`)
   const state: AcpToolState = {
     id,
     name,
@@ -197,7 +256,7 @@ export function applyToolUpdate(update: SessionUpdate, states: Map<string, AcpTo
     status,
     isError: status === "failed",
     done: status === "completed" || status === "failed",
-    output: outputOf(update) ?? existing?.output,
+    output: outputOf(update) ?? streamed,
   }
   states.set(id, state)
   return state

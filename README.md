@@ -149,6 +149,9 @@ builtin tool registers the background work itself, so the ACP parent is woken by
 `<subagent>` message when the child goes idle. Passing `sessionID` back to `subagent` steers the
 running child or starts a new run in it.
 
+Calls to these bridge tools appear as console-style cards with a `mcp.<server>.<tool>` command, its
+JSON arguments, and the result, because OpenCode's generic tool card has no detail view.
+
 The wrapped builtin tools assert their own permissions (`subagent`, `question`, `todowrite`,
 `skill`, `artifact`). The `session_*` tools are normally client-only, so they assert a `session`
 permission with the target session id as the resource. Reads default to the calling session; reading
