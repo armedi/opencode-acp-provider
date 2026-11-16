@@ -155,7 +155,73 @@ The wrapped builtin tools assert their own permissions (`subagent`, `question`, 
 `todowrite` only appears when `experimental.todo` is enabled, and the artifact tools only when
 `experimental.artifacts` is enabled; otherwise they are omitted from `tools/list`. ACP agents should
 have their own subagent/task and ask-user tools disabled in the agent's configuration so
-orchestration and questions route through OpenCode instead.
+orchestration and questions route through OpenCode instead. See
+[Disabling native orchestration tools](#disabling-native-orchestration-tools).
+
+### Disabling native orchestration tools
+
+ACP agents keep their own tools, including subagents and ask-user prompts. Disable those in the
+agent's own configuration so delegation and questions route through the MCP bridge instead of a
+second hidden agent loop.
+
+| Server | What to disable | How |
+| --- | --- | --- |
+| Claude Code | `Task`, `AskUserQuestion` | `meta.claudeCode.options.disallowedTools` |
+| Codex | native agents, request-user-input | `CODEX_CONFIG='{"agents":{"enabled":false},"tools":{"experimental_request_user_input":{"enabled":false}}}'` |
+| Command Code (`cmd`) | `agent`, `agent_output` (and optionally `ask_user_question`) | load a mod with `cmd acp --mod …` |
+
+Claude Code:
+
+```jsonc
+{
+  "id": "claude",
+  "command": ["claude-agent-acp"],
+  "meta": {
+    "claudeCode": {
+      "options": { "disallowedTools": ["Task", "AskUserQuestion"] }
+    }
+  }
+}
+```
+
+Codex:
+
+```jsonc
+{
+  "id": "codex",
+  "command": ["codex-acp"],
+  "env": {
+    "CODEX_CONFIG": "{\"agents\":{\"enabled\":false},\"tools\":{\"experimental_request_user_input\":{\"enabled\":false}}}"
+  }
+}
+```
+
+Command Code has no equivalent setting key. Its docs mark the `agent` tool as always allowed, so a
+`permissions.deny` rule cannot block it. Use the companion mod at
+[`agents/cmd/no-native-subagent.ts`](agents/cmd/no-native-subagent.ts), which removes the tools from
+the model's schema and refuses any call that still arrives:
+
+```jsonc
+{
+  "id": "cmd",
+  "name": "Command Code (ACP)",
+  "command": [
+    "cmd",
+    "acp",
+    "--mod",
+    "/absolute/path/to/opencode-acp/agents/cmd/no-native-subagent.ts"
+  ]
+}
+```
+
+`--mod` is a global `cmd` flag, accepted by `cmd acp` even though `cmd acp --help` does not list it.
+Add `"ask_user_question"` to the mod's `DISABLED` set if questions should route through OpenCode
+too. The mod filters only the active tool list, so other `cmd` mods keep their tools, commands, and
+hooks. Verify with a prompt such as "call the agent tool with subagent_type explore": the agent no
+longer sees that tool and should report it as unavailable rather than delegating.
+
+Companion files live under [`agents/`](agents/README.md), one directory per server id. Add a new
+directory there when another agent needs a file of its own.
 
 Transport defaults to stdio because ACP requires it and some adapters (notably `codex-acp`) drop
 injected HTTP servers. The stdio entry runs `mcp-bridge.mjs` with `node` from `PATH`; set
