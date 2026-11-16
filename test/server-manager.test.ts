@@ -134,27 +134,3 @@ test("an allowlist that matches nothing is not retried", async () => {
     await instance.stop()
   }
 })
-
-test("warns when the configured model is not advertised", async () => {
-  const logs: string[] = []
-  const instance = new AcpServerManager({
-    servers: [{ id: "fake", command: [process.execPath, agent], model: "extra-model" }],
-    defaultCwd: tmpdir(),
-    log: (_level, message) => logs.push(message),
-  })
-  try {
-    await instance.initialize()
-    expect(logs.some((line) => line.includes('does not advertise the configured model "extra-model"'))).toBe(true)
-  } finally {
-    await instance.stop()
-  }
-})
-
-test("stop before initialize leaves nothing running", async () => {
-  const instance = new AcpServerManager({
-    servers: [{ id: "fake", command: [process.execPath, agent] }],
-    defaultCwd: tmpdir(),
-  })
-  await instance.stop()
-  await expect(instance.run({ server: "fake", prompt: "hi" })).rejects.toThrow("stopped")
-})

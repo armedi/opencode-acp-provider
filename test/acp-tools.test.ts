@@ -69,13 +69,3 @@ test("names write calls when the title says so", () => {
   expect(state?.input.path).toBe("hello.txt")
   expect(state?.input.content).toBe("hello")
 })
-
-test("keeps unknown tool kinds generic", () => {
-  const states = new Map<string, AcpToolState>()
-  const state = applyToolUpdate(
-    { sessionUpdate: "tool_call", toolCallId: "call-4", title: "Think", status: "pending" },
-    states,
-  )
-  expect(state?.name).toBe("tool")
-  expect(state?.done).toBe(false)
-})

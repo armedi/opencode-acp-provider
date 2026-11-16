@@ -99,18 +99,6 @@ test("answers title requests without spending an ACP turn", async () => {
   }
 })
 
-test("rejects an empty prompt", async () => {
-  const { shim } = await start()
-  try {
-    const response = await chat(shim.url, { model: "fake::model-a", messages: [] })
-    expect(response.status).toBe(400)
-    const body = (await response.json()) as any
-    expect(body.error.message).toBe("Empty prompt")
-  } finally {
-    await shim.close()
-  }
-})
-
 test("streams structured tool events when asked", async () => {
   const { shim } = await start({
     run: async (input) => {

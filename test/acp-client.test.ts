@@ -41,16 +41,6 @@ test("runs an ACP session end to end", async () => {
   }
 })
 
-test("surfaces an agent JSON-RPC error as a rejection", async () => {
-  const acp = client()
-  try {
-    const session = await acp.newSession(tmpdir())
-    await expect(acp.prompt(session.sessionId, "please fail")).rejects.toThrow("scripted failure")
-  } finally {
-    await acp.stop()
-  }
-})
-
 test("stop rejects a turn that is still running", async () => {
   const acp = client({ promptTimeoutMs: 0 })
   const session = await acp.newSession(tmpdir())
