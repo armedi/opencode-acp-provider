@@ -4,6 +4,7 @@
 
 const endpoint = process.env.OPENCODE_MCP_URL
 const token = process.env.OPENCODE_MCP_TOKEN
+const timeoutMs = Number(process.env.OPENCODE_MCP_TIMEOUT_MS ?? 10 * 60_000)
 
 if (!endpoint || !token) {
   process.stderr.write("mcp-bridge: OPENCODE_MCP_URL and OPENCODE_MCP_TOKEN are required\n")
@@ -15,12 +16,26 @@ let protocolVersion = null
 let buffer = ""
 const aborters = new Map()
 
+process.stdout.on("error", (error) => {
+  process.stderr.write(`mcp-bridge: stdout failed: ${error.message}\n`)
+  process.exit(1)
+})
+process.stderr.on("error", () => process.exit(1))
+
 function write(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`)
 }
 
 function log(message) {
   process.stderr.write(`mcp-bridge: ${message}\n`)
+}
+
+function signalWithTimeout(external) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return external
+  if (typeof AbortSignal.timeout !== "function") return external
+  const timeout = AbortSignal.timeout(timeoutMs)
+  if (typeof AbortSignal.any !== "function") return external ?? timeout
+  return external ? AbortSignal.any([external, timeout]) : timeout
 }
 
 async function post(message, signal) {
@@ -36,7 +51,7 @@ async function post(message, signal) {
     method: "POST",
     headers,
     body: JSON.stringify(message),
-    signal,
+    signal: signalWithTimeout(signal),
   })
   sessionId = response.headers.get("mcp-session-id") ?? sessionId
   if (!response.ok) {
@@ -128,6 +143,7 @@ process.stdin.on("data", (chunk) => {
   }
 })
 process.stdin.on("end", () => process.exit(0))
+process.stdin.on("close", () => process.exit(0))
 process.stdin.on("error", (error) => {
   log(error.message)
   process.exit(1)

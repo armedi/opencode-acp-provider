@@ -7,6 +7,8 @@ export interface AcpLanguageModelOptions {
   model: string
   /** Base URL of the chat-completions shim, e.g. `http://127.0.0.1:1234/v1`. */
   url: string
+  /** Bearer token required by the shim, when it enforces one. */
+  token?: string
   log?: Log
 }
 
@@ -35,6 +37,7 @@ export function createAcpLanguageModel(options: AcpLanguageModelOptions) {
           "content-type": "application/json",
           // Ask the shim for structured tool events instead of inline markers.
           "x-acp-tool-events": "1",
+          ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
           ...(sessionID ? { "x-opencode-session-id": sessionID } : {}),
         },
         body: JSON.stringify({
@@ -78,6 +81,8 @@ export function createAcpLanguageModel(options: AcpLanguageModelOptions) {
         else if (part.type === "finish") {
           finishReason = part.finishReason?.unified ?? "stop"
           usage = part.usage
+        } else if (part.type === "error") {
+          throw part.error instanceof Error ? part.error : new Error(String(part.error))
         }
       }
       return {
@@ -288,6 +293,7 @@ function translate(body: ReadableStream<Uint8Array>, log?: Log) {
       }
     }
     let failed = false
+    let failure: unknown
     try {
       for (;;) {
         const { done, value } = await reader.read()
@@ -314,37 +320,67 @@ function translate(body: ReadableStream<Uint8Array>, log?: Log) {
       }
     } catch (error) {
       failed = true
+      failure = error
       log?.("warn", `acp language model stream failed: ${error instanceof Error ? error.message : String(error)}`)
-      push({ type: "error", error })
     } finally {
       closeText()
       closeReasoning()
-      reader.releaseLock()
-    }
-    if (!failed) {
-      // Some agents finish a turn without a terminal status for a tool. Settle
-      // it here so the card cannot stay stuck in the streaming state.
-      for (const [id, current] of tools) {
-        if (current.settled) continue
-        if (!current.called) {
-          callTool(id, current, {})
-          current.called = true
-        }
-        settleTool(id, current, false)
-        current.settled = true
+      try {
+        reader.releaseLock()
+      } catch {
+        // the stream was already cancelled
       }
     }
-    push({ type: "finish", finishReason: { unified: unifiedReason(reason), raw: reason }, usage })
+    // Settle every tool even when the turn was interrupted, so a cancelled or
+    // failed turn cannot leave a card stuck in the streaming state.
+    for (const [id, current] of tools) {
+      if (current.settled) continue
+      if (!current.called) {
+        callTool(id, current, {})
+        current.called = true
+      }
+      settleTool(id, current, failed)
+      current.settled = true
+    }
+    if (!failed) {
+      push({ type: "finish", finishReason: { unified: unifiedReason(reason), raw: reason }, usage })
+    } else {
+      push({ type: "error", error: failure })
+    }
   }
 
+  let closed = false
   return new ReadableStream<any>({
     start(controller) {
-      void pump((part) => controller.enqueue(part)).then(
-        () => controller.close(),
-        (error) => controller.error(error),
-      )
+      const push = (part: any) => {
+        if (closed) return
+        try {
+          controller.enqueue(part)
+        } catch {
+          closed = true
+        }
+      }
+      const finish = () => {
+        if (closed) return
+        closed = true
+        try {
+          controller.close()
+        } catch {
+          // cancelled by the consumer
+        }
+      }
+      void pump(push).then(finish, (error) => {
+        if (closed) return
+        closed = true
+        try {
+          controller.error(error)
+        } catch {
+          // cancelled by the consumer
+        }
+      })
     },
     cancel(reason) {
+      closed = true
       void reader.cancel(reason).catch(() => {})
     },
   })

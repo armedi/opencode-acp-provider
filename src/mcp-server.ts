@@ -12,6 +12,7 @@ const MCP_PROTOCOL_VERSION = "2025-06-18"
 const MAX_BODY_BYTES = 4 * 1024 * 1024
 const MAX_CONTEXT_CHARS = 60_000
 const TOKEN_IDLE_MS = 2 * 60 * 60_000
+const TOKEN_EVICT_MIN_IDLE_MS = 60_000
 const MAX_TOKENS = 256
 
 const SUBAGENT_DESCRIPTION = [
@@ -102,8 +103,10 @@ const stringSchema = (description?: string) => ({ type: "string", ...(descriptio
 export async function createMcpServer(options: McpServerOptions): Promise<McpServerHandle> {
   const { ctx, log = () => {} } = options
   const transport = options.transport ?? "stdio"
-  const version = options.version ?? "0.4.0"
+  const version = options.version ?? "0.5.0"
   const tokens = new Map<string, TokenEntry>()
+  /** In-flight tool calls, so `notifications/cancelled` can abort them. */
+  const inFlight = new Map<number | string, AbortController>()
   const bridgePath = fileURLToPath(new URL("./mcp-bridge.mjs", import.meta.url))
   let loggedTools = false
 
@@ -182,8 +185,14 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
 
   function issue(sessionKey: string): McpLease {
     if (tokens.size >= MAX_TOKENS) {
-      const oldest = [...tokens.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0]
+      // Only drop a token that has not been used recently; evicting a live one
+      // would break the agent's MCP connection mid-session.
+      const cutoff = Date.now() - TOKEN_EVICT_MIN_IDLE_MS
+      const oldest = [...tokens.entries()]
+        .filter(([, entry]) => entry.lastUsed <= cutoff)
+        .sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0]
       if (oldest) tokens.delete(oldest[0])
+      else log("warn", `MCP token cap reached (${MAX_TOKENS}); issuing an extra token`)
     }
     const token = randomUUID()
     tokens.set(token, { sessionKey, lastUsed: Date.now() })
@@ -268,13 +277,28 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
 
     const messages = Array.isArray(payload) ? payload : [payload]
     const responses: unknown[] = []
+    const scope = auth.token
     for (const message of messages) {
       if (!message || typeof message !== "object") continue
       if (message.id === undefined || message.id === null) {
+        if (message.method === "notifications/cancelled") {
+          const requestId = message.params?.requestId
+          if (requestId !== undefined && requestId !== null) inFlight.get(`${scope}:${requestId}`)?.abort()
+          continue
+        }
         await dispatch(message, auth.sessionKey, controller.signal).catch(() => undefined)
         continue
       }
-      responses.push(await dispatch(message, auth.sessionKey, controller.signal))
+      const requestController = new AbortController()
+      const requestKey = `${scope}:${message.id}`
+      inFlight.set(requestKey, requestController)
+      try {
+        responses.push(
+          await dispatch(message, auth.sessionKey, combineSignals(controller.signal, requestController.signal)),
+        )
+      } finally {
+        inFlight.delete(requestKey)
+      }
     }
 
     if (!responses.length) {
@@ -296,15 +320,16 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
 
     try {
       switch (message.method) {
-        case "initialize":
+        case "initialize": {
+          // Only claim the version we actually implement.
+          const requested =
+            typeof message.params?.protocolVersion === "string" ? message.params.protocolVersion : undefined
           return reply({
-            protocolVersion:
-              typeof message.params?.protocolVersion === "string"
-                ? message.params.protocolVersion
-                : MCP_PROTOCOL_VERSION,
+            protocolVersion: requested === MCP_PROTOCOL_VERSION ? requested : MCP_PROTOCOL_VERSION,
             capabilities: { tools: { listChanged: false } },
             serverInfo: { name: "opencode", version },
           })
+        }
         case "ping":
           return reply({})
         case "tools/list": {
@@ -359,6 +384,8 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
     async close() {
       clearInterval(sweeper)
       tokens.clear()
+      for (const controller of inFlight.values()) controller.abort()
+      inFlight.clear()
       await new Promise<void>((resolve) => {
         server.close(() => resolve())
         server.closeAllConnections?.()
@@ -385,6 +412,9 @@ async function buildTools(ctx: Ctx, sessionKey: string): Promise<McpTool[]> {
 
   const invoke = async (tool: any, args: any, signal: AbortSignal) => {
     const session = await ctx.session.get({ sessionID: sessionKey }).catch(() => undefined)
+    // The public plugin API exposes tool.execute, not the session's tool
+    // pipeline, so `execute.before`/`after` hooks do not run for MCP-originated
+    // calls. The wrapped builtins assert their own permissions.
     const context = {
       sessionID: sessionKey,
       agent: session?.agent ?? "build",
@@ -514,13 +544,19 @@ async function buildTools(ctx: Ctx, sessionKey: string): Promise<McpTool[]> {
         subpath: stringSchema("Filter by subpath."),
         cursor: stringSchema("Paging cursor."),
       }),
-      call: async (args) => toMcpResult(await ctx.session.list(args ?? {})),
+      call: async (args, signal) => {
+        await assertList(ctx, sessionKey, signal)
+        return toMcpResult(await ctx.session.list(args ?? {}))
+      },
     },
     {
       name: "session_get",
       description: "Read one session's status and metadata. Defaults to the calling session.",
       inputSchema: objectSchema({ sessionID: stringSchema("Session ID. Omit for the calling session.") }),
-      call: async (args) => toMcpResult(await ctx.session.get({ sessionID: args?.sessionID ?? sessionKey })),
+      call: async (args, signal) => {
+        const sessionID = await readTarget(ctx, sessionKey, args?.sessionID, "get", signal)
+        return toMcpResult(await ctx.session.get({ sessionID }))
+      },
     },
     {
       name: "session_prompt",
@@ -548,8 +584,9 @@ async function buildTools(ctx: Ctx, sessionKey: string): Promise<McpTool[]> {
       name: "session_context",
       description: "Read a session's messages. Defaults to the calling session. Large timelines are truncated to the most recent items.",
       inputSchema: objectSchema({ sessionID: stringSchema("Session ID. Omit for the calling session.") }),
-      call: async (args) => {
-        const messages = await ctx.session.context({ sessionID: args?.sessionID ?? sessionKey })
+      call: async (args, signal) => {
+        const sessionID = await readTarget(ctx, sessionKey, args?.sessionID, "context", signal)
+        const messages = await ctx.session.context({ sessionID })
         return toMcpResult(boundContext(messages))
       },
     },
@@ -563,18 +600,23 @@ async function buildTools(ctx: Ctx, sessionKey: string): Promise<McpTool[]> {
         },
         ["sessionID"],
       ),
-      call: async (args) => {
-        const sessionID = String(args.sessionID)
+      call: async (args, signal) => {
+        const sessionID = await readTarget(ctx, sessionKey, args.sessionID, "wait", signal)
         const requested = Number(args.timeoutMs ?? 45_000)
         const timeout = requested > 0 ? Math.min(requested, 120_000) : 45_000
         const wait = ctx.session.wait({ sessionID })
+        let timer: ReturnType<typeof setTimeout> | undefined
         const outcome = await Promise.race([
           wait.then(() => "done" as const),
           new Promise<"timeout">((resolve) => {
-            const timer = setTimeout(() => resolve("timeout"), timeout)
+            timer = setTimeout(() => resolve("timeout"), timeout)
             timer.unref?.()
           }),
-        ])
+          waitForAbort(signal),
+        ]).finally(() => {
+          if (timer) clearTimeout(timer)
+        })
+        if (outcome === "cancelled") throw new Error("session wait cancelled")
         const timedOut = outcome === "timeout"
         const info = await ctx.session.get({ sessionID }).catch(() => undefined)
         return toMcpResult({ sessionID, session: info, waitTimedOut: timedOut })
@@ -621,8 +663,63 @@ async function assertSession(ctx: Ctx, caller: string, target: any, operation: s
     } as any)
   } catch (error) {
     if (signal.aborted) throw error
-    throw new Error(`Permission denied: session ${operation} on ${target}`)
+    const message = error instanceof Error && error.message ? `: ${error.message}` : ""
+    throw new Error(`Permission denied: session ${operation} on ${target}${message}`)
   }
+}
+
+/** Listing spans sessions, so it needs an explicit permission of its own. */
+async function assertList(ctx: Ctx, caller: string, signal: AbortSignal) {
+  try {
+    await ctx.permission.assert({
+      sessionID: caller as any,
+      action: "session",
+      resources: ["*"],
+      metadata: { operation: "list" },
+    } as any)
+  } catch (error) {
+    if (signal.aborted) throw error
+    const message = error instanceof Error && error.message ? `: ${error.message}` : ""
+    throw new Error(`Permission denied: session list${message}`)
+  }
+}
+
+/** Reads default to the calling session; another session needs a permission check. */
+async function readTarget(
+  ctx: Ctx,
+  caller: string,
+  requested: unknown,
+  operation: string,
+  signal: AbortSignal,
+) {
+  const target = typeof requested === "string" && requested ? requested : caller
+  if (target !== caller) await assertSession(ctx, caller, target, operation, signal)
+  return target
+}
+
+function waitForAbort(signal: AbortSignal): Promise<"cancelled"> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve("cancelled")
+      return
+    }
+    signal.addEventListener("abort", () => resolve("cancelled"), { once: true })
+  })
+}
+
+function combineSignals(...signals: AbortSignal[]): AbortSignal {
+  if (signals.length === 1) return signals[0]!
+  const anyOf = (AbortSignal as unknown as { any?: (list: AbortSignal[]) => AbortSignal }).any
+  if (typeof anyOf === "function") return anyOf(signals)
+  const controller = new AbortController()
+  for (const signal of signals) {
+    if (signal.aborted) {
+      controller.abort(signal.reason)
+      break
+    }
+    signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true })
+  }
+  return controller.signal
 }
 
 function toMcpResult(value: any) {
@@ -661,16 +758,27 @@ function readBody(req: IncomingMessage, maxBytes: number) {
   return new Promise<string>((resolve, reject) => {
     const chunks: Buffer[] = []
     let size = 0
+    let settled = false
     req.on("data", (chunk) => {
+      if (settled) return
       size += chunk.length
       if (size > maxBytes) {
+        settled = true
         reject(new Error("Request body too large"))
         req.destroy()
         return
       }
       chunks.push(Buffer.from(chunk))
     })
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")))
-    req.on("error", reject)
+    req.on("end", () => {
+      if (settled) return
+      settled = true
+      resolve(Buffer.concat(chunks).toString("utf8"))
+    })
+    req.on("error", (error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    })
   })
 }

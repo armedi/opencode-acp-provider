@@ -51,6 +51,8 @@ export interface AcpServerState {
   effortConfigID?: string
   defaultEffort?: string
   error?: string
+  /** False when retrying cannot help, e.g. a `models` allowlist that matches nothing. */
+  retryable?: boolean
   initialized: boolean
 }
 
@@ -111,12 +113,14 @@ interface PooledSession {
   server: string
   key: string
   sessionId: string
+  client: AcpClient
   model?: string
   effort?: string
   cwd: string
   queue: Promise<unknown>
   lastUsed: number
   pending: number
+  broken: boolean
   mcpRelease?: () => void
 }
 
@@ -129,6 +133,9 @@ const DEFAULT_MAX_SESSIONS = 32
 const DEFAULT_SESSION_IDLE_MS = 30 * 60_000
 const DEFAULT_INIT_TIMEOUT_MS = 20_000
 const SWEEP_INTERVAL_MS = 60_000
+/** Do not evict a session that was created or used this recently, so a turn that is
+ * between negotiation and its first `pending` increment cannot be closed under it. */
+const EVICT_MIN_IDLE_MS = 1_000
 
 export class AcpServerManager {
   readonly servers = new Map<string, AcpServerState>()
@@ -144,9 +151,11 @@ export class AcpServerManager {
   private maxSessions: number
   private sessionIdleMs: number
   private initTimeoutMs: number
+  private requestTimeoutMs?: number
   private promptTimeoutMs?: number
   private allowPathsOutsideCwd: boolean
   private maxFileBytes?: number
+  private disposed = false
 
   constructor(input: {
     servers: AcpServerConfig[]
@@ -156,6 +165,7 @@ export class AcpServerManager {
     mcp?: McpProvider
     log?: LogFn
     initTimeoutMs?: number
+    requestTimeoutMs?: number
     promptTimeoutMs?: number
     maxSessions?: number
     sessionIdleMs?: number
@@ -168,6 +178,7 @@ export class AcpServerManager {
     this.mcp = input.mcp
     this.log = input.log ?? (() => {})
     this.initTimeoutMs = input.initTimeoutMs ?? DEFAULT_INIT_TIMEOUT_MS
+    this.requestTimeoutMs = input.requestTimeoutMs
     this.promptTimeoutMs = input.promptTimeoutMs
     this.maxSessions = Math.max(1, input.maxSessions ?? DEFAULT_MAX_SESSIONS)
     this.sessionIdleMs = Math.max(0, input.sessionIdleMs ?? DEFAULT_SESSION_IDLE_MS)
@@ -243,6 +254,7 @@ export class AcpServerManager {
 
   /** Start every enabled agent, read its model inventory, and keep it ready. */
   async initialize() {
+    if (this.disposed) return
     await Promise.all(
       this.list.map(async (state) => {
         try {
@@ -263,15 +275,27 @@ export class AcpServerManager {
 
   /** Re-run discovery, e.g. after a server failed to start during setup. */
   async refresh(state: AcpServerState) {
-    const inFlight = this.preparing.get(state.config.id)
-    if (inFlight) await inFlight.catch(() => {})
-    if (state.initialized && state.models.length) return
-    state.initialized = false
-    state.error = undefined
-    await this.prepare(state)
+    if (this.disposed) throw new Error("ACP server manager is stopped")
+    const id = state.config.id
+    const work = (async () => {
+      const inFlight = this.preparing.get(id)
+      if (inFlight) await inFlight.catch(() => {})
+      if (state.initialized && state.models.length) return
+      if (this.disposed) throw new Error("ACP server manager is stopped")
+      state.initialized = false
+      state.error = undefined
+      await this.prepare(state)
+    })()
+    try {
+      await withTimeout(work, this.initTimeoutMs, `ACP server "${id}" did not initialize within ${this.initTimeoutMs}ms`)
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error)
+      throw error
+    }
   }
 
   private prepare(state: AcpServerState): Promise<void> {
+    if (this.disposed) return Promise.reject(new Error("ACP server manager is stopped"))
     if (state.initialized) return Promise.resolve()
     const id = state.config.id
     const existing = this.preparing.get(id)
@@ -286,6 +310,7 @@ export class AcpServerManager {
 
   private async doPrepare(state: AcpServerState) {
     const config = state.config
+    if (this.disposed) throw new Error("ACP server manager is stopped")
     const { command, args } = normalizeCommand(config.command)
     const env: Record<string, string> = { ...config.env }
     if (config.credential) {
@@ -294,6 +319,7 @@ export class AcpServerManager {
       if (value && name) env[name] = value
       if (!value) this.log("warn", `no credential found for integration "${config.credential}"; starting "${config.id}" unauthenticated`)
     }
+    if (this.disposed) throw new Error("ACP server manager is stopped")
 
     const previous = state.client
     if (previous) {
@@ -307,6 +333,7 @@ export class AcpServerManager {
       cwd: config.cwd ?? this.defaultCwd,
       env,
       autoApprove: config.autoApprove !== false,
+      requestTimeoutMs: this.requestTimeoutMs,
       promptTimeoutMs: this.promptTimeoutMs,
       allowPathsOutsideCwd: this.allowPathsOutsideCwd,
       maxFileBytes: this.maxFileBytes,
@@ -317,15 +344,32 @@ export class AcpServerManager {
       },
     })
     state.client = client
+    state.retryable = true
 
     try {
       const session = await client.newSession(config.cwd ?? this.defaultCwd, {
         model: config.model,
         meta: config.meta,
       })
+      if (this.disposed) throw new Error("ACP server manager is stopped")
       let models = session.models
       if (!models.length) models = await this.fallbackModels(config, env)
-      if (config.models?.length) models = models.filter((model) => config.models!.includes(model.id))
+      if (config.models?.length) {
+        const allow = new Set(config.models)
+        models = models.filter((model) => allow.has(model.id))
+        if (!models.length) {
+          state.retryable = false
+          throw new Error(
+            `ACP server "${config.id}" advertised no model matching "models" (${config.models.join(", ")})`,
+          )
+        }
+      }
+      if (config.model && models.length && !models.some((model) => model.id === config.model)) {
+        this.log(
+          "warn",
+          `ACP server "${config.id}" does not advertise the configured model "${config.model}"; it will be sent anyway`,
+        )
+      }
       state.models = models
       state.defaultModel = session.currentModel
       state.efforts = (session.efforts ?? []).filter((value) => value !== "default")
@@ -351,6 +395,7 @@ export class AcpServerManager {
     try {
       const { stdout } = await execFileAsync(command, [...args, "--list-models"], {
         timeout: 15_000,
+        cwd: config.cwd ?? this.defaultCwd,
         env: { ...process.env, ...env },
       })
       const models: AcpModelInfo[] = []
@@ -443,12 +488,14 @@ export class AcpServerManager {
           server: input.server,
           key: input.key!,
           sessionId: session.sessionId,
+          client,
           model,
           effort,
           cwd,
           queue: Promise.resolve(),
           lastUsed: Date.now(),
           pending: 0,
+          broken: false,
           mcpRelease: lease?.release,
         }
         this.pools.set(poolKey, created)
@@ -462,16 +509,17 @@ export class AcpServerManager {
       negotiating.finally(() => this.negotiating.delete(poolKey)).catch(() => {})
     }
     const { pooled, reused } = await negotiating
+    if (pooled.broken || this.pools.get(poolKey) !== pooled) {
+      throw new Error(`ACP session for key ${input.key.slice(0, 24)} was closed after an earlier turn failed`)
+    }
 
     const prompt =
       typeof input.prompt === "string" ? input.prompt : reused ? input.prompt.reused : input.prompt.fresh
     pooled.lastUsed = Date.now()
     pooled.pending += 1
     const run = pooled.queue.then(() => {
-      // The client can be replaced if the agent restarts while this turn is queued.
-      const active = state.client
-      if (!active) throw new Error(`ACP server "${input.server}" is not ready`)
-      return active.prompt(pooled.sessionId, prompt, {
+      if (pooled.broken) throw new Error(`ACP session ${pooled.sessionId} is no longer usable`)
+      return pooled.client.prompt(pooled.sessionId, prompt, {
         onUpdate: input.onUpdate,
         signal: input.signal,
         requestPermission: onPermission,
@@ -490,11 +538,13 @@ export class AcpServerManager {
       .catch(() => {})
     run.catch(() => {
       // A failed turn can leave the ACP session unusable; recreate it next time.
-      if (this.pools.get(poolKey) === pooled) {
-        this.pools.delete(poolKey)
-        pooled.mcpRelease?.()
-        void client.closeSession(pooled.sessionId).catch(() => {})
-      }
+      // Queued turns on this pool notice `broken` and fail instead of prompting
+      // a session that has already been closed.
+      pooled.broken = true
+      if (this.pools.get(poolKey) !== pooled) return
+      this.pools.delete(poolKey)
+      pooled.mcpRelease?.()
+      void pooled.client.closeSession(pooled.sessionId).catch(() => {})
     })
     return run
   }
@@ -507,14 +557,16 @@ export class AcpServerManager {
 
   private evictForCapacity() {
     if (this.pools.size < this.maxSessions) return
+    const cutoff = Date.now() - EVICT_MIN_IDLE_MS
     const candidates = [...this.pools.entries()]
-      .filter(([, pooled]) => pooled.pending === 0)
+      .filter(([, pooled]) => pooled.pending === 0 && pooled.lastUsed <= cutoff)
       .sort((left, right) => left[1].lastUsed - right[1].lastUsed)
     for (const [key, pooled] of candidates) {
       if (this.pools.size < this.maxSessions) break
       this.pools.delete(key)
+      pooled.broken = true
       pooled.mcpRelease?.()
-      void this.get(pooled.server)?.client?.closeSession(pooled.sessionId).catch(() => {})
+      void pooled.client.closeSession(pooled.sessionId).catch(() => {})
       this.log("debug", `evicted idle ACP session ${pooled.sessionId} (capacity ${this.maxSessions})`)
     }
   }
@@ -524,8 +576,9 @@ export class AcpServerManager {
     for (const [key, pooled] of this.pools) {
       if (pooled.pending > 0 || pooled.lastUsed > cutoff) continue
       this.pools.delete(key)
+      pooled.broken = true
       pooled.mcpRelease?.()
-      void this.get(pooled.server)?.client?.closeSession(pooled.sessionId).catch(() => {})
+      void pooled.client.closeSession(pooled.sessionId).catch(() => {})
       this.log("debug", `closed idle ACP session ${pooled.sessionId} after ${this.sessionIdleMs}ms`)
     }
   }
@@ -536,13 +589,15 @@ export class AcpServerManager {
     for (const [key, pooled] of this.pools) {
       if (!key.startsWith(prefix)) continue
       this.pools.delete(key)
+      pooled.broken = true
       pooled.mcpRelease?.()
-      closed.push(this.get(pooled.server)?.client?.closeSession(pooled.sessionId) ?? Promise.resolve())
+      closed.push(pooled.client.closeSession(pooled.sessionId))
     }
     await Promise.allSettled(closed)
   }
 
   async stop() {
+    this.disposed = true
     if (this.sweeper) clearInterval(this.sweeper)
     this.sweeper = undefined
     this.preparing.clear()
@@ -552,8 +607,9 @@ export class AcpServerManager {
     // Best effort: the agents are killed below, so do not wait on a close
     // handshake that could hang shutdown.
     for (const pooled of pools) {
+      pooled.broken = true
       pooled.mcpRelease?.()
-      void this.get(pooled.server)?.client?.closeSession(pooled.sessionId).catch(() => {})
+      void pooled.client.closeSession(pooled.sessionId).catch(() => {})
     }
     await Promise.allSettled([...this.servers.values()].map((state) => state.client?.stop()))
   }

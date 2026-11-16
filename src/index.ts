@@ -1,4 +1,5 @@
 import { Model, Plugin, Provider } from "@opencode/plugin"
+import { randomUUID } from "node:crypto"
 import { AcpServerManager, type AcpServerConfig, type AcpServerState } from "./server-manager.ts"
 import { createShim } from "./shim.ts"
 import { createAcpLanguageModel } from "./language-model.ts"
@@ -33,6 +34,8 @@ interface AcpPluginOptions {
   outputLimit?: number
   /** How long to wait for one agent to initialize. Defaults to 20 seconds. */
   initTimeoutMs?: number
+  /** Timeout for ACP handshake and control calls such as `session/new`. Defaults to 15 seconds. */
+  requestTimeoutMs?: number
   /** How long one ACP turn may run. Defaults to 30 minutes. */
   promptTimeoutMs?: number
   /** Show ACP tool calls as inline transcript lines when the server cannot render native tool cards. Defaults to "inline"; "off" hides them. */
@@ -59,12 +62,14 @@ export default Plugin.define({
     if (!servers.length) return
 
     const levels: LogLevel[] = ["debug", "info", "warn", "error"]
-    const minLevel = options.logLevel ? levels.indexOf(options.logLevel) : 1
+    const minLevel =
+      options.logLevel && levels.includes(options.logLevel) ? levels.indexOf(options.logLevel) : 1
     const debugEnabled = levels.indexOf("debug") >= minLevel
     const log = (level: LogLevel, message: string) => {
       if (levels.indexOf(level) < minLevel) return
       debugLog(level, message)
-      console.log(`[acp] ${level}: ${message}`)
+      const write = level === "error" ? console.error : console.log
+      write(`[acp] ${level}: ${message}`)
     }
     debugLog("info", "setup started")
     const setupStartedAt = Date.now()
@@ -95,6 +100,7 @@ export default Plugin.define({
       log,
       mcp: mcp ? { servers: (sessionKey) => mcp!.issue(sessionKey) } : undefined,
       initTimeoutMs: options.initTimeoutMs,
+      requestTimeoutMs: options.requestTimeoutMs,
       maxSessions: options.maxSessions,
       sessionIdleMs: options.sessionIdleMs,
       allowPathsOutsideCwd: options.allowPathsOutsideCwd === true,
@@ -128,6 +134,7 @@ export default Plugin.define({
 
     const contextLimit = options.contextLimit ?? 200_000
     const outputLimit = options.outputLimit ?? 32_000
+    const shimToken = randomUUID()
 
     let disposed = false
     const retryTimers = new Set<ReturnType<typeof setTimeout>>()
@@ -188,7 +195,7 @@ export default Plugin.define({
               // ACP tool calls can surface as native OpenCode tool parts.
               package: nativeToolParts ? "aisdk:acp" : "@opencode/ai/providers/openai-compatible",
               compatibility: { reasoningField: "reasoning_content" },
-              settings: { baseURL: shim.url, apiKey: "acp" },
+              settings: { baseURL: shim.url, apiKey: shimToken },
             },
             models,
           })
@@ -200,7 +207,7 @@ export default Plugin.define({
     }
 
     const scheduleRetry = (state: AcpServerState, attempt: number) => {
-      if (attempt >= RETRY_DELAYS.length || disposed) return
+      if (attempt >= RETRY_DELAYS.length || disposed || state.retryable === false) return
       const timer = setTimeout(() => {
         retryTimers.delete(timer)
         void (async () => {
@@ -235,59 +242,86 @@ export default Plugin.define({
       return { server, model }
     }
 
-    const shim = await createShim({
-      manager,
-      resolveModel,
-      includeSystem: options.includeSystem === true,
-      localTitles: options.localTitles !== false,
-      historyTurns: options.historyTurns,
-      historyChars: options.historyChars,
-      maxBodyBytes: options.maxBodyBytes,
-      debugEnabled,
-      log,
-    })
-
-    // Reserve provider ids in configuration order so a server that succeeds
-    // late cannot steal the id of one that already registered.
-    for (const state of manager.list) providerIDForServer(state.config.id)
-
-    await manager.initialize()
-
-    for (const state of manager.list) {
-      if (await registerProvider(state)) continue
-      log("warn", `deferring provider for ACP server "${state.config.id}": no models available yet`)
-      scheduleRetry(state, 0)
+    let shim: Awaited<ReturnType<typeof createShim>>
+    try {
+      shim = await createShim({
+        manager,
+        resolveModel,
+        token: shimToken,
+        includeSystem: options.includeSystem === true,
+        localTitles: options.localTitles !== false,
+        toolCallDisplay: options.toolCallDisplay,
+        historyTurns: options.historyTurns,
+        historyChars: options.historyChars,
+        maxBodyBytes: options.maxBodyBytes,
+        debugEnabled,
+        log,
+      })
+    } catch (error) {
+      await manager.stop().catch(() => {})
+      await mcp?.close().catch(() => {})
+      throw error
     }
 
-    // Supply the ACP language model to OpenCode's AI SDK layer. Tool calls the
-    // agent runs itself come back as provider-executed parts, so the session
-    // shows the real shell/read/edit card without routing the tool.
-    const acpProviderIDs = new Set(providerIDs.values())
-    if (nativeToolParts) {
-      registrations.push(
-        await ctx.aisdk.hook("sdk", (evt) => {
-          if (evt.package !== "acp") return
-          if (!acpProviderIDs.has(evt.model.providerID as string)) return
-          const target = resolveModel(String(evt.model.modelID ?? ""))
-          if (!target) return
-          evt.sdk = {
-            languageModel: () =>
-              createAcpLanguageModel({ server: target.server, model: target.model, url: shim.url, log }),
-          }
-        }),
-      )
-    }
-
-    log("info", `registered ${registered.size} ACP provider(s) in ${Date.now() - setupStartedAt}ms`)
-
-    return async () => {
+    const cleanup = async () => {
       disposed = true
       for (const timer of retryTimers) clearTimeout(timer)
       retryTimers.clear()
       for (const registration of registrations) await registration.dispose().catch(() => {})
-      await manager.stop().catch(() => {})
+      // Close the shim first so a late request cannot start an agent while the
+      // manager is shutting down.
       await shim.close().catch(() => {})
+      await manager.stop().catch(() => {})
       await mcp?.close().catch(() => {})
+    }
+
+    try {
+      // Reserve provider ids in configuration order so a server that succeeds
+      // late cannot steal the id of one that already registered.
+      for (const state of manager.list) providerIDForServer(state.config.id)
+
+      await manager.initialize()
+
+      for (const state of manager.list) {
+        if (await registerProvider(state)) continue
+        if (state.retryable === false) {
+          log("error", `ACP server "${state.config.id}" cannot be registered: ${state.error ?? "no models available"}`)
+          continue
+        }
+        log("warn", `deferring provider for ACP server "${state.config.id}": no models available yet`)
+        scheduleRetry(state, 0)
+      }
+
+      // Supply the ACP language model to OpenCode's AI SDK layer. Tool calls the
+      // agent runs itself come back as provider-executed parts, so the session
+      // shows the real shell/read/edit card without routing the tool.
+      const acpProviderIDs = new Set(providerIDs.values())
+      if (nativeToolParts) {
+        registrations.push(
+          await ctx.aisdk.hook("sdk", (evt) => {
+            if (evt.package !== "acp") return
+            if (!acpProviderIDs.has(evt.model.providerID as string)) return
+            const target = resolveModel(String(evt.model.modelID ?? ""))
+            if (!target) return
+            evt.sdk = {
+              languageModel: () =>
+                createAcpLanguageModel({
+                  server: target.server,
+                  model: target.model,
+                  url: shim.url,
+                  token: shimToken,
+                  log,
+                }),
+            }
+          }),
+        )
+      }
+
+      log("info", `registered ${registered.size} ACP provider(s) in ${Date.now() - setupStartedAt}ms`)
+      return cleanup
+    } catch (error) {
+      await cleanup()
+      throw error
     }
   },
 })

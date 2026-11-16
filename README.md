@@ -42,7 +42,7 @@ The plugin is a local package. Point OpenCode at the absolute path in your `open
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "/Users/armedi.armedi/repos/github.com/armedi/opencode-acp",
+      "package": "/absolute/path/to/opencode-acp",
       "options": {
         "logLevel": "info",
         "servers": [
@@ -132,10 +132,10 @@ The tools are 1:1 wrappers over OpenCode's own tools and session APIs:
 | `todowrite` | builtin `todowrite` |
 | `skill` | builtin `skill` |
 | `artifact_create` / `artifact_read` / `artifact_update` / `artifact_delete` | builtin artifact tools |
-| `session_list` | `session.list` |
+| `session_list` | `session.list` (requires a `session` permission for `*`) |
 | `session_get` | `session.get` (defaults to the calling session) |
 | `session_prompt` | `session.prompt` (`delivery: "steer"` joins a running turn; `"queue"` follows up) |
-| `session_context` | `session.context` (bounded to recent items) |
+| `session_context` | `session.context` (defaults to the calling session; bounded to recent items) |
 | `session_wait` | `session.wait` (timeout does not cancel the session) |
 | `session_interrupt` | `session.interrupt` |
 
@@ -145,8 +145,10 @@ builtin tool registers the background work itself, so the ACP parent is woken by
 running child or starts a new run in it.
 
 The wrapped builtin tools assert their own permissions (`subagent`, `question`, `todowrite`,
-`skill`, `artifact`). The `session_*` tools are normally client-only, so `session_prompt` and
-`session_interrupt` assert a `session` permission with the target session id as the resource:
+`skill`, `artifact`). The `session_*` tools are normally client-only, so they assert a `session`
+permission with the target session id as the resource. Reads default to the calling session; reading
+another session, `session_wait`, `session_prompt`, and `session_interrupt` require permission for that
+session id, and `session_list` asserts resource `*`:
 
 ```jsonc
 { "action": "session", "resource": "*", "effect": "allow" }
@@ -263,7 +265,8 @@ Plugin options:
 | `maxBodyBytes` | Largest chat-completions body the shim accepts. Defaults to `33554432` (32 MB). |
 | `contextLimit` | Context window advertised for ACP models. Defaults to `200000`. Tune it to the real window. |
 | `outputLimit` | Output limit advertised for ACP models. Defaults to `32000`. |
-| `initTimeoutMs` | How long one agent may take to initialize. Defaults to `20000`; a failed server is retried in the background. |
+| `initTimeoutMs` | How long one agent may take to initialize. Defaults to `20000`; a failed server is retried in the background, with each retry bounded by the same timeout. |
+| `requestTimeoutMs` | Timeout for the ACP handshake and control calls such as `session/new`. Defaults to `15000`; raise it for agents that start slowly. |
 | `promptTimeoutMs` | How long one ACP turn may run. Defaults to `1800000` (30 minutes); `0` disables the cap. |
 | `toolCallDisplay` | `inline` (default) shows finished ACP tool calls as transcript lines; `off` hides them. ACP agents run tools in their own harness, so these are not native OpenCode tool cards. |
 | `mcp` | Expose OpenCode tools to ACP agents through the MCP bridge. Defaults to `true`. |
@@ -291,16 +294,18 @@ error.
 3. **Shim** turns an OpenAI chat-completions request into one `session/prompt`. Text deltas come from
    `session/update` → `agent_message_chunk` and reasoning from `agent_thought_chunk`; both are
    re-emitted as SSE chunks (`content` and `reasoning_content`).
-4. **Sessions** are keyed by OpenCode's `x-opencode-session` header, model, and reasoning effort,
-   created once and reused, with prompts serialized per session. The reuse decision is made inside
-   the pool, so a retry after a failed turn cannot replay the wrong prompt. Reused sessions receive
-   only the newest user turn; a fresh session receives a short transcript (last 16 turns, capped at
-   8k characters by default) so a restarted agent still sees the conversation without replaying an
-   unbounded history. Idle sessions are closed after 30 minutes and the pool is capped at 32.
+4. **Sessions** are keyed by OpenCode's `x-opencode-session-id` header (falling back to
+   `x-opencode-session`), model, and reasoning effort, created once and reused, with prompts
+   serialized per session. The reuse decision is made inside the pool, so a retry after a failed turn
+   cannot replay the wrong prompt. Reused sessions receive only the newest user turn; a fresh session
+   receives a short transcript (last 16 turns, capped at 8k characters by default) so a restarted
+   agent still sees the conversation without replaying an unbounded history. Idle sessions are
+   closed after 30 minutes and the pool is capped at 32.
 5. **Titles** are answered locally instead of spending an ACP turn on session naming.
 6. **Recovery** is automatic: if an agent process exits, the next turn restarts it and stale pooled
-   sessions are dropped. Every handshake, control call, and turn has a timeout, and a server that
-   fails to start is retried in the background instead of disappearing from the model picker.
+   sessions are dropped. Every handshake, control call, and turn has a timeout, retries are bounded
+   by `initTimeoutMs`, and a server that fails to start is retried in the background instead of
+   disappearing from the model picker.
 7. **Cancellation** is wired to the response connection: stopping a turn sends `session/cancel` to
    the agent and gives it a short grace period to finish.
 
@@ -347,7 +352,13 @@ those models reach an ACP agent through the builtin `subagent` tool (see
   an ACP child must delegate further.
 - `session_context` returns the most recent items up to roughly 60k characters and reports
   `truncated`/`omittedMessages`. `session_wait` accepts a timeout because `session.wait` has none;
-  it defaults to 45s and is capped at 120s so a waiting turn cannot hang forever.
+  it defaults to 45s and is capped at 120s so a waiting turn cannot hang forever. Reads default to
+  the calling session; other sessions need the `session` permission described above.
+- The MCP server and the loopback chat shim are bearer-token protected; the shim token is generated
+  per plugin instance and never written to the log.
+- MCP-originated tool calls are executed through the registered tool's `execute`, so plugin
+  `execute.before`/`execute.after` hooks do not observe them. The wrapped builtins assert their own
+  permissions.
 - The provider does not know per-token pricing, so models are registered with an empty cost list
   (pricing unknown, not free). The agent still reports actual per-turn cost in `usage_update` logs.
   Token counts in the completion are estimated from the response length; context usage comes from
@@ -366,4 +377,5 @@ Files:
 - `src/debug.ts` — optional file log.
 
 There is no build step: OpenCode loads the TypeScript entrypoint directly. Type-check the plugin
-with `bun run typecheck` (or `../../node_modules/.bin/tsc --noEmit`) from this directory.
+with `bun run typecheck` (or `../../node_modules/.bin/tsc --noEmit`) and run the tests with
+`bun test` from this directory.

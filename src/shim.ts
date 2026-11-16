@@ -9,6 +9,8 @@ export interface ShimOptions {
   /** Resolve an OpenAIChat model id to a registered ACP server id. */
   resolveModel: (modelID: string) => { server: string; model: string } | undefined
   log?: (level: "debug" | "info" | "warn" | "error", message: string) => void
+  /** Bearer token clients must present. When omitted the shim is unauthenticated. */
+  token?: string
   /** Include OpenCode's system message in the ACP prompt. Defaults to false. */
   includeSystem?: boolean
   /** Answer OpenCode's session-title requests locally. Defaults to true. */
@@ -36,7 +38,7 @@ interface HistoryLimits {
 }
 
 const DEFAULT_HISTORY_TURNS = 16
-const DEFAULT_HISTORY_CHARS = 8_000
+const DEFAULT_HISTORY_CHARS = 8_192
 const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024
 const COMPACTION_LIMITS: HistoryLimits = { turns: 10_000, chars: 4_000_000 }
 
@@ -85,13 +87,13 @@ function lastUserPrompt(messages: ChatMessage[], includeSystem: boolean) {
 }
 
 function sessionKey(req: IncomingMessage, body: any): string | undefined {
+  // x-opencode-session-id is the session itself; x-opencode-session is the
+  // affinity/root session (parent or fork source), so it must come second.
   for (const name of [
-    "x-opencode-session",
     "x-opencode-session-id",
+    "x-opencode-session",
     "x-session-id",
-    "x-session",
     "x-session-affinity",
-    "x-request-id",
   ]) {
     const value = req.headers[name]
     if (typeof value === "string" && value) return value
@@ -196,11 +198,27 @@ export async function createShim(options: ShimOptions) {
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES
   const localTitles = options.localTitles !== false
   const toolCallDisplay = options.toolCallDisplay !== "off"
+  const token = options.token
   let loggedRequest = false
+  let loggedOneOff = false
+
+  const authorized = (req: IncomingMessage) => {
+    if (!token) return true
+    const header = req.headers.authorization
+    if (typeof header !== "string") return false
+    const separator = header.indexOf(" ")
+    return separator > 0 && header.slice(0, separator).toLowerCase() === "bearer" && header.slice(separator + 1).trim() === token
+  }
 
   const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     res.on("error", () => {})
     const url = (req.url ?? "").split("?")[0]
+
+    if (!authorized(req)) {
+      res.writeHead(401, { "content-type": "application/json", "www-authenticate": "Bearer" })
+      res.end(JSON.stringify({ error: { message: "Unauthorized", type: "invalid_request_error" } }))
+      return
+    }
 
     if (req.method === "GET" && (url === "/v1/models" || url === "/models")) {
       const data = manager.list.flatMap((state) =>
@@ -330,6 +348,10 @@ export async function createShim(options: ShimOptions) {
     }
 
     const key = sessionKey(req, body)
+    if (!key && !loggedOneOff) {
+      loggedOneOff = true
+      log("warn", "no OpenCode session header on the shim request; ACP sessions will not be reused and MCP tools are unavailable")
+    }
     // The AI SDK provider asks for structured tool events so OpenCode can
     // render native tool cards; the OpenAI-compatible route keeps inline lines.
     const structuredTools = req.headers["x-acp-tool-events"] === "1"
@@ -373,6 +395,14 @@ export async function createShim(options: ShimOptions) {
       })
       writeChunk({ role: "assistant", content: "" })
     }
+
+    // A silent agent turn can otherwise trip a client-side chunk timeout.
+    const heartbeat = stream
+      ? setInterval(() => {
+          if (!res.destroyed && !res.writableEnded) res.write(": keep-alive\n\n")
+        }, 15_000)
+      : undefined
+    heartbeat?.unref?.()
 
     let emitted = ""
     let reasoning = ""
@@ -507,6 +537,8 @@ export async function createShim(options: ShimOptions) {
         res.write("data: [DONE]\n\n")
         res.end()
       }
+    } finally {
+      if (heartbeat) clearInterval(heartbeat)
     }
   }
 

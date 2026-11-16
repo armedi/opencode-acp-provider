@@ -1,7 +1,11 @@
-import { appendFile, stat, writeFile } from "node:fs/promises"
+import { appendFile, chmod, stat, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
-const FILE = process.env.ACP_PLUGIN_LOG ?? "/tmp/opencode-acp.log"
+const FILE = process.env.ACP_PLUGIN_LOG ?? join(tmpdir(), "opencode-acp.log")
 const MAX_BYTES = 10 * 1024 * 1024
+// Agent stderr can contain credentials, so keep the file private to this user.
+const FILE_MODE = 0o600
 
 let queue: Promise<void> = Promise.resolve()
 let bytes = 0
@@ -18,12 +22,13 @@ export function debugLog(scope: string, message: string) {
       if (!measured) {
         measured = true
         bytes = await stat(FILE).then((info) => info.size).catch(() => 0)
+        await chmod(FILE, FILE_MODE).catch(() => {})
       }
       if (bytes + line.length > MAX_BYTES) {
-        await writeFile(FILE, "").catch(() => {})
+        await writeFile(FILE, "", { mode: FILE_MODE }).catch(() => {})
         bytes = 0
       }
-      await appendFile(FILE, line).catch(() => {})
+      await appendFile(FILE, line, { mode: FILE_MODE }).catch(() => {})
       bytes += line.length
     })
     .catch(() => {})

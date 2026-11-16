@@ -152,6 +152,8 @@ const DEFAULT_PROMPT_TIMEOUT_MS = 30 * 60_000
 const DEFAULT_ABORT_GRACE_MS = 5_000
 const DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024
 const MAX_PROTOCOL_BUFFER = 64 * 1024 * 1024
+const MAX_STDERR_BUFFER = 1024 * 1024
+const SIGKILL_DELAY_MS = 2_000
 
 export class AcpError extends Error {
   code: number
@@ -199,10 +201,14 @@ export class AcpClient {
   }
 
   private async doStart(): Promise<AgentHandshake> {
+    const detached = process.platform !== "win32"
     const child = spawn(this.options.command, this.options.args ?? [], {
       cwd: this.options.cwd,
       env: { ...process.env, ...this.options.env },
       stdio: ["pipe", "pipe", "pipe"],
+      // POSIX: give the agent its own process group so wrappers such as
+      // `npx` can be stopped together with the agent they launch.
+      detached,
     })
     this.child = child
     this.closed = false
@@ -227,6 +233,14 @@ export class AcpClient {
       exitWith(new AcpError(`ACP agent exited (code=${code ?? "null"}, signal=${signal ?? "null"})`))
     })
     child.on("error", (error) => exitWith(error))
+    // Writing to an agent that closed stdin emits EPIPE asynchronously; without
+    // a listener that becomes an uncaught exception in the OpenCode process.
+    child.stdin.on("error", (error) => {
+      this.log("warn", `ACP agent stdin failed: ${error.message}`)
+      exitWith(new AcpError(`ACP agent stdin failed: ${error.message}`))
+    })
+    child.stdout.on("error", (error) => exitWith(error))
+    child.stderr.on("error", (error) => this.log("warn", `ACP agent stderr failed: ${error.message}`))
 
     const result = await this.request(
       "initialize",
@@ -295,6 +309,12 @@ export class AcpClient {
 
   private onStderr(chunk: string) {
     this.stderrBuffer += chunk
+    if (this.stderrBuffer.length > MAX_STDERR_BUFFER && this.stderrBuffer.lastIndexOf("\n") < 0) {
+      this.log("debug", this.stderrBuffer.slice(0, 2_000))
+      this.log("debug", `dropping oversized ACP stderr (${this.stderrBuffer.length} bytes without a newline)`)
+      this.stderrBuffer = ""
+      return
+    }
     let index: number
     while ((index = this.stderrBuffer.indexOf("\n")) >= 0) {
       const line = this.stderrBuffer.slice(0, index).trim()
@@ -508,11 +528,18 @@ export class AcpClient {
 
     this.sessions.set(sessionId, { cwd })
 
-    if (options.model && modelOption && options.model !== modelOption.currentValue) {
-      await this.setModel(sessionId, options.model, modelOption.id ?? "model")
-    }
-    if (options.effort && effort && options.effort !== effort.currentValue) {
-      await this.setEffort(sessionId, options.effort, effort.configId)
+    try {
+      if (options.model && modelOption && options.model !== modelOption.currentValue) {
+        await this.setModel(sessionId, options.model, modelOption.id ?? "model")
+      }
+      if (options.effort && effort && options.effort !== effort.currentValue) {
+        await this.setEffort(sessionId, options.effort, effort.configId)
+      }
+    } catch (error) {
+      // The agent already created the session; close it so a rejected model or
+      // effort does not leak an ACP session that nobody can address anymore.
+      await this.closeSession(sessionId).catch(() => {})
+      throw error
     }
 
     return {
@@ -609,11 +636,8 @@ export class AcpClient {
   async closeSession(sessionId: string) {
     this.sessions.delete(sessionId)
     if (this.handshake?.agentCapabilities?.sessionCapabilities?.close === false) {
-      try {
-        this.notify("session/cancel", { sessionId })
-      } catch {
-        // the agent is already gone
-      }
+      // The agent has no close method; dropping our side is all we can do.
+      this.log("debug", `dropping ACP session ${sessionId} (agent does not support session/close)`)
       return
     }
     try {
@@ -642,20 +666,36 @@ export class AcpClient {
     const child = this.child
     this.child = undefined
     if (child) {
-      child.kill()
+      this.killChild(child, "SIGTERM")
       const timer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL")
-      }, 2_000)
+        if (child.exitCode === null && child.signalCode === null) this.killChild(child, "SIGKILL")
+      }, SIGKILL_DELAY_MS)
       timer.unref?.()
+    }
+  }
+
+  /** Kill the agent and, on POSIX, any wrapper it launched in its process group. */
+  private killChild(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals) {
+    if (process.platform !== "win32" && child.pid) {
+      try {
+        process.kill(-child.pid, signal)
+        return
+      } catch {
+        // no process group (not detached, or it already exited)
+      }
+    }
+    try {
+      child.kill(signal)
+    } catch {
+      // already gone
     }
   }
 
   // ---- filesystem methods -------------------------------------------------
 
   private async readTextFile(params: { sessionId?: string; path?: string; line?: number; limit?: number }) {
-    const target = String(params.path ?? "")
+    const target = await this.resolveTarget(params.sessionId, String(params.path ?? ""))
     if (!target) throw new AcpError("fs/read_text_file requires a path", -32602)
-    await this.assertPathAllowed(params.sessionId, target)
     const line = typeof params.line === "number" && params.line > 0 ? Math.floor(params.line) : undefined
     const limit = typeof params.limit === "number" && params.limit > 0 ? Math.floor(params.limit) : undefined
     const maxBytes = this.options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES
@@ -670,35 +710,58 @@ export class AcpClient {
   }
 
   private async writeTextFile(params: { sessionId?: string; path?: string; content?: string }) {
-    const target = String(params.path ?? "")
+    const target = await this.resolveTarget(params.sessionId, String(params.path ?? ""))
     if (!target) throw new AcpError("fs/write_text_file requires a path", -32602)
-    await this.assertPathAllowed(params.sessionId, target)
     await mkdir(dirname(target), { recursive: true })
     await writeFile(target, params.content ?? "", "utf8")
   }
 
-  private async assertPathAllowed(sessionId: string | undefined, target: string) {
-    if (this.options.allowPathsOutsideCwd) return
+  /**
+   * Resolve a path from the agent against the session directory and enforce the
+   * sandbox. Returning the resolved path matters: checking one path and then
+   * reading a relative one would touch the process cwd instead.
+   */
+  private async resolveTarget(sessionId: string | undefined, target: string): Promise<string> {
+    const raw = target.trim()
+    if (!raw) return ""
     const root = sessionId ? this.sessions.get(sessionId)?.cwd : undefined
+    if (this.options.allowPathsOutsideCwd) {
+      return resolve(root ?? process.cwd(), raw)
+    }
     if (!root) {
       throw new AcpError("filesystem access requires a known session root", -32602)
     }
     const resolvedRoot = await realpath(root).catch(() => resolve(root))
-    const resolvedTarget = resolve(resolvedRoot, target)
+    const resolvedTarget = resolve(resolvedRoot, raw)
     if (!isInside(resolvedRoot, resolvedTarget)) {
       throw new AcpError(`Path is outside the session directory: ${target}`, -32602)
     }
-    // Refuse to follow a symlink out of the root when the target already exists.
-    const real = await realpath(resolvedTarget).catch(() => undefined)
+    // Refuse to follow a symlink out of the root. For a path that does not exist
+    // yet, check the deepest existing ancestor: a symlinked parent directory
+    // would otherwise let a write escape even though the file itself is new.
+    const real = (await realpath(resolvedTarget).catch(() => undefined)) ?? (await realpathExistingAncestor(resolvedTarget))
     if (real && !isInside(resolvedRoot, real)) {
       throw new AcpError(`Path resolves outside the session directory: ${target}`, -32602)
     }
+    return resolvedTarget
   }
 }
 
 function isInside(root: string, target: string) {
   const rel = relative(root, target)
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))
+}
+
+/** Resolve the real path of the closest ancestor that exists. */
+async function realpathExistingAncestor(target: string): Promise<string | undefined> {
+  let current = target
+  for (;;) {
+    const real = await realpath(current).catch(() => undefined)
+    if (real) return real
+    const parent = dirname(current)
+    if (parent === current) return undefined
+    current = parent
+  }
 }
 
 async function readLines(path: string, offset: number, limit: number, maxBytes: number) {
