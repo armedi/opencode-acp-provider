@@ -87,6 +87,52 @@ function toolName(kind: string | undefined, title: string | undefined): string {
   }
 }
 
+interface McpCall {
+  server: string
+  tool: string
+  arguments?: Record<string, unknown>
+}
+
+/** Agents name MCP tools as `mcp__server__tool` or `mcp.server.tool`. */
+function parseMcpName(name: string): { server: string; tool: string } | undefined {
+  if (name.startsWith("mcp__")) {
+    const [server, ...rest] = name.slice(5).split("__")
+    const tool = rest.join("__")
+    if (server && tool) return { server, tool }
+  }
+  if (name.startsWith("mcp.")) {
+    const [server, ...rest] = name.slice(4).split(".")
+    const tool = rest.join(".")
+    if (server && tool) return { server, tool }
+  }
+  return undefined
+}
+
+function mcpCall(
+  update: SessionUpdate,
+  raw: Record<string, unknown> | undefined,
+  fallbackTitle?: string,
+): McpCall | undefined {
+  const meta = record(update._meta)
+  if (meta?.is_mcp_tool_call === true && raw) {
+    const server = firstText(raw.server)
+    const tool = firstText(raw.tool)
+    if (server && tool) return { server, tool, arguments: record(raw.arguments) }
+  }
+  const names = [
+    firstText(update.name),
+    firstText(update.title),
+    fallbackTitle,
+    firstText(record(record(meta?.claudeCode)?.toolName)),
+  ]
+  for (const name of names) {
+    if (!name) continue
+    const parsed = parseMcpName(name)
+    if (parsed) return { ...parsed, arguments: raw }
+  }
+  return undefined
+}
+
 function normalize(name: string, raw: Record<string, unknown>, fallbackPath?: string) {
   const input: Record<string, unknown> = { ...raw }
   const path = firstText(raw.path, raw.file_path, raw.filePath, raw.file) ?? fallbackPath
@@ -221,19 +267,21 @@ export function applyToolUpdate(update: SessionUpdate, states: Map<string, AcpTo
   const title = text(update.title) ?? existing?.title
   const status = text(update.status) ?? existing?.status ?? "pending"
   const raw = record(update.rawInput)
-  const isMcpCall = record(update._meta)?.is_mcp_tool_call === true
-  const name = existing?.name ?? (isMcpCall ? "shell" : toolName(kind, title))
+  const mcp = mcpCall(update, raw, existing?.title)
+  const name = existing?.name ?? (mcp ? "shell" : toolName(kind, title))
   const path = locationPath(update)
   const input = raw ? normalize(name, raw, path) : { ...(existing?.input ?? {}) }
   if (path && !input.path) input.path = path
-  if (isMcpCall && raw) {
+  if (mcp) {
     // OpenCode's generic tool card has no detail view, so render the bridge call
     // as a console card where the command names the MCP tool and its arguments.
-    const server = firstText(raw.server) ?? "mcp"
-    const tool = firstText(raw.tool) ?? title ?? "tool"
-    const args = record(raw.arguments)
+    const args = mcp.arguments
     const rendered = args && Object.keys(args).length ? ` ${JSON.stringify(args)}` : ""
-    input.command = `mcp.${server}.${tool}${rendered}`
+    if (rendered) {
+      input.command = `mcp.${mcp.server}.${mcp.tool}${rendered}`
+    } else if (!input.command && (status === "completed" || status === "failed")) {
+      input.command = `mcp.${mcp.server}.${mcp.tool}`
+    }
   }
   if (name === "edit" && input.oldString === undefined) {
     // Agents that send no edit fields in `rawInput` still report the change as

@@ -260,9 +260,11 @@ function translate(body: ReadableStream<Uint8Array>, log?: Log) {
       const input = event.input && typeof event.input === "object" && !Array.isArray(event.input) ? event.input : {}
       const done = event.done === true
       const keys = Object.keys(input)
-      // A path alone is not enough for an edit/write: agents often send the
-      // actual change with the completion update, and the card needs it.
-      const partial = (name === "edit" || name === "write") && keys.length === 1 && "path" in input
+      // Agents stream edit/write input in pieces. Wait for the actual change so
+      // the card is created with its diff instead of a path-only placeholder.
+      const partial =
+        (name === "edit" && (input.oldString === undefined || input.newString === undefined)) ||
+        (name === "write" && input.content === undefined)
       if (!current.called && (done || (keys.length > 0 && !partial))) {
         callTool(event.id, current, input)
         current.called = true

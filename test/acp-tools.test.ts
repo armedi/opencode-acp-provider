@@ -136,6 +136,46 @@ test("renders MCP calls as a console card and reads their result", () => {
   expect(completed?.output).toBe('{"total":9}')
 })
 
+test("renders mcp__ tool names as console cards", () => {
+  const states = new Map<string, AcpToolState>()
+  const pending = applyToolUpdate(
+    {
+      sessionUpdate: "tool_call",
+      toolCallId: "call-mcp",
+      name: "mcp__opencode__models",
+      title: "mcp__opencode__models",
+      kind: "other",
+      status: "pending",
+      rawInput: {},
+    },
+    states,
+  )
+  expect(pending?.name).toBe("shell")
+  // Codex sends arguments with the first update; Claude sends them later.
+  expect(pending?.input.command).toBeUndefined()
+
+  const args = applyToolUpdate(
+    {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call-mcp",
+      rawInput: { query: "claude", limit: 1 },
+    },
+    states,
+  )
+  expect(args?.input.command).toBe('mcp.opencode.models {"query":"claude","limit":1}')
+
+  const completed = applyToolUpdate(
+    {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call-mcp",
+      status: "completed",
+      rawOutput: '{"total":30}',
+    },
+    states,
+  )
+  expect(completed?.output).toBe('{"total":30}')
+})
+
 test("does not surface internal think calls as tool cards", () => {
   const states = new Map<string, AcpToolState>()
   const state = applyToolUpdate(
