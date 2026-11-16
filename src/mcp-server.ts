@@ -23,10 +23,17 @@ const SUBAGENT_DESCRIPTION = [
   "Pass the returned sessionID to continue that specific child conversation. A follow-up to a running child joins its current run.",
 ].join("\n")
 
-const MODELS_DESCRIPTION = [
-  "Search the models available to use. Use this to turn a model name the user mentions into an exact reference for a tool or subagent.",
-  "The model ID must be written as \"providerID/modelID\", optionally with a #variant. Do not guess the ID: look it up here first.",
-  "Your own provider comes first. Include older versions only when needed.",
+const MODELS_DESCRIPTION =
+  "Search the models available to use. Use this to turn a model name the user mentions into an exact reference for a tool that takes a model. Check your own provider first."
+
+const TODOWRITE_DESCRIPTION = [
+  "Create and update a todo list for the current session. The user sees it as your working plan.",
+  "",
+  "Use it proactively when a task has 3 or more distinct steps, or when the user gives several tasks or asks for a todo list. Skip it for a single simple task or a purely conversational request. When in doubt, use it.",
+  "",
+  "- Send the full list on every call; it replaces the previous one.",
+  "- Mark items `in_progress` when you start them and `completed` as soon as they're actually done.",
+  "- Only call it when the list changes.",
 ].join("\n")
 
 const QUESTION_DESCRIPTION = [
@@ -621,7 +628,15 @@ async function buildTools(
   addBuiltin("models", ["models"], MODELS_DESCRIPTION, objectSchema({
     query: stringSchema("Text to search for in model names and IDs."),
     provider: stringSchema("Provider ID or name to filter by. Try your own provider first."),
-    type: { type: "string", enum: ["chat", "image"], description: "Which kind of model to list. Defaults to \"chat\"." },
+    type: {
+      type: "string",
+      enum: ["chat", "image"],
+      description: [
+        "Which kind of model to list. Defaults to \"chat\".",
+        "\"chat\": a language model (LLM). Powers sessions, agents and subagents, and can call tools.",
+        "\"image\": generates or edits images from a prompt. It can't chat or call tools.",
+      ].join("\n"),
+    },
     all: { type: "boolean", description: "Include older versions of each model family. By default only the newest version is listed." },
     limit: { type: "integer", minimum: 1, maximum: 100, description: "Maximum number of models to return. Defaults to 20." },
     offset: { type: "integer", minimum: 0, description: "Number of models to skip, for paging through results." },
@@ -670,12 +685,13 @@ async function buildTools(
               question: stringSchema("Complete question"),
               options: {
                 type: "array",
+                description: "Available choices",
                 items: objectSchema(
                   { label: stringSchema("Display text (1-5 words, concise)"), description: stringSchema("Explanation of choice") },
                   ["label", "description"],
                 ),
               },
-              multiple: { type: "boolean", description: "Allow selecting more than one option" },
+              multiple: { type: "boolean", description: "Allow selecting multiple choices" },
             },
             ["header", "question", "options"],
           ),
@@ -696,13 +712,18 @@ async function buildTools(
     })
   }
 
-  addBuiltin("todowrite", ["todowrite", "todo"], "Update the todo list for the current task.", objectSchema({
+  addBuiltin("todowrite", ["todowrite", "todo"], TODOWRITE_DESCRIPTION, objectSchema({
     todos: {
       type: "array",
+      description: "The updated todo list",
       items: objectSchema(
         {
           content: stringSchema("Brief description of the task"),
-          status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"], description: "Current status of the task" },
+          status: {
+            type: "string",
+            enum: ["pending", "in_progress", "completed", "cancelled"],
+            description: "Current status of the task: pending, in_progress, completed, cancelled",
+          },
         },
         ["content", "status"],
       ),
