@@ -1,5 +1,5 @@
 /**
- * Disable Command Code's native subagent tools inside `cmd acp`.
+ * Disable Command Code's native orchestration and question tools inside `cmd acp`.
  *
  * Command Code exposes `agent` and `agent_output` to the main loop. Inside an
  * ACP host such as OpenCode those duplicate the orchestrator, which already
@@ -7,15 +7,17 @@
  * cannot block `agent` (the docs mark it as always allowed), so this mod
  * removes it from the tool surface and fails closed if a call still arrives.
  *
- * Loaded by the `cmd` server entry in opencode.jsonc:
- *   "command": ["cmd", "acp", "--mod", "/absolute/path/to/agents/cmd/no-native-subagent.ts"]
+ * `ask_user_question` is removed for the same reason: ACP has no question
+ * method, so `cmd acp` would relay it as a permission request instead of
+ * showing OpenCode's question UI. The agent should call the host's MCP
+ * `question` tool instead.
  *
- * Add "ask_user_question" to DISABLED if questions should also route through
- * the ACP host instead of Command Code's own question tool.
+ * Loaded by the `cmd` server entry in opencode.jsonc:
+ *   "command": ["cmd", "acp", "--mod", "/absolute/path/to/agents/cmd/no-native-orchestration.ts"]
  */
 import type { ModApi } from "@commandcode/harness"
 
-const DISABLED = new Set(["agent", "agent_output"])
+const DISABLED = new Set(["agent", "agent_output", "ask_user_question"])
 
 export default function (cmd: ModApi) {
   const hide = () => {
@@ -43,7 +45,9 @@ export default function (cmd: ModApi) {
       return {
         block: true,
         additionalContext:
-          "Native subagents are disabled. Use the host's own subagent tool instead.",
+          toolName === "ask_user_question"
+            ? "Native questions are disabled. Use the host's MCP `question` tool instead."
+            : "Native subagents are disabled. Use the host's own subagent tool instead.",
       }
     },
   })

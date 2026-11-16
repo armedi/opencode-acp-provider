@@ -52,6 +52,8 @@ const ARTIFACT_DESCRIPTIONS = {
 export interface McpServerOptions {
   ctx: Ctx
   log?: LogFn
+  /** Local OpenCode service that can create forms with a location. Resolved per question. */
+  localService?: { url: string; password: string } | (() => Promise<{ url: string; password: string } | undefined>)
   transport?: "stdio" | "http"
   /** Runtime that can execute a JavaScript file, e.g. "node" or "bun". */
   runtime?: string
@@ -321,7 +323,7 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
           // Only claim the version we actually implement.
           const requested =
             typeof message.params?.protocolVersion === "string" ? message.params.protocolVersion : undefined
-          const instructions = await buildInstructions(ctx, sessionKey).catch(() => undefined)
+          const instructions = await buildInstructions(ctx, sessionKey, options.localService, log).catch(() => undefined)
           return reply({
             protocolVersion: requested === MCP_PROTOCOL_VERSION ? requested : MCP_PROTOCOL_VERSION,
             capabilities: { tools: { listChanged: false } },
@@ -332,7 +334,7 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
         case "ping":
           return reply({})
         case "tools/list": {
-          const tools = await buildTools(ctx, sessionKey)
+          const tools = await buildTools(ctx, sessionKey, options.localService, log)
           if (!loggedTools) {
             loggedTools = true
             log("info", `OpenCode MCP tools exposed: ${tools.map((tool) => tool.name).join(", ")}`)
@@ -348,7 +350,7 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
         case "tools/call": {
           const name = String(message.params?.name ?? "")
           const args = message.params?.arguments ?? {}
-          const tools = await buildTools(ctx, sessionKey)
+          const tools = await buildTools(ctx, sessionKey, options.localService, log)
           const tool = tools.find((candidate) => candidate.name === name)
           if (!tool) return fail(-32602, `Unknown tool: ${name}`)
           const startedAt = Date.now()
@@ -393,8 +395,132 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
   }
 }
 
-async function buildInstructions(ctx: Ctx, sessionKey: string) {
-  const tools = await buildTools(ctx, sessionKey)
+class QuestionFormError extends Error {}
+
+function basicAuth(password: string) {
+  return `Basic ${Buffer.from(`opencode:${password}`, "utf8").toString("base64")}`
+}
+
+function questionFields(questions: any[]) {
+  return questions.map((question, index) => ({
+    key: `q${index}`,
+    title: typeof question?.header === "string" ? question.header : `Question ${index + 1}`,
+    description: typeof question?.question === "string" ? question.question : "",
+    type: question?.multiple === true ? "multiselect" : "string",
+    options: (Array.isArray(question?.options) ? question.options : []).map((option: any) => ({
+      value: String(option?.label ?? ""),
+      label: String(option?.label ?? ""),
+      ...(typeof option?.description === "string" ? { description: option.description } : {}),
+    })),
+    custom: true,
+  }))
+}
+
+function answeredQuestions(questions: any[], answer: Record<string, unknown>) {
+  const answers = questions.map((_, index) => {
+    const value = answer[`q${index}`]
+    if (value === undefined || value === null) return []
+    if (Array.isArray(value)) return value.map(String)
+    return [String(value)]
+  })
+  const text = `User has answered your questions: ${questions
+    .map((question, index) => `"${question?.question ?? ""}"="${answers[index].length ? answers[index].join(", ") : "Unanswered"}"`)
+    .join(", ")}. You can now continue with the user's answers in mind.`
+  return { output: { answers }, content: [{ type: "text" as const, text }], metadata: { answers } }
+}
+
+function delay(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason ?? new Error("aborted"))
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(signal.reason ?? new Error("aborted"))
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
+/**
+ * Ask through the local server's form API instead of the builtin question tool.
+ * A form created outside the HTTP location middleware has no `location` on its
+ * event, and the desktop client ignores `form.created` events without one. The
+ * HTTP route runs inside that middleware, so the desktop renders the question.
+ */
+async function askViaForm(
+  ctx: Ctx,
+  service: { url: string; password: string },
+  sessionKey: string,
+  args: any,
+  signal: AbortSignal,
+  log?: LogFn,
+): Promise<any> {
+  const questions = Array.isArray(args?.questions) ? args.questions : []
+  if (!questions.length) throw new QuestionFormError("No questions were provided")
+
+  const session = await ctx.session.get({ sessionID: sessionKey as any }).catch(() => undefined)
+  const directory = (session as any)?.location?.directory ?? ctx.location.directory
+  const base = service.url.replace(/\/+$/, "")
+  const headers = {
+    "content-type": "application/json",
+    authorization: basicAuth(service.password),
+    "x-opencode-directory": encodeURIComponent(directory),
+  }
+  const endpoint = `${base}/api/session/${encodeURIComponent(sessionKey)}/form`
+
+  const created = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ title: "Questions", metadata: { kind: "question" }, fields: questionFields(questions) }),
+    signal,
+  }).catch((error) => {
+    throw new QuestionFormError(error instanceof Error ? error.message : String(error))
+  })
+  if (!created.ok) {
+    const detail = await created.text().catch(() => "")
+    throw new QuestionFormError(`form API returned ${created.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`)
+  }
+  const form = ((await created.json().catch(() => undefined)) as any)?.data
+  if (!form?.id) throw new QuestionFormError("form API did not return a form id")
+
+  const formEndpoint = `${endpoint}/${encodeURIComponent(form.id)}`
+  try {
+    while (true) {
+      if (signal.aborted) throw signal.reason ?? new Error("aborted")
+      const response = await fetch(formEndpoint, { headers, signal })
+      if (response.ok) {
+        const detail = ((await response.json().catch(() => undefined)) as any)?.data
+        const state = detail?.state
+        if (state?.status === "answered") return answeredQuestions(questions, state.answer ?? {})
+        if (state?.status === "cancelled") throw new Error(state.message || "The user dismissed this question")
+      } else if (response.status === 404) {
+        throw new Error("The question form was closed")
+      } else {
+        log?.("warn", `question form poll returned ${response.status}`)
+      }
+      await delay(300, signal)
+    }
+  } catch (error) {
+    await fetch(formEndpoint, {
+      method: "DELETE",
+      headers,
+      body: JSON.stringify({ message: "The question was cancelled because the request was interrupted." }),
+      signal: AbortSignal.timeout(2_000),
+    }).catch(() => {})
+    throw error
+  }
+}
+
+async function buildInstructions(
+  ctx: Ctx,
+  sessionKey: string,
+  service?: { url: string; password: string } | (() => Promise<{ url: string; password: string } | undefined>),
+  log?: LogFn,
+) {
+  const tools = await buildTools(ctx, sessionKey, service, log)
   if (!tools.length) return undefined
   const names = new Set(tools.map((tool) => tool.name))
   const lines = [
@@ -417,7 +543,12 @@ async function buildInstructions(ctx: Ctx, sessionKey: string) {
   return lines.join("\n")
 }
 
-async function buildTools(ctx: Ctx, sessionKey: string): Promise<McpTool[]> {
+async function buildTools(
+  ctx: Ctx,
+  sessionKey: string,
+  localService?: { url: string; password: string } | (() => Promise<{ url: string; password: string } | undefined>),
+  log?: LogFn,
+): Promise<McpTool[]> {
   const tools: McpTool[] = []
   const available = await ctx.tool.list().catch(() => [])
 
@@ -503,24 +634,46 @@ async function buildTools(ctx: Ctx, sessionKey: string): Promise<McpTool[]> {
     })
   }
 
-  addBuiltin("question", ["question"], QUESTION_DESCRIPTION, objectSchema({
-    questions: {
-      type: "array",
-      description: "Questions to ask",
-      items: objectSchema(
-        {
-          header: stringSchema("Very short label (max 30 chars)"),
-          question: stringSchema("Complete question"),
-          options: {
-            type: "array",
-            items: objectSchema({ label: stringSchema("Display text (1-5 words, concise)"), description: stringSchema("Explanation of choice") }, ["label", "description"]),
-          },
-          multiple: { type: "boolean", description: "Allow selecting more than one option" },
+  const question = find("question")
+  if (question) {
+    tools.push({
+      name: "question",
+      description: QUESTION_DESCRIPTION,
+      inputSchema: objectSchema({
+        questions: {
+          type: "array",
+          description: "Questions to ask",
+          items: objectSchema(
+            {
+              header: stringSchema("Very short label (max 30 chars)"),
+              question: stringSchema("Complete question"),
+              options: {
+                type: "array",
+                items: objectSchema(
+                  { label: stringSchema("Display text (1-5 words, concise)"), description: stringSchema("Explanation of choice") },
+                  ["label", "description"],
+                ),
+              },
+              multiple: { type: "boolean", description: "Allow selecting more than one option" },
+            },
+            ["header", "question", "options"],
+          ),
         },
-        ["header", "question", "options"],
-      ),
-    },
-  }, ["questions"]))
+      }, ["questions"]),
+      call: async (args, signal) => {
+        const service = typeof localService === "function" ? await localService() : localService
+        if (service) {
+          try {
+            return toMcpResult(await askViaForm(ctx, service, sessionKey, args ?? {}, signal, log))
+          } catch (error) {
+            if (!(error instanceof QuestionFormError)) throw error
+            log?.("warn", `question form API unavailable (${error.message}); using the builtin question tool`)
+          }
+        }
+        return toMcpResult(await invoke(question, args ?? {}, signal))
+      },
+    })
+  }
 
   addBuiltin("todowrite", ["todowrite", "todo"], "Update the todo list for the current task.", objectSchema({
     todos: {

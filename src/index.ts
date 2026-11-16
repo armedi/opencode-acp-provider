@@ -1,5 +1,8 @@
 import { Model, Plugin, Provider } from "@opencode/plugin"
 import { randomUUID } from "node:crypto"
+import { readFile } from "node:fs/promises"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import { AcpServerManager, type AcpServerConfig, type AcpServerState } from "./server-manager.ts"
 import { createShim } from "./shim.ts"
 import { createAcpLanguageModel } from "./language-model.ts"
@@ -57,6 +60,41 @@ function providerIDFor(id: string) {
   return `acp-${id.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "server"}`
 }
 
+interface LocalService {
+  url: string
+  password: string
+}
+
+/**
+ * A `serve --service` server records its address and password next to its
+ * state, with the owning pid. Match that pid so the MCP question tool can use
+ * the HTTP API of the server that is hosting this plugin. Default CLI servers
+ * do not write the file, and the builtin question tool is used instead.
+ */
+async function readLocalService(): Promise<LocalService | undefined> {
+  const candidates = new Set<string>()
+  const home = homedir()
+  if (process.env.OPENCODE_STATE_HOME) candidates.add(process.env.OPENCODE_STATE_HOME)
+  if (process.env.XDG_STATE_HOME) candidates.add(join(process.env.XDG_STATE_HOME, "opencode"))
+  candidates.add(join(home, ".local", "state", "opencode"))
+  candidates.add(join(home, "Library", "Application Support", "opencode"))
+  if (process.env.APPDATA) candidates.add(join(process.env.APPDATA, "opencode"))
+  if (process.env.LOCALAPPDATA) candidates.add(join(process.env.LOCALAPPDATA, "opencode"))
+
+  for (const directory of candidates) {
+    try {
+      const raw = await readFile(join(directory, "service.json"), "utf8")
+      const data = JSON.parse(raw) as { pid?: number; url?: unknown; password?: unknown }
+      if (data.pid !== process.pid) continue
+      if (typeof data.url !== "string" || typeof data.password !== "string") continue
+      return { url: data.url, password: data.password }
+    } catch {
+      // no matching service file here
+    }
+  }
+  return undefined
+}
+
 export default Plugin.define({
   id: "acp.client",
   async setup(ctx) {
@@ -103,6 +141,7 @@ export default Plugin.define({
         mcp = await createMcpServer({
           ctx,
           log,
+          localService: () => readLocalService(),
           transport: options.mcpTransport === "http" ? "http" : "stdio",
           runtime: options.mcpRuntime,
           version: "0.5.0",

@@ -9,8 +9,8 @@ One directory per OpenCode `servers[].id`:
 ```text
 agents/
 ├── cmd/
-│   ├── no-native-subagent.ts   # loaded with `cmd acp --mod …`
-│   └── opencode-skills.ts      # loaded automatically by the plugin
+│   ├── no-native-orchestration.ts   # loaded with `cmd acp --mod …`
+│   └── opencode-skills.ts           # loaded automatically by the plugin
 └── <id>/                       # one directory per server id
     └── <capability>.ts         # name the file after the behavior it changes
 ```
@@ -18,7 +18,7 @@ agents/
 ## Conventions
 
 - The directory name matches the `id` in `opencode.jsonc` (`cmd`, `claude`, `codex`, …).
-- The file name describes the behavior, not the agent: `no-native-subagent.ts`.
+- The file name describes the behavior, not the agent: `no-native-orchestration.ts`.
 - Keep each companion file standalone. It must not import from `src/`; the agent loads it with its
   own runtime and API.
 - Document how the agent loads the file (CLI flag, env var, config key) in a comment at the top of
@@ -28,12 +28,12 @@ agents/
 
 ## Command Code (`cmd`)
 
-`no-native-subagent.ts` removes the native `agent` and `agent_output` tools from the main loop.
-Command Code's permission rules cannot block the `agent` tool (its docs mark it as always allowed),
-so the mod uses `cmd.setActiveTools` to remove it from the model's schema and `beforeToolCall` to
-refuse any call that still arrives.
+`no-native-orchestration.ts` removes the native `agent`, `agent_output`, and `ask_user_question`
+tools from the main loop. Command Code's permission rules cannot block the `agent` tool (its docs
+mark it as always allowed), so the mod uses `cmd.setActiveTools` to remove it from the model's schema
+and `beforeToolCall` to refuse any call that still arrives.
 
-It filters from `cmd.getActiveTools()` rather than `cmd.getAllTools()`, so it only removes those two
+It filters from `cmd.getActiveTools()` rather than `cmd.getAllTools()`, so it only removes the listed
 tools. Tools another mod disabled stay disabled, and tools another mod added stay active.
 `setActiveTools` filters the tool surface only: other mods' commands, hooks, providers, renderers,
 and UI are untouched. If some later mod re-enables `agent`, `beforeToolCall` still blocks the call.
@@ -48,15 +48,17 @@ Load it from the server entry:
     "cmd",
     "acp",
     "--mod",
-    "/absolute/path/to/opencode-acp/agents/cmd/no-native-subagent.ts"
+    "/absolute/path/to/opencode-acp/agents/cmd/no-native-orchestration.ts"
   ]
 }
 ```
 
 `--mod` is a global `cmd` flag. `cmd acp` accepts it even though `cmd acp --help` does not list it.
 
-Add `"ask_user_question"` to the mod's `DISABLED` set if questions should route through OpenCode
-too. Verify with a prompt such as "call the agent tool with subagent_type explore": the agent no
+The mod also removes `ask_user_question`, because ACP has no question method: leaving it enabled
+makes `cmd acp` relay the question as a permission request instead of using OpenCode's question UI.
+With it disabled the agent calls the MCP `question` tool. Verify with a prompt such as "call the
+agent tool with subagent_type explore": the agent no
 longer sees that tool and should report it as unavailable rather than delegating.
 
 ### `opencode-skills.ts`

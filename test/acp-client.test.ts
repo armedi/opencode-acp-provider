@@ -54,6 +54,29 @@ test("forwards additionalDirectories when it creates a session", async () => {
   }
 })
 
+test("declines a native agent question instead of auto-approving its options", async () => {
+  // autoApprove is true, but question options must never be picked automatically.
+  const acp = client()
+  try {
+    const session = await acp.newSession(tmpdir())
+    const result = await acp.prompt(session.sessionId, "please ask")
+    expect(result.text).toBe("question:cancelled")
+  } finally {
+    await acp.stop()
+  }
+})
+
+test("still auto-approves ordinary permission requests", async () => {
+  const acp = client()
+  try {
+    const session = await acp.newSession(tmpdir())
+    const result = await acp.prompt(session.sessionId, "ask permission")
+    expect(result.text).toBe("permission:allow_once")
+  } finally {
+    await acp.stop()
+  }
+})
+
 test("stop rejects a turn that is still running", async () => {
   const acp = client({ promptTimeoutMs: 0 })
   const session = await acp.newSession(tmpdir())

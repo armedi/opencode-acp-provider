@@ -113,6 +113,58 @@ function handle(message) {
         })
       }
       if (/\bhang\b/i.test(text)) return
+      if (/\bpermission\b/i.test(text)) {
+        void (async () => {
+          const reply = await ask("session/request_permission", {
+            sessionId,
+            toolCall: {
+              toolCallId: "call-permission",
+              title: "Run ls",
+              kind: "execute",
+              status: "pending",
+              rawInput: { command: "ls" },
+            },
+            options: [
+              { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+              { optionId: "reject_once", name: "Reject", kind: "reject_once" },
+            ],
+          })
+          const outcome = reply?.result?.outcome
+          const selected = outcome?.outcome === "selected" ? outcome.optionId : "cancelled"
+          update(sessionId, {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `permission:${selected}` },
+          })
+          send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
+        })()
+        return
+      }
+      if (/\bask\b/i.test(text)) {
+        void (async () => {
+          const reply = await ask("session/request_permission", {
+            sessionId,
+            toolCall: {
+              toolCallId: "call-question",
+              title: "Stack: Which stack?",
+              kind: "other",
+              status: "pending",
+              rawInput: { question: "Which stack?", options: ["TypeScript", "Python"] },
+            },
+            options: [
+              { optionId: "option_0", name: "TypeScript: Node", kind: "allow_once" },
+              { optionId: "option_1", name: "Python: FastAPI", kind: "allow_once" },
+            ],
+          })
+          const outcome = reply?.result?.outcome
+          const selected = outcome?.outcome === "selected" ? outcome.optionId : "cancelled"
+          update(sessionId, {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `question:${selected}` },
+          })
+          send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
+        })()
+        return
+      }
       if (/\bdirectories\b/i.test(text)) {
         const directories = sessionDirectories.get(sessionId) ?? []
         update(sessionId, {

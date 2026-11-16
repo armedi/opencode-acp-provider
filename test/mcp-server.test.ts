@@ -204,3 +204,159 @@ test("cancels an in-flight tool call", async () => {
     await server.close()
   }
 })
+
+test("asks questions through the local form API when a service is available", async () => {
+  let posted: any
+  let seenAuth = ""
+  let seenDirectory = ""
+  let polls = 0
+  const forms = Bun.serve({
+    port: 0,
+    fetch: async (request) => {
+      const url = new URL(request.url)
+      seenAuth = request.headers.get("authorization") ?? ""
+      seenDirectory = request.headers.get("x-opencode-directory") ?? ""
+      if (request.method === "POST" && url.pathname === "/api/session/ses_caller/form") {
+        posted = await request.json()
+        return Response.json({ data: { id: "frm_test", sessionID: "ses_caller", fields: posted.fields } })
+      }
+      if (request.method === "GET" && url.pathname === "/api/session/ses_caller/form/frm_test") {
+        polls += 1
+        if (polls < 2) return Response.json({ data: { state: { status: "pending" } } })
+        return Response.json({ data: { state: { status: "answered", answer: { q0: "Cats" } } } })
+      }
+      if (request.method === "DELETE") return Response.json({ data: {} })
+      return new Response("not found", { status: 404 })
+    },
+  })
+
+  const base = context()
+  const ctx = context({
+    session: {
+      ...base.session,
+      get: async ({ sessionID }: { sessionID: string }) => ({
+        id: sessionID,
+        agent: "build",
+        location: { directory: "/tmp/test-project" },
+      }),
+    },
+    tool: {
+      list: async () => [
+        {
+          name: "question",
+          execute: async () => {
+            throw new Error("builtin question tool should not run")
+          },
+        },
+      ],
+    },
+  })
+  const server = await createMcpServer({
+    ctx,
+    transport: "http",
+    log: () => {},
+    localService: { url: `http://127.0.0.1:${forms.port}`, password: "secret" },
+  })
+  const lease = server.issue("ses_caller")
+  const http = lease.servers[0]
+  if (http.type !== "http") throw new Error("expected an HTTP MCP server")
+  const token = http.headers.find((header) => header.name === "Authorization")?.value ?? ""
+  try {
+    const response = await rpc(server.url, token, {
+      jsonrpc: "2.0",
+      id: 20,
+      method: "tools/call",
+      params: {
+        name: "question",
+        arguments: {
+          questions: [
+            {
+              header: "Animal",
+              question: "Cats or dogs?",
+              options: [
+                { label: "Cats", description: "indoor" },
+                { label: "Dogs", description: "outdoor" },
+              ],
+            },
+          ],
+        },
+      },
+    })
+
+    expect(response.body.result.isError).toBeUndefined()
+    expect(JSON.stringify(response.body.result)).toContain("Cats")
+    expect(posted.fields[0].key).toBe("q0")
+    expect(posted.fields[0].options[0]).toEqual({ value: "Cats", label: "Cats", description: "indoor" })
+    expect(seenAuth).toBe(`Basic ${Buffer.from("opencode:secret").toString("base64")}`)
+    expect(seenDirectory).toBe(encodeURIComponent("/tmp/test-project"))
+  } finally {
+    lease.release()
+    await server.close()
+    forms.stop(true)
+  }
+})
+
+test("falls back to the builtin question tool when the form API is unavailable", async () => {
+  const forms = Bun.serve({
+    port: 0,
+    fetch: () => new Response("unavailable", { status: 500 }),
+  })
+  const logs: string[] = []
+  const base = context()
+  const ctx = context({
+    session: {
+      ...base.session,
+      get: async ({ sessionID }: { sessionID: string }) => ({
+        id: sessionID,
+        agent: "build",
+        location: { directory: "/tmp/test-project" },
+      }),
+    },
+    tool: {
+      list: async () => [
+        {
+          name: "question",
+          execute: async () => ({
+            output: { answers: [["Fallback"]] },
+            content: [{ type: "text", text: "builtin question result" }],
+          }),
+        },
+      ],
+    },
+  })
+  const server = await createMcpServer({
+    ctx,
+    transport: "http",
+    log: (level, message) => logs.push(`${level}: ${message}`),
+    localService: { url: `http://127.0.0.1:${forms.port}`, password: "secret" },
+  })
+  const lease = server.issue("ses_caller")
+  const http = lease.servers[0]
+  if (http.type !== "http") throw new Error("expected an HTTP MCP server")
+  const token = http.headers.find((header) => header.name === "Authorization")?.value ?? ""
+  try {
+    const response = await rpc(server.url, token, {
+      jsonrpc: "2.0",
+      id: 21,
+      method: "tools/call",
+      params: {
+        name: "question",
+        arguments: {
+          questions: [
+            {
+              header: "Animal",
+              question: "Cats or dogs?",
+              options: [{ label: "Cats", description: "indoor" }],
+            },
+          ],
+        },
+      },
+    })
+    expect(JSON.stringify(response.body.result)).toContain("builtin question result")
+    expect(logs.some((line) => line.includes("using the builtin question tool"))).toBe(true)
+  } finally {
+    lease.release()
+    await server.close()
+    forms.stop(true)
+  }
+})

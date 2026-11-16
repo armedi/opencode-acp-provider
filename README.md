@@ -179,7 +179,7 @@ second hidden agent loop.
 | --- | --- | --- |
 | Claude Code | `Task`, `AskUserQuestion` | `meta.claudeCode.options.disallowedTools` |
 | Codex | native agents, request-user-input | `CODEX_CONFIG='{"agents":{"enabled":false},"tools":{"experimental_request_user_input":{"enabled":false}}}'` |
-| Command Code (`cmd`) | `agent`, `agent_output` (and optionally `ask_user_question`) | load a mod with `cmd acp --mod …` |
+| Command Code (`cmd`) | `agent`, `agent_output`, `ask_user_question` | load a mod with `cmd acp --mod …` |
 
 Claude Code:
 
@@ -209,7 +209,7 @@ Codex:
 
 Command Code has no equivalent setting key. Its docs mark the `agent` tool as always allowed, so a
 `permissions.deny` rule cannot block it. Use the companion mod at
-[`agents/cmd/no-native-subagent.ts`](agents/cmd/no-native-subagent.ts), which removes the tools from
+[`agents/cmd/no-native-orchestration.ts`](agents/cmd/no-native-orchestration.ts), which removes the tools from
 the model's schema and refuses any call that still arrives:
 
 ```jsonc
@@ -220,15 +220,17 @@ the model's schema and refuses any call that still arrives:
     "cmd",
     "acp",
     "--mod",
-    "/absolute/path/to/opencode-acp/agents/cmd/no-native-subagent.ts"
+    "/absolute/path/to/opencode-acp/agents/cmd/no-native-orchestration.ts"
   ]
 }
 ```
 
 `--mod` is a global `cmd` flag, accepted by `cmd acp` even though `cmd acp --help` does not list it.
-Add `"ask_user_question"` to the mod's `DISABLED` set if questions should route through OpenCode
-too. The mod filters only the active tool list, so other `cmd` mods keep their tools, commands, and
-hooks. Verify with a prompt such as "call the agent tool with subagent_type explore": the agent no
+The mod also removes `ask_user_question`, because ACP has no question method: leaving it enabled
+makes `cmd acp` relay the question as a permission request instead of using OpenCode's question UI.
+With it disabled the agent calls the MCP `question` tool. The mod filters only the active tool list,
+so other `cmd` mods keep their tools, commands, and hooks. Verify with a prompt such as "call the
+agent tool with subagent_type explore": the agent no
 longer sees that tool and should report it as unavailable rather than delegating.
 
 Companion files live under [`agents/`](agents/README.md), one directory per server id. Add a new
@@ -296,7 +298,8 @@ agent can still be visible to the ACP agent. Use `permissions` on the agent, `"s
 | `effort` | `string` | Default ACP reasoning effort for sessions without a `#variant`. `cmd` accepts `off`, `low`, `high`, `max`, or `default`. Lower effort usually answers faster; `off` disables thinking entirely. Per-model variants override this. |
 | `mode` | `string` | ACP session mode applied to pooled sessions, e.g. `auto-accept` or `plan`. |
 | `meta` | `object` | ACP `_meta` passed to `session/new`. Claude Code reads `meta.claudeCode.options`, e.g. `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } } }`. |
-| `autoApprove` | `boolean` | Auto-approve `session/request_permission` requests. Defaults to `true`. When `false`, each request is routed through OpenCode's permission prompt (action `acp_tool`); requests without an OpenCode session are denied. |
+| `autoApprove` | `boolean` | Auto-approve real `session/request_permission` requests. Defaults to `true`. When `false`, each request is routed through OpenCode's permission prompt (action `acp_tool`); requests without an OpenCode session are denied. Question prompts that an agent encodes as a permission request are never auto-approved and are declined instead; native ask-user tools should be disabled so agents use the MCP `question` tool. |
+| `skills` | `boolean` | Expose OpenCode's skills through this agent's native skill discovery. Defaults to `true`. See [Skills](#skills). |
 | `disabled` | `boolean` | Skip the server without deleting its configuration. |
 
 Plugin options:
@@ -394,6 +397,15 @@ those models reach an ACP agent through the builtin `subagent` tool (see
 - Permission requests are auto-approved by default. With `autoApprove: false`, approval goes through
   OpenCode's permission prompt; paths outside the session directory are denied unless
   `allowPathsOutsideCwd` is set, even when the agent asks for permission.
+- ACP has no question method. Native ask-user tools must be disabled in the agent's configuration
+  so questions go through the MCP `question` tool. If an agent still encodes a question as a
+  `session/request_permission` call whose options are the answer choices, it is recognised by its
+  `rawInput.question` and declined rather than answered with the first option.
+- The MCP `question` tool asks through the OpenCode server's HTTP form API when the plugin runs
+  inside a `serve --service` server such as the desktop app. Forms created directly by the builtin
+  tool have no location on their event, and the desktop client ignores those events; the HTTP route
+  attaches the session location so the question dock appears. Default CLI servers fall back to the
+  builtin question tool.
 - Plugin setup runs per OpenCode location, so each open location gets its own agent process and
   shim. Startup is bounded by `initTimeoutMs`, and a server that is not ready yet is retried in the
   background.

@@ -83,6 +83,30 @@ interface AgentHandshake {
   authMethods: unknown
 }
 
+/**
+ * Recognise an ask-user prompt that an agent sent through
+ * `session/request_permission`. Command Code marks every choice as
+ * `allow_once` and numbers the option ids `option_0`, `option_1`, …, so option
+ * `kind` cannot tell a question apart from a permission. The raw question text
+ * is the reliable signal; numbered ids or option labels keep ordinary tool
+ * prompts out.
+ *
+ * Native question tools must be disabled in the agent's own configuration so
+ * agents use OpenCode's MCP `question` tool instead. If one still asks this
+ * way, the request is declined rather than answered with the first option.
+ */
+function readQuestionText(params: any, options: Array<{ optionId?: string }>): string | undefined {
+  const raw = params?.toolCall?.rawInput
+  const question = typeof raw?.question === "string" ? raw.question.trim() : ""
+  if (!question || !options.length) return undefined
+  const labels: unknown[] = Array.isArray(raw?.options) ? raw.options : []
+  const numbered = options.every(
+    (option) => typeof option.optionId === "string" && /^option_\d+$/.test(option.optionId),
+  )
+  if (!numbered && !labels.length) return undefined
+  return question
+}
+
 function readEffortConfig(configOptions: AcpConfigOption[]): AcpEffortConfig | undefined {
   const option =
     configOptions.find((candidate) => candidate.id === "effort") ??
@@ -109,7 +133,10 @@ export interface AcpClientOptions {
   onLog?: (level: "debug" | "warn" | "error", message: string) => void
   /** Called when the agent process exits unexpectedly, so callers can drop stale sessions. */
   onExit?: (error: Error) => void
-  /** Auto-approve `session/request_permission` requests. Defaults to true. */
+  /**
+   * Auto-approve real `session/request_permission` requests. Questions that an
+   * agent encodes as permission requests are declined instead. Defaults to true.
+   */
   autoApprove?: boolean
   /** Timeout for handshake and control calls. Defaults to 15s; 0 disables. */
   requestTimeoutMs?: number
@@ -362,6 +389,17 @@ export class AcpClient {
       if (method === "session/request_permission") {
         const params = message.params ?? {}
         const options: Array<{ optionId?: string; kind?: string }> = params.options ?? []
+
+        const question = readQuestionText(params, options)
+        if (question) {
+          // Native ask-user tools are supposed to be disabled in favour of the
+          // MCP `question` tool. Never auto-approve one: the first option is an
+          // answer, not permission.
+          this.log("debug", `declining native ACP question: ${question}`)
+          this.reply(message.id!, { outcome: { outcome: "cancelled" } })
+          return
+        }
+
         const allow =
           options.find((option) => option.optionId === "allow_once") ??
           options.find((option) => option.optionId?.startsWith("allow")) ??
