@@ -9,7 +9,8 @@ One directory per OpenCode `servers[].id`:
 ```text
 agents/
 ├── cmd/
-│   └── no-native-subagent.ts   # loaded with `cmd acp --mod …`
+│   ├── no-native-subagent.ts   # loaded with `cmd acp --mod …`
+│   └── opencode-skills.ts      # loaded automatically by the plugin
 └── <id>/                       # one directory per server id
     └── <capability>.ts         # name the file after the behavior it changes
 ```
@@ -57,3 +58,11 @@ Load it from the server entry:
 Add `"ask_user_question"` to the mod's `DISABLED` set if questions should route through OpenCode
 too. Verify with a prompt such as "call the agent tool with subagent_type explore": the agent no
 longer sees that tool and should report it as unavailable rather than delegating.
+
+### `opencode-skills.ts`
+
+`cmd acp` accepts the global `--skill` flag but its ACP action never applies it; only the interactive
+and print paths call `setSkillLoadOverrides`. Mods are loaded on the ACP path, and
+`cmd.addSkillsPath` feeds the same skill discovery plan. This mod reads
+`OPENCODE_ACP_SKILL_DIR` and registers it. The plugin sets the env var and appends `--mod` to a
+`cmd ... acp` command automatically; `--safe-mode` disables it like any other mod.

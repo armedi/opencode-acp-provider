@@ -4,6 +4,7 @@ import { AcpServerManager, type AcpServerConfig, type AcpServerState } from "./s
 import { createShim } from "./shim.ts"
 import { createAcpLanguageModel } from "./language-model.ts"
 import { createMcpServer } from "./mcp-server.ts"
+import { createSkillMirror } from "./skills.ts"
 import { debugLog } from "./debug.ts"
 
 type LogLevel = "debug" | "info" | "warn" | "error"
@@ -42,6 +43,8 @@ interface AcpPluginOptions {
   toolCallDisplay?: "off" | "inline"
   /** Expose OpenCode tools to ACP agents through an MCP bridge. Defaults to true. */
   mcp?: boolean
+  /** Make OpenCode's skills available to ACP agents through their own discovery. `false` disables it; an array is an allowlist of skill IDs. Defaults to true. */
+  skills?: boolean | string[]
   /** MCP transport handed to ACP agents. Defaults to "stdio". */
   mcpTransport?: "stdio" | "http"
   /** Runtime that can execute a JavaScript file for the stdio bridge, e.g. "node". */
@@ -79,6 +82,21 @@ export default Plugin.define({
     // inline transcript markers.
     const nativeToolParts = typeof ctx.aisdk?.hook === "function"
 
+    let skills: Awaited<ReturnType<typeof createSkillMirror>> | undefined
+    const skillFilter = Array.isArray(options.skills) ? options.skills : undefined
+    const skillsEnabled = options.skills !== false && skillFilter?.length !== 0
+    if (skillsEnabled && servers.some((server) => server.skills !== false)) {
+      try {
+        skills = await createSkillMirror(ctx, { include: skillFilter, log })
+        if (!skills.count) {
+          await skills.close()
+          skills = undefined
+        }
+      } catch (error) {
+        log("warn", `OpenCode skills mirror disabled: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+
     let mcp: Awaited<ReturnType<typeof createMcpServer>> | undefined
     if (options.mcp !== false) {
       try {
@@ -99,6 +117,9 @@ export default Plugin.define({
       defaultCwd: ctx.location.directory,
       log,
       mcp: mcp ? { servers: (sessionKey) => mcp!.issue(sessionKey) } : undefined,
+      additionalDirectories: skills ? [skills.root] : undefined,
+      cmdSkillDir: skills?.agentsDir,
+      cmdSkillMod: skills?.modPath,
       initTimeoutMs: options.initTimeoutMs,
       requestTimeoutMs: options.requestTimeoutMs,
       maxSessions: options.maxSessions,
@@ -260,6 +281,7 @@ export default Plugin.define({
     } catch (error) {
       await manager.stop().catch(() => {})
       await mcp?.close().catch(() => {})
+      await skills?.close().catch(() => {})
       throw error
     }
 
@@ -272,6 +294,7 @@ export default Plugin.define({
       // manager is shutting down.
       await shim.close().catch(() => {})
       await manager.stop().catch(() => {})
+      await skills?.close().catch(() => {})
       await mcp?.close().catch(() => {})
     }
 

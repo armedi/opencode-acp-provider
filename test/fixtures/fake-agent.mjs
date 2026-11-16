@@ -3,6 +3,7 @@
 // stdio and implements just enough of the protocol for the client.
 
 let nextSession = 1
+const sessionDirectories = new Map()
 const configOptions = [
   {
     id: "model",
@@ -73,12 +74,15 @@ function handle(message) {
           authMethods: [],
         },
       })
-    case "session/new":
+    case "session/new": {
+      const sessionId = `sess-${nextSession++}`
+      sessionDirectories.set(sessionId, message.params?.additionalDirectories ?? [])
       return send({
         jsonrpc: "2.0",
         id: message.id,
-        result: { sessionId: `sess-${nextSession++}`, configOptions },
+        result: { sessionId, configOptions },
       })
+    }
     case "session/set_config_option": {
       const value = message.params?.value
       const accepted = ["fast", "slow"].includes(value) || String(value).startsWith("extra-")
@@ -109,6 +113,14 @@ function handle(message) {
         })
       }
       if (/\bhang\b/i.test(text)) return
+      if (/\bdirectories\b/i.test(text)) {
+        const directories = sessionDirectories.get(sessionId) ?? []
+        update(sessionId, {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `directories:${directories.join(",")}` },
+        })
+        return send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
+      }
       if (/\bwrite files?\b/i.test(text)) {
         void (async () => {
           const inside = await ask("fs/write_text_file", {

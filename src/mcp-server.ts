@@ -42,9 +42,6 @@ const QUESTION_DESCRIPTION = [
   "- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label",
 ].join("\n")
 
-const SKILL_DESCRIPTION =
-  "Load a specialized skill's instructions and resources into the current conversation when the task at hand matches its description.\n\nThe skill ID must match an available skill or a skill explicitly referenced by the user."
-
 const ARTIFACT_DESCRIPTIONS = {
   artifact_create: "Publish a new artifact to the default artifact provider or a named override.",
   artifact_read: "Read an artifact's metadata and file contents so you can inspect or update it.",
@@ -413,7 +410,7 @@ async function buildInstructions(ctx: Ctx, sessionKey: string) {
   if (names.has("question")) {
     lines.push("Use the server's `question` tool to ask the user.")
   }
-  const extras = ["models", "todowrite", "skill"].filter((name) => names.has(name))
+  const extras = ["models", "todowrite"].filter((name) => names.has(name))
   if (extras.length) {
     lines.push(`Other tools: ${extras.map((name) => `\`${name}\``).join(", ")}.`)
   }
@@ -537,8 +534,6 @@ async function buildTools(ctx: Ctx, sessionKey: string): Promise<McpTool[]> {
       ),
     },
   }, ["todos"]))
-
-  addBuiltin("skill", ["skill"], SKILL_DESCRIPTION, objectSchema({ id: stringSchema("The ID of an available skill or a skill explicitly referenced by the user") }, ["id"]))
 
   addBuiltin("artifact_create", ["artifact_create"], ARTIFACT_DESCRIPTIONS.artifact_create, objectSchema({
     title: stringSchema("Human-readable artifact title."),

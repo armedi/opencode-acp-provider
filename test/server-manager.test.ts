@@ -18,7 +18,15 @@ afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
 })
 
-function manager(options: { models?: string[]; effort?: string; defaultCwd?: string } = {}) {
+function manager(
+  options: {
+    models?: string[]
+    effort?: string
+    defaultCwd?: string
+    additionalDirectories?: string[]
+    skills?: boolean
+  } = {},
+) {
   const logs: string[] = []
   const instance = new AcpServerManager({
     servers: [
@@ -28,9 +36,11 @@ function manager(options: { models?: string[]; effort?: string; defaultCwd?: str
         models: options.models,
         effort: options.effort,
         autoApprove: true,
+        skills: options.skills,
       },
     ],
     defaultCwd: options.defaultCwd ?? tmpdir(),
+    additionalDirectories: options.additionalDirectories,
     log: (level, message) => logs.push(`${level}: ${message}`),
   })
   return { instance, logs }
@@ -61,6 +71,51 @@ test("discovers models and reuses a pooled session", async () => {
       sessionKey: "ses_test",
     })
     expect(second.text).toBe("got:second-reused")
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("passes additionalDirectories to fresh and pooled sessions", async () => {
+  const dir = await cwd()
+  const { instance } = manager({ defaultCwd: dir, additionalDirectories: ["/tmp/opencode-skills"] })
+  try {
+    await instance.initialize()
+    const fresh = await instance.run({
+      server: "fake",
+      prompt: "directories",
+      sessionKey: "ses_dirs",
+    })
+    expect(fresh.text).toBe("directories:/tmp/opencode-skills")
+
+    const pooled = await instance.run({
+      server: "fake",
+      prompt: "directories",
+      key: "ses_dirs",
+      sessionKey: "ses_dirs",
+    })
+    expect(pooled.text).toBe("directories:/tmp/opencode-skills")
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("a server can opt out of the skills mirror", async () => {
+  const dir = await cwd()
+  const { instance } = manager({
+    defaultCwd: dir,
+    additionalDirectories: ["/tmp/opencode-skills"],
+    skills: false,
+  })
+  try {
+    await instance.initialize()
+    const result = await instance.run({
+      server: "fake",
+      prompt: "directories",
+      key: "ses_no_skills",
+      sessionKey: "ses_no_skills",
+    })
+    expect(result.text).toBe("directories:")
   } finally {
     await instance.stop()
   }

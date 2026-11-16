@@ -32,6 +32,8 @@ For a server named `cmd`:
   [Delegating to an ACP agent](#delegating-to-an-acp-agent)).
 - An MCP bridge that gives ACP agents the OpenCode-owned tools they need to orchestrate and ask
   questions (see [OpenCode tools inside ACP agents](#opencode-tools-inside-acp-agents)).
+- OpenCode's skills mirrored into each agent's own skill discovery, so agents load them with their
+  native skill loader instead of a bridge tool (see [Skills](#skills)).
 
 ## Install
 
@@ -135,7 +137,6 @@ The tools are 1:1 wrappers over OpenCode's own tools and session APIs:
 | `subagent` | builtin `subagent` (native child session; async with native `<subagent>` wake) |
 | `question` | builtin `question` (native session form) |
 | `todowrite` | builtin `todowrite` |
-| `skill` | builtin `skill` |
 | `artifact_create` / `artifact_read` / `artifact_update` / `artifact_delete` | builtin artifact tools |
 | `session_list` | `session.list` (requires a `session` permission for `*`) |
 | `session_get` | `session.get` (defaults to the calling session) |
@@ -153,7 +154,7 @@ Calls to these bridge tools appear as console-style cards with a `mcp.<server>.<
 JSON arguments, and the result, because OpenCode's generic tool card has no detail view.
 
 The wrapped builtin tools assert their own permissions (`subagent`, `question`, `todowrite`,
-`skill`, `artifact`). The `session_*` tools are normally client-only, so they assert a `session`
+`artifact`). The `session_*` tools are normally client-only, so they assert a `session`
 permission with the target session id as the resource. Reads default to the calling session; reading
 another session, `session_wait`, `session_prompt`, and `session_interrupt` require permission for that
 session id, and `session_list` asserts resource `*`:
@@ -238,6 +239,47 @@ injected HTTP servers. The stdio entry runs `mcp-bridge.mjs` with `node` from `P
 `mcpRuntime` to use another runtime. Set `mcpTransport: "http"` for agents that reliably accept HTTP
 MCP servers (`cmd acp` advertises it; Claude's adapter supports it).
 
+## Skills
+
+OpenCode skills are registered in OpenCode, not in the ACP agent. Instead of bridging
+OpenCode's `skill` tool, the plugin copies OpenCode's own usable skills into a temporary directory
+and gives that directory to the agent through ACP `session/new`'s `additionalDirectories`:
+
+```text
+<tmp>/opencode-acp-skills-*/
+├── .agents/skills/<id>/SKILL.md   # Codex (and other .agents-compatible agents)
+└── .claude/skills/<id>/SKILL.md   # Claude Code
+```
+
+Each agent reads the tree with its own skill loader, so skills keep their normal progressive
+disclosure and supporting files. Directory-backed skills are copied with their `scripts/`,
+`references/`, and `assets/`; built-in OpenCode skills (which have a virtual `skill://` path) are
+written from their content. Skills without a description, skills with
+`opencode/autoinvoke: false`, and IDs that are not portable lowercase kebab-case are skipped.
+Skills already in `.agents/skills` or `.claude/skills` belong to the agents: they stay in place and
+each agent keeps loading them natively, so the mirror does not copy them or move them between
+conventions.
+
+`cmd` ignores ACP `additionalDirectories`, and its `acp` subcommand accepts but does not apply the
+global `--skill` flag. The plugin therefore appends a small mod
+([`agents/cmd/opencode-skills.ts`](agents/cmd/opencode-skills.ts)) that registers the directory with
+`cmd.addSkillsPath`, and also passes `--skill` for cmd builds that apply it. An explicit `--skill`,
+`--no-skills`, or `--safe-mode` in the server command wins. Set `"skills": false` on a server to opt
+out entirely.
+
+To copy only specific OpenCode skills, set the plugin option to an allowlist:
+
+```jsonc
+{
+  "skills": ["opencode"],
+}
+```
+
+The skill mirror is built during plugin setup and removed on shutdown. Native delivery does not run
+OpenCode's per-agent `skill` permission checks: a skill that OpenCode would hide from the current
+agent can still be visible to the ACP agent. Use `permissions` on the agent, `"skills": false`, or
+`autoinvoke: false` when that matters.
+
 ## Server options
 
 | Option | Type | Meaning |
@@ -278,6 +320,7 @@ Plugin options:
 | `promptTimeoutMs` | How long one ACP turn may run. Defaults to `1800000` (30 minutes); `0` disables the cap. |
 | `toolCallDisplay` | `inline` (default) shows finished ACP tool calls as transcript lines; `off` hides them. ACP agents run tools in their own harness, so these are not native OpenCode tool cards. |
 | `mcp` | Expose OpenCode tools to ACP agents through the MCP bridge. Defaults to `true`. |
+| `skills` | Mirror OpenCode's own skills into the agents' native skill discovery. Defaults to `true`; `false` disables it, and an array such as `["opencode"]` is an allowlist of skill IDs. |
 | `mcpTransport` | `stdio` (default) or `http`. Use `http` only for agents that accept injected HTTP MCP servers. |
 | `mcpRuntime` | Runtime that executes the stdio bridge, e.g. `bun`. Defaults to `node` resolved through `PATH`. |
 
@@ -354,6 +397,10 @@ those models reach an ACP agent through the builtin `subagent` tool (see
 - Plugin setup runs per OpenCode location, so each open location gets its own agent process and
   shim. Startup is bounded by `initTimeoutMs`, and a server that is not ready yet is retried in the
   background.
+- The skills mirror is rebuilt when plugin setup runs. Skills installed or edited while OpenCode
+  stays open reach the agent after a reload. Built-in skills with a virtual `skill://` path have no
+  supporting files to copy; only their `SKILL.md` body is mirrored. Native discovery does not run
+  OpenCode's `skill` permission checks.
 - Agents that authenticate through ACP's `authenticate` method (OAuth-style) are not supported;
   credentials are injected through the environment instead.
 - MCP subagents are bounded by OpenCode's `experimental.subagent_depth` (default `1`). Raise it if
@@ -381,6 +428,7 @@ Files:
 - `src/index.ts` — plugin entry, provider registration.
 - `src/acp-client.ts` — ACP JSON-RPC client over stdio.
 - `src/server-manager.ts` — agents, credentials, model discovery, session pooling.
+- `src/skills.ts` — mirrors OpenCode's skills into the agents' native skill trees.
 - `src/shim.ts` — OpenAI-compatible HTTP shim.
 - `src/mcp-server.ts` — MCP endpoint, per-session tokens, tool wrappers.
 - `src/mcp-bridge.mjs` — stdio-to-HTTP bridge for ACP agents that need stdio MCP.

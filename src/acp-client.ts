@@ -499,7 +499,13 @@ export class AcpClient {
    */
   async newSession(
     cwd: string,
-    options: { model?: string; effort?: string; mcpServers?: AcpMcpServer[]; meta?: Record<string, unknown> } = {},
+    options: {
+      model?: string
+      effort?: string
+      mcpServers?: AcpMcpServer[]
+      additionalDirectories?: string[]
+      meta?: Record<string, unknown>
+    } = {},
   ) {
     await this.start()
     const result = await this.request(
@@ -507,6 +513,7 @@ export class AcpClient {
       {
         cwd,
         mcpServers: options.mcpServers ?? [],
+        ...(options.additionalDirectories?.length ? { additionalDirectories: options.additionalDirectories } : {}),
         ...(options.meta ? { _meta: options.meta } : {}),
       },
       { timeout: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS },

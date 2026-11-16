@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { AcpClient, type AcpMcpServer, type SessionUpdate, type PermissionHandler } from "./acp-client.ts"
+import { applyCmdSkillFlag, isCmdCommand } from "./skills.ts"
 
 const execFileAsync = promisify(execFile)
 
@@ -31,6 +32,8 @@ export interface AcpServerConfig {
   meta?: Record<string, unknown>
   /** Auto-approve ACP permission requests. Defaults to true. */
   autoApprove?: boolean
+  /** Expose OpenCode's skills through the agent's native skill discovery. Defaults to true. */
+  skills?: boolean
   /** Disable this server without removing its configuration. */
   disabled?: boolean
 }
@@ -155,6 +158,9 @@ export class AcpServerManager {
   private promptTimeoutMs?: number
   private allowPathsOutsideCwd: boolean
   private maxFileBytes?: number
+  private additionalDirectories?: string[]
+  private cmdSkillDir?: string
+  private cmdSkillMod?: string
   private disposed = false
 
   constructor(input: {
@@ -171,6 +177,12 @@ export class AcpServerManager {
     sessionIdleMs?: number
     allowPathsOutsideCwd?: boolean
     maxFileBytes?: number
+    /** Extra roots offered to ACP agents, e.g. the generated skills mirror. */
+    additionalDirectories?: string[]
+    /** Directory passed to cmd through its global `--skill` flag. */
+    cmdSkillDir?: string
+    /** Mod that registers the skills directory with `cmd acp`. */
+    cmdSkillMod?: string
   }) {
     this.defaultCwd = input.defaultCwd
     this.resolver = input.resolveCredential ?? (async () => undefined)
@@ -184,6 +196,9 @@ export class AcpServerManager {
     this.sessionIdleMs = Math.max(0, input.sessionIdleMs ?? DEFAULT_SESSION_IDLE_MS)
     this.allowPathsOutsideCwd = input.allowPathsOutsideCwd === true
     this.maxFileBytes = input.maxFileBytes
+    this.additionalDirectories = input.additionalDirectories?.filter((directory) => directory.trim())
+    this.cmdSkillDir = input.cmdSkillDir
+    this.cmdSkillMod = input.cmdSkillMod
 
     for (const config of input.servers) {
       if (!config?.id || !config.command) continue
@@ -231,6 +246,15 @@ export class AcpServerManager {
   private resolveEffort(state: AcpServerState, requested?: string) {
     const effort = requested ?? state.config.effort ?? state.defaultEffort
     return effort && effort !== "default" ? effort : undefined
+  }
+
+  private sessionDirectories(config: AcpServerConfig) {
+    return config.skills === false ? undefined : this.additionalDirectories
+  }
+
+  private commandFor(config: AcpServerConfig) {
+    if (config.skills === false || !this.cmdSkillDir) return config.command
+    return applyCmdSkillFlag(config.command, this.cmdSkillDir, this.cmdSkillMod)
   }
 
   private async applyEffort(
@@ -311,8 +335,13 @@ export class AcpServerManager {
   private async doPrepare(state: AcpServerState) {
     const config = state.config
     if (this.disposed) throw new Error("ACP server manager is stopped")
-    const { command, args } = normalizeCommand(config.command)
+    const { command, args } = normalizeCommand(this.commandFor(config))
     const env: Record<string, string> = { ...config.env }
+    if (config.skills !== false && this.cmdSkillDir && isCmdCommand(config.command)) {
+      // Read by agents/cmd/opencode-skills.ts, which registers the directory
+      // because `cmd acp` does not apply the global `--skill` flag.
+      env.OPENCODE_ACP_SKILL_DIR = this.cmdSkillDir
+    }
     if (config.credential) {
       const name = credentialEnvName(config)
       const value = await this.resolver(config.credential)
@@ -350,6 +379,7 @@ export class AcpServerManager {
       const session = await client.newSession(config.cwd ?? this.defaultCwd, {
         model: config.model,
         meta: config.meta,
+        additionalDirectories: this.sessionDirectories(config),
       })
       if (this.disposed) throw new Error("ACP server manager is stopped")
       let models = session.models
@@ -444,7 +474,11 @@ export class AcpServerManager {
 
     if (!input.key) {
       const prompt = typeof input.prompt === "string" ? input.prompt : input.prompt.fresh
-      const session = await client.newSession(cwd, { model, meta: state.config.meta })
+      const session = await client.newSession(cwd, {
+        model,
+        meta: state.config.meta,
+        additionalDirectories: this.sessionDirectories(state.config),
+      })
       try {
         if (mode) await client.setMode(session.sessionId, mode).catch(() => {})
         await this.applyEffort(state, client, session.sessionId, effort)
@@ -476,6 +510,7 @@ export class AcpServerManager {
             model,
             mcpServers: lease?.servers,
             meta: state.config.meta,
+            additionalDirectories: this.sessionDirectories(state.config),
           })
           if (mode) await client.setMode(session.sessionId, mode).catch(() => {})
           await this.applyEffort(state, client, session.sessionId, effort)

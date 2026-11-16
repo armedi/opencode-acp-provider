@@ -105,6 +105,34 @@ test("returns minimal tool guidance on initialize", async () => {
   }
 })
 
+test("does not bridge OpenCode's skill tool", async () => {
+  const ctx = context({
+    tool: {
+      list: async () => [
+        { name: "skill", execute: async () => ({}) },
+        { name: "question", execute: async () => ({}) },
+      ],
+    },
+  })
+  const { server, lease, token } = await start(ctx)
+  try {
+    const tools = await rpc(server.url, token, { jsonrpc: "2.0", id: 2, method: "tools/list" })
+    const names = tools.body.result.tools.map((tool: { name: string }) => tool.name)
+    expect(names).not.toContain("skill")
+
+    const initialized = await rpc(server.url, token, {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18" },
+    })
+    expect(initialized.body.result.instructions).not.toContain("`skill`")
+  } finally {
+    lease.release()
+    await server.close()
+  }
+})
+
 test("lists the session tools", async () => {
   const { server, lease, token } = await start()
   try {

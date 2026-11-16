@@ -41,6 +41,19 @@ test("runs an ACP session end to end", async () => {
   }
 })
 
+test("forwards additionalDirectories when it creates a session", async () => {
+  const acp = client()
+  try {
+    const session = await acp.newSession(tmpdir(), {
+      additionalDirectories: ["/tmp/opencode-skills-a", "/tmp/opencode-skills-b"],
+    })
+    const result = await acp.prompt(session.sessionId, "directories")
+    expect(result.text).toBe("directories:/tmp/opencode-skills-a,/tmp/opencode-skills-b")
+  } finally {
+    await acp.stop()
+  }
+})
+
 test("stop rejects a turn that is still running", async () => {
   const acp = client({ promptTimeoutMs: 0 })
   const session = await acp.newSession(tmpdir())
