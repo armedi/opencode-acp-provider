@@ -42,7 +42,7 @@ The plugin is a local package. Point OpenCode at the absolute path in your `open
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "./plugins/opencode-acp",
+      "package": "/Users/armedi.armedi/repos/github.com/armedi/opencode-acp",
       "options": {
         "logLevel": "info",
         "servers": [
