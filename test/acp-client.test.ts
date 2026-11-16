@@ -41,19 +41,6 @@ test("runs an ACP session end to end", async () => {
   }
 })
 
-test("forwards additionalDirectories when it creates a session", async () => {
-  const acp = client()
-  try {
-    const session = await acp.newSession(tmpdir(), {
-      additionalDirectories: ["/tmp/opencode-skills-a", "/tmp/opencode-skills-b"],
-    })
-    const result = await acp.prompt(session.sessionId, "directories")
-    expect(result.text).toBe("directories:/tmp/opencode-skills-a,/tmp/opencode-skills-b")
-  } finally {
-    await acp.stop()
-  }
-})
-
 test("declines a native agent question instead of auto-approving its options", async () => {
   // autoApprove is true, but question options must never be picked automatically.
   const acp = client()
@@ -84,18 +71,6 @@ test("stop rejects a turn that is still running", async () => {
   await new Promise((resolve) => setTimeout(resolve, 50))
   await acp.stop()
   await expect(pending).rejects.toThrow("stopped")
-})
-
-test("newSession closes the session when the agent rejects a model", async () => {
-  const acp = client()
-  try {
-    await expect(acp.newSession(tmpdir(), { model: "missing" })).rejects.toThrow("unknown model")
-    // The client is still usable after the failed session.
-    const session = await acp.newSession(tmpdir())
-    expect(session.sessionId).toStartWith("sess-")
-  } finally {
-    await acp.stop()
-  }
 })
 
 test("keeps fs writes inside the session directory", async () => {

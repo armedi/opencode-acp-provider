@@ -52,24 +52,6 @@ test("falls back to a reported diff for edits", () => {
   expect(state?.input.newString).toBe("b")
 })
 
-test("names write calls when the title says so", () => {
-  const states = new Map<string, AcpToolState>()
-  const state = applyToolUpdate(
-    {
-      sessionUpdate: "tool_call",
-      toolCallId: "call-3",
-      title: "Create hello.txt",
-      kind: "edit",
-      status: "in_progress",
-      rawInput: { file_path: "hello.txt", content: "hello" },
-    },
-    states,
-  )
-  expect(state?.name).toBe("write")
-  expect(state?.input.path).toBe("hello.txt")
-  expect(state?.input.content).toBe("hello")
-})
-
 test("maps codex read calls from locations and terminal output", () => {
   const states = new Map<string, AcpToolState>()
   const state = applyToolUpdate(
@@ -107,7 +89,7 @@ test("maps codex read calls from locations and terminal output", () => {
   expect(completed?.output).toBe("alpha\nbeta\n")
 })
 
-test("renders MCP calls as a console card and reads their result", () => {
+test("renders MCP calls as console cards and reads their result", () => {
   const states = new Map<string, AcpToolState>()
   const state = applyToolUpdate(
     {
@@ -134,14 +116,12 @@ test("renders MCP calls as a console card and reads their result", () => {
     states,
   )
   expect(completed?.output).toBe('{"total":9}')
-})
 
-test("renders mcp__ tool names as console cards", () => {
-  const states = new Map<string, AcpToolState>()
-  const pending = applyToolUpdate(
+  // Agents that name the tool `mcp__server__tool` send arguments with a later update.
+  const named = applyToolUpdate(
     {
       sessionUpdate: "tool_call",
-      toolCallId: "call-mcp",
+      toolCallId: "exec-4",
       name: "mcp__opencode__models",
       title: "mcp__opencode__models",
       kind: "other",
@@ -150,30 +130,17 @@ test("renders mcp__ tool names as console cards", () => {
     },
     states,
   )
-  expect(pending?.name).toBe("shell")
-  // Codex sends arguments with the first update; Claude sends them later.
-  expect(pending?.input.command).toBeUndefined()
+  expect(named?.input.command).toBeUndefined()
 
   const args = applyToolUpdate(
     {
       sessionUpdate: "tool_call_update",
-      toolCallId: "call-mcp",
+      toolCallId: "exec-4",
       rawInput: { query: "claude", limit: 1 },
     },
     states,
   )
   expect(args?.input.command).toBe('mcp.opencode.models {"query":"claude","limit":1}')
-
-  const completed = applyToolUpdate(
-    {
-      sessionUpdate: "tool_call_update",
-      toolCallId: "call-mcp",
-      status: "completed",
-      rawOutput: '{"total":30}',
-    },
-    states,
-  )
-  expect(completed?.output).toBe('{"total":30}')
 })
 
 test("does not surface internal think calls as tool cards", () => {

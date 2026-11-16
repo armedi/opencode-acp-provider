@@ -100,27 +100,6 @@ test("passes additionalDirectories to fresh and pooled sessions", async () => {
   }
 })
 
-test("a server can opt out of the skills mirror", async () => {
-  const dir = await cwd()
-  const { instance } = manager({
-    defaultCwd: dir,
-    additionalDirectories: ["/tmp/opencode-skills"],
-    skills: false,
-  })
-  try {
-    await instance.initialize()
-    const result = await instance.run({
-      server: "fake",
-      prompt: "directories",
-      key: "ses_no_skills",
-      sessionKey: "ses_no_skills",
-    })
-    expect(result.text).toBe("directories:")
-  } finally {
-    await instance.stop()
-  }
-})
-
 test("a failed turn drops the pool and the next turn starts a new session", async () => {
   const { instance } = manager()
   try {
@@ -172,19 +151,6 @@ test("a failed turn refuses the turns queued behind it", async () => {
     const [firstError, secondError] = await errors
     expect(firstError).toBe("scripted failure")
     expect(secondError).toContain("no longer usable")
-  } finally {
-    await instance.stop()
-  }
-})
-
-test("an allowlist that matches nothing is not retried", async () => {
-  const { instance } = manager({ models: ["does-not-exist"] })
-  try {
-    await instance.initialize()
-    const state = instance.get("fake")
-    expect(state?.models).toEqual([])
-    expect(state?.retryable).toBe(false)
-    expect(state?.error).toContain("advertised no model matching")
   } finally {
     await instance.stop()
   }

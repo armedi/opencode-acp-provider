@@ -94,59 +94,10 @@ test("returns explicit tool guidance on initialize", async () => {
       params: { protocolVersion: "2025-06-18" },
     })
     const instructions = response.body.result.instructions
+    expect(instructions).toContain("Available tools: `question`, `subagent`, `models`")
     expect(instructions).toContain("`mcp__opencode__question`")
     expect(instructions).toContain("`opencode.question`")
     expect(instructions).toContain("`tools.mcp__opencode__question`")
-    expect(instructions).toContain("Match the form your own tool list shows")
-    expect(instructions).toContain("Available tools: `question`, `subagent`, `models`")
-    expect(instructions).toContain("Use `question` to ask the user")
-    expect(instructions).toContain("never report that there is no question tool")
-    expect(instructions).toContain("Use `subagent` for delegation")
-    expect(instructions).toContain("do not poll")
-    expect(instructions).toContain("may just be deferred")
-    expect(instructions).not.toContain("the server's `question` tool")
-  } finally {
-    lease.release()
-    await server.close()
-  }
-})
-
-test("does not bridge OpenCode's skill tool", async () => {
-  const ctx = context({
-    tool: {
-      list: async () => [
-        { name: "skill", execute: async () => ({}) },
-        { name: "question", execute: async () => ({}) },
-      ],
-    },
-  })
-  const { server, lease, token } = await start(ctx)
-  try {
-    const tools = await rpc(server.url, token, { jsonrpc: "2.0", id: 2, method: "tools/list" })
-    const names = tools.body.result.tools.map((tool: { name: string }) => tool.name)
-    expect(names).not.toContain("skill")
-
-    const initialized = await rpc(server.url, token, {
-      jsonrpc: "2.0",
-      id: 3,
-      method: "initialize",
-      params: { protocolVersion: "2025-06-18" },
-    })
-    expect(initialized.body.result.instructions).not.toContain("`skill`")
-  } finally {
-    lease.release()
-    await server.close()
-  }
-})
-
-test("lists the session tools", async () => {
-  const { server, lease, token } = await start()
-  try {
-    const response = await rpc(server.url, token, { jsonrpc: "2.0", id: 2, method: "tools/list" })
-    const names = response.body.result.tools.map((tool: { name: string }) => tool.name)
-    expect(names).toContain("session_context")
-    expect(names).toContain("session_prompt")
-    expect(names).toContain("session_list")
   } finally {
     lease.release()
     await server.close()

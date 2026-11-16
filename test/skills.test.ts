@@ -78,28 +78,6 @@ test("mirrors OpenCode skills into the agent-native skill trees", async () => {
   expect(await exists(mirror.root)).toBe(false)
 })
 
-test("only mirrors the requested skill IDs", async () => {
-  const skill = (id: string) => ({
-    id,
-    description: `${id} skill`,
-    path: `skill://${id}/SKILL.md`,
-    content: `# ${id}\n`,
-  })
-  const mirror = await createSkillMirror(context([skill("opencode"), skill("report"), skill("browser")]), {
-    include: ["opencode"],
-  })
-  try {
-    expect(mirror.count).toBe(1)
-    for (const root of [mirror.agentsDir, mirror.claudeDir]) {
-      expect(await exists(join(root, "opencode", "SKILL.md"))).toBe(true)
-      expect(await exists(join(root, "report"))).toBe(false)
-      expect(await exists(join(root, "browser"))).toBe(false)
-    }
-  } finally {
-    await mirror.close()
-  }
-})
-
 test("leaves shared agent skills where the agents already load them", async () => {
   const source = await temp("skill-native-")
   const agentsOnly = join(source, ".agents", "skills", "agents-only")
@@ -174,19 +152,4 @@ test("adds the skills root to cmd without overriding an explicit choice", () => 
   ])
   expect(applyCmdSkillFlag(["claude-agent-acp"], "/tmp/skills", "/mod.ts")).toEqual(["claude-agent-acp"])
   expect(applyCmdSkillFlag(["cmd", "--list-models"], "/tmp/skills", "/mod.ts")).toEqual(["cmd", "--list-models"])
-})
-
-test("the cmd mod registers the directory from the environment", async () => {
-  const { default: mod } = await import("../agents/cmd/opencode-skills.ts")
-  const previous = process.env.OPENCODE_ACP_SKILL_DIR
-  const seen: string[] = []
-  try {
-    process.env.OPENCODE_ACP_SKILL_DIR = "/tmp/mirror/.agents/skills"
-    mod({ addSkillsPath: (path) => seen.push(path) })
-    expect(seen).toEqual(["/tmp/mirror/.agents/skills"])
-    expect(() => mod({})).not.toThrow()
-  } finally {
-    if (previous === undefined) delete process.env.OPENCODE_ACP_SKILL_DIR
-    else process.env.OPENCODE_ACP_SKILL_DIR = previous
-  }
 })

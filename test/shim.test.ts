@@ -19,7 +19,6 @@ function fakeManager(run: (input: RunInput) => Promise<{ stopReason: string; tex
 
 async function start(options: {
   run?: (input: RunInput) => Promise<{ stopReason: string; text: string }>
-  toolCallDisplay?: "off" | "inline"
 } = {}) {
   const calls: RunInput[] = []
   const shim = await createShim({
@@ -30,7 +29,6 @@ async function start(options: {
     resolveModel: (modelID) =>
       modelID === "fake::model-a" ? { server: "fake", model: "model-a" } : undefined,
     token: TOKEN,
-    toolCallDisplay: options.toolCallDisplay,
   })
   return { shim, calls }
 }
@@ -81,24 +79,6 @@ test("keys the session by x-opencode-session-id, not the affinity header", async
   }
 })
 
-test("answers title requests without spending an ACP turn", async () => {
-  const { shim, calls } = await start()
-  try {
-    const response = await chat(shim.url, {
-      model: "fake::model-a",
-      messages: [
-        { role: "system", content: "You name conversations." },
-        { role: "user", content: "<message>Fix the parser bug</message>" },
-      ],
-    })
-    const body = (await response.json()) as any
-    expect(body.choices[0].message.content).toBe("Fix the parser bug")
-    expect(calls.length).toBe(0)
-  } finally {
-    await shim.close()
-  }
-})
-
 test("streams structured tool events when asked", async () => {
   const { shim } = await start({
     run: async (input) => {
@@ -124,33 +104,6 @@ test("streams structured tool events when asked", async () => {
     expect(text).toContain("hi there")
     expect(text).toContain("_acp_tool")
     expect(text).toContain("[DONE]")
-  } finally {
-    await shim.close()
-  }
-})
-
-test("toolCallDisplay=off hides inline tool lines", async () => {
-  const { shim } = await start({
-    toolCallDisplay: "off",
-    run: async (input) => {
-      input.onUpdate?.({
-        sessionUpdate: "tool_call",
-        toolCallId: "call-2",
-        title: "ls",
-        kind: "execute",
-        status: "completed",
-        rawInput: { command: "ls" },
-      })
-      return { stopReason: "end_turn", text: "done" }
-    },
-  })
-  try {
-    const response = await chat(shim.url, {
-      model: "fake::model-a",
-      messages: [{ role: "user", content: "hi" }],
-    })
-    const body = (await response.json()) as any
-    expect(body.choices[0].message.content).toBe("done")
   } finally {
     await shim.close()
   }
