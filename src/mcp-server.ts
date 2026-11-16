@@ -42,6 +42,29 @@ const QUESTION_DESCRIPTION = [
   "- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label",
 ].join("\n")
 
+/**
+ * Order used by the initialize instructions. Clients that defer MCP tools (Codex
+ * shows only the server's `instructions` until a namespace is loaded, and appends
+ * them to every tool description) never see the per-tool descriptions first, so
+ * the namespace text has to name each tool itself.
+ */
+const TOOL_ORDER = [
+  "question",
+  "subagent",
+  "models",
+  "todowrite",
+  "session_list",
+  "session_get",
+  "session_context",
+  "session_prompt",
+  "session_wait",
+  "session_interrupt",
+  "artifact_create",
+  "artifact_read",
+  "artifact_update",
+  "artifact_delete",
+]
+
 const ARTIFACT_DESCRIPTIONS = {
   artifact_create: "Publish a new artifact to the default artifact provider or a named override.",
   artifact_read: "Read an artifact's metadata and file contents so you can inspect or update it.",
@@ -523,23 +546,32 @@ async function buildInstructions(
   const tools = await buildTools(ctx, sessionKey, service, log)
   if (!tools.length) return undefined
   const names = new Set(tools.map((tool) => tool.name))
+  // Tools the model is most likely to need come first; some clients append this
+  // text to every tool description, so keep it tight.
+  const order = new Map(TOOL_ORDER.map((name, index) => [name, index]))
+  const listed = [...tools]
+    .sort((left, right) => (order.get(left.name) ?? 99) - (order.get(right.name) ?? 99))
+    .map((tool) => `\`${tool.name}\``)
+    .join(", ")
   const lines = [
-    "OpenCode exposes its tools through this MCP server; your client may prefix their names with the server name.",
+    "OpenCode MCP server `opencode`. Tool names are plain (`question`, `subagent`, `session_get`, …) but every client adds its own MCP prefix, for example `mcp__opencode__question`, `opencode.question`, or `mcp.opencode.question`; exec/code-mode scripts call `tools.mcp__opencode__question`. Match the form your own tool list shows.",
+    `Available tools: ${listed}.`,
   ]
-  if (names.has("subagent")) {
+  if (names.has("question")) {
     lines.push(
-      "Use the server's `subagent` tool for delegation instead of a native subagent or task tool: call it with { agent, description, prompt }.",
-      "It starts a fresh child session immediately and reports back with a <subagent> message when the child goes idle; do not poll it.",
-      "Available agents and the full contract are in the tool description.",
+      "Use `question` to ask the user for a decision, preference, or clarification instead of asking in plain text.",
+      "It exists even when the agent's native ask-user tool is disabled, so never report that there is no question tool.",
     )
   }
-  if (names.has("question")) {
-    lines.push("Use the server's `question` tool to ask the user.")
+  if (names.has("subagent")) {
+    lines.push(
+      "Use `subagent` for delegation instead of a native subagent or task tool: call it with { agent, description, prompt }.",
+      "It returns at once and reports back with a <subagent> message when the child goes idle; do not poll it.",
+    )
   }
-  const extras = ["models", "todowrite"].filter((name) => names.has(name))
-  if (extras.length) {
-    lines.push(`Other tools: ${extras.map((name) => `\`${name}\``).join(", ")}.`)
-  }
+  lines.push(
+    "If a tool above seems missing it may just be deferred: look it up under the `opencode` MCP namespace, using whatever prefix your client lists (for example in ALL_TOOLS or your client's tool search), before concluding it is unavailable.",
+  )
   return lines.join("\n")
 }
 

@@ -75,7 +75,7 @@ test("negotiates the protocol version it implements", async () => {
   }
 })
 
-test("returns minimal tool guidance on initialize", async () => {
+test("returns explicit tool guidance on initialize", async () => {
   const ctx = context({
     tool: {
       list: async () => [
@@ -94,11 +94,17 @@ test("returns minimal tool guidance on initialize", async () => {
       params: { protocolVersion: "2025-06-18" },
     })
     const instructions = response.body.result.instructions
-    expect(instructions).toContain("the server's `subagent` tool")
-    expect(instructions).toContain("the server's `question` tool")
-    expect(instructions).toContain("`models`")
+    expect(instructions).toContain("`mcp__opencode__question`")
+    expect(instructions).toContain("`opencode.question`")
+    expect(instructions).toContain("`tools.mcp__opencode__question`")
+    expect(instructions).toContain("Match the form your own tool list shows")
+    expect(instructions).toContain("Available tools: `question`, `subagent`, `models`")
+    expect(instructions).toContain("Use `question` to ask the user")
+    expect(instructions).toContain("never report that there is no question tool")
+    expect(instructions).toContain("Use `subagent` for delegation")
     expect(instructions).toContain("do not poll")
-    expect(instructions).not.toContain("mcp__opencode__")
+    expect(instructions).toContain("may just be deferred")
+    expect(instructions).not.toContain("the server's `question` tool")
   } finally {
     lease.release()
     await server.close()
