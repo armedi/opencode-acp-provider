@@ -324,10 +324,12 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
           // Only claim the version we actually implement.
           const requested =
             typeof message.params?.protocolVersion === "string" ? message.params.protocolVersion : undefined
+          const instructions = await buildInstructions(ctx, sessionKey).catch(() => undefined)
           return reply({
             protocolVersion: requested === MCP_PROTOCOL_VERSION ? requested : MCP_PROTOCOL_VERSION,
             capabilities: { tools: { listChanged: false } },
             serverInfo: { name: "opencode", version },
+            ...(instructions ? { instructions } : {}),
           })
         }
         case "ping":
@@ -394,6 +396,30 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
   }
 }
 
+async function buildInstructions(ctx: Ctx, sessionKey: string) {
+  const tools = await buildTools(ctx, sessionKey)
+  if (!tools.length) return undefined
+  const names = new Set(tools.map((tool) => tool.name))
+  const lines = [
+    "OpenCode exposes its tools through this MCP server; your client may prefix their names with the server name.",
+  ]
+  if (names.has("subagent")) {
+    lines.push(
+      "Use the server's `subagent` tool for delegation instead of a native subagent or task tool: call it with { agent, description, prompt }.",
+      "It starts a fresh child session immediately and reports back with a <subagent> message when the child goes idle; do not poll it.",
+      "Available agents and the full contract are in the tool description.",
+    )
+  }
+  if (names.has("question")) {
+    lines.push("Use the server's `question` tool to ask the user.")
+  }
+  const extras = ["models", "todowrite", "skill"].filter((name) => names.has(name))
+  if (extras.length) {
+    lines.push(`Other tools: ${extras.map((name) => `\`${name}\``).join(", ")}.`)
+  }
+  return lines.join("\n")
+}
+
 async function buildTools(ctx: Ctx, sessionKey: string): Promise<McpTool[]> {
   const tools: McpTool[] = []
   const available = await ctx.tool.list().catch(() => [])
@@ -404,7 +430,7 @@ async function buildTools(ctx: Ctx, sessionKey: string): Promise<McpTool[]> {
         available.find((tool) => tool.name === name) ??
         available.find((tool) => tool.name === `opencode.${name}`) ??
         available.find((tool) => tool.id === `opencode.tool.${name}`) ??
-        available.find((tool) => tool.id.endsWith(`.${name}`))
+        available.find((tool) => tool.id?.endsWith(`.${name}`))
       if (match) return match
     }
     return undefined

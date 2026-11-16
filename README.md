@@ -122,6 +122,11 @@ Each ACP session gets its own bearer token, bound to the OpenCode session id and
 session closes. `tools/list` is scoped per session and only advertises tools that are actually
 registered.
 
+The MCP `initialize` response also carries a short instruction block naming the orchestration
+tools by their server-relative names (`subagent`, `question`, and so on), so clients that surface
+MCP server instructions know about them before their first tool call without assuming a
+client-specific tool prefix.
+
 The tools are 1:1 wrappers over OpenCode's own tools and session APIs:
 
 | Tool | Wraps |
@@ -359,6 +364,8 @@ those models reach an ACP agent through the builtin `subagent` tool (see
 - MCP-originated tool calls are executed through the registered tool's `execute`, so plugin
   `execute.before`/`execute.after` hooks do not observe them. The wrapped builtins assert their own
   permissions.
+- Command Code's MCP client ignores `initialize` instructions. It relies on its own "Additional
+  tools" list, which names the bridge tools once `tools/list` succeeds.
 - The provider does not know per-token pricing, so models are registered with an empty cost list
   (pricing unknown, not free). The agent still reports actual per-turn cost in `usage_update` logs.
   Token counts in the completion are estimated from the response length; context usage comes from

@@ -75,6 +75,36 @@ test("negotiates the protocol version it implements", async () => {
   }
 })
 
+test("returns minimal tool guidance on initialize", async () => {
+  const ctx = context({
+    tool: {
+      list: async () => [
+        { name: "subagent", execute: async () => ({}) },
+        { name: "question", execute: async () => ({}) },
+        { name: "models", execute: async () => ({}) },
+      ],
+    },
+  })
+  const { server, lease, token } = await start(ctx)
+  try {
+    const response = await rpc(server.url, token, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18" },
+    })
+    const instructions = response.body.result.instructions
+    expect(instructions).toContain("the server's `subagent` tool")
+    expect(instructions).toContain("the server's `question` tool")
+    expect(instructions).toContain("`models`")
+    expect(instructions).toContain("do not poll")
+    expect(instructions).not.toContain("mcp__opencode__")
+  } finally {
+    lease.release()
+    await server.close()
+  }
+})
+
 test("lists the session tools", async () => {
   const { server, lease, token } = await start()
   try {
