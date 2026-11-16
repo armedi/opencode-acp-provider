@@ -59,18 +59,7 @@ const TOOL_ORDER = [
   "session_prompt",
   "session_wait",
   "session_interrupt",
-  "artifact_create",
-  "artifact_read",
-  "artifact_update",
-  "artifact_delete",
 ]
-
-const ARTIFACT_DESCRIPTIONS = {
-  artifact_create: "Publish a new artifact to the default artifact provider or a named override.",
-  artifact_read: "Read an artifact's metadata and file contents so you can inspect or update it.",
-  artifact_update: "Replace an existing artifact's files at the same ID and URL.",
-  artifact_delete: "Delete an artifact and remove its stored copy.",
-}
 
 export interface McpServerOptions {
   ctx: Ctx
@@ -719,21 +708,6 @@ async function buildTools(
       ),
     },
   }, ["todos"]))
-
-  addBuiltin("artifact_create", ["artifact_create"], ARTIFACT_DESCRIPTIONS.artifact_create, objectSchema({
-    title: stringSchema("Human-readable artifact title."),
-    files: { type: "object", additionalProperties: { type: "string" }, description: "UTF-8 file map keyed by relative path (for example index.html and assets/app.js)." },
-    entry: stringSchema("Entry file path relative to the artifact root. Defaults to index.html, index.md, or the sole file."),
-    provider: stringSchema("Artifact provider ID to override the default provider for this request."),
-  }, ["title", "files"]))
-  addBuiltin("artifact_read", ["artifact_read"], ARTIFACT_DESCRIPTIONS.artifact_read, objectSchema({ id: stringSchema("Artifact ID (art_...) to read.") }, ["id"]))
-  addBuiltin("artifact_update", ["artifact_update"], ARTIFACT_DESCRIPTIONS.artifact_update, objectSchema({
-    id: stringSchema("Artifact ID (art_...) to update."),
-    title: stringSchema("Updated title, or omit to keep the current title."),
-    files: { type: "object", additionalProperties: { type: "string" }, description: "Replacement UTF-8 file map keyed by relative path." },
-    entry: stringSchema("Updated entry file path."),
-  }, ["id"]))
-  addBuiltin("artifact_delete", ["artifact_delete"], ARTIFACT_DESCRIPTIONS.artifact_delete, objectSchema({ id: stringSchema("Artifact ID (art_...) to delete.") }, ["id"]))
 
   tools.push(
     {
