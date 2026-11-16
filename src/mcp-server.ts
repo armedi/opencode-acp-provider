@@ -1,0 +1,676 @@
+import { randomUUID } from "node:crypto"
+import { statSync } from "node:fs"
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
+import { fileURLToPath } from "node:url"
+import type { Plugin } from "@opencode/plugin"
+import type { AcpMcpServer } from "./acp-client.ts"
+import type { LogFn } from "./server-manager.ts"
+
+type Ctx = Plugin.Context
+
+const MCP_PROTOCOL_VERSION = "2025-06-18"
+const MAX_BODY_BYTES = 4 * 1024 * 1024
+const MAX_CONTEXT_CHARS = 60_000
+const TOKEN_IDLE_MS = 2 * 60 * 60_000
+const MAX_TOKENS = 256
+
+const SUBAGENT_DESCRIPTION = [
+  "Spawns an agent in a child session to work on the specified task.",
+  "Subagents always run in the background: the call returns immediately with a sessionID, and you receive a `<subagent>` message each time the child goes idle, including after later work.",
+  "Keep working on non-overlapping tasks, or briefly tell the user what you launched and end your response. Do not sleep, poll, or proactively check on the child's progress.",
+  "New child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.",
+  "Pass the returned sessionID to continue that specific child conversation. A follow-up to a running child joins its current run.",
+].join("\n")
+
+const MODELS_DESCRIPTION = [
+  "Search the models available to use. Use this to turn a model name the user mentions into an exact reference for a tool or subagent.",
+  "The model ID must be written as \"providerID/modelID\", optionally with a #variant. Do not guess the ID: look it up here first.",
+  "Your own provider comes first. Include older versions only when needed.",
+].join("\n")
+
+const QUESTION_DESCRIPTION = [
+  "Use this tool when you need to ask the user questions during execution. This allows you to:",
+  "1. Gather user preferences or requirements",
+  "2. Clarify ambiguous instructions",
+  "3. Get decisions on implementation choices as you work",
+  "4. Offer choices to the user about what direction to take.",
+  "",
+  "Usage notes:",
+  "- A \"Type your own answer\" option is added automatically; don't include a separate option for free form answers",
+  "- Set `multiple: true` to allow selecting more than one option",
+  "- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label",
+].join("\n")
+
+const SKILL_DESCRIPTION =
+  "Load a specialized skill's instructions and resources into the current conversation when the task at hand matches its description.\n\nThe skill ID must match an available skill or a skill explicitly referenced by the user."
+
+const ARTIFACT_DESCRIPTIONS = {
+  artifact_create: "Publish a new artifact to the default artifact provider or a named override.",
+  artifact_read: "Read an artifact's metadata and file contents so you can inspect or update it.",
+  artifact_update: "Replace an existing artifact's files at the same ID and URL.",
+  artifact_delete: "Delete an artifact and remove its stored copy.",
+}
+
+export interface McpServerOptions {
+  ctx: Ctx
+  log?: LogFn
+  transport?: "stdio" | "http"
+  /** Runtime that can execute a JavaScript file, e.g. "node" or "bun". */
+  runtime?: string
+  version?: string
+}
+
+export interface McpLease {
+  servers: AcpMcpServer[]
+  release: () => void
+}
+
+export interface McpServerHandle {
+  url: string
+  issue: (sessionKey: string) => McpLease
+  close: () => Promise<void>
+}
+
+interface McpTool {
+  name: string
+  description: string
+  inputSchema: Record<string, unknown>
+  call: (args: any, signal: AbortSignal) => Promise<any>
+}
+
+interface JsonRpcRequest {
+  jsonrpc?: string
+  id?: number | string | null
+  method?: string
+  params?: any
+}
+
+interface TokenEntry {
+  sessionKey: string
+  lastUsed: number
+}
+
+const objectSchema = (properties: Record<string, unknown>, required: string[] = []) => ({
+  type: "object",
+  properties,
+  ...(required.length ? { required } : {}),
+  additionalProperties: false,
+})
+
+const stringSchema = (description?: string) => ({ type: "string", ...(description ? { description } : {}) })
+
+export async function createMcpServer(options: McpServerOptions): Promise<McpServerHandle> {
+  const { ctx, log = () => {} } = options
+  const transport = options.transport ?? "stdio"
+  const version = options.version ?? "0.4.0"
+  const tokens = new Map<string, TokenEntry>()
+  const bridgePath = fileURLToPath(new URL("./mcp-bridge.mjs", import.meta.url))
+  let loggedTools = false
+
+  if (transport === "stdio") {
+    try {
+      statSync(bridgePath)
+    } catch {
+      throw new Error(`MCP stdio bridge not found at ${bridgePath}`)
+    }
+  }
+
+  const server = createServer((req, res) => {
+    void handleRequest(req, res).catch((error) => {
+      log("error", `MCP request failed: ${error instanceof Error ? error.message : String(error)}`)
+      if (!res.headersSent) {
+        try {
+          res.writeHead(500, { "content-type": "application/json" })
+        } catch {
+          // connection closed
+        }
+      }
+      if (!res.writableEnded) {
+        try {
+          res.end()
+        } catch {
+          // connection closed
+        }
+      }
+    })
+  })
+  server.requestTimeout = 0
+  server.timeout = 0
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", () => resolve())
+  })
+  const address = server.address()
+  const port = typeof address === "object" && address ? address.port : 0
+  const url = `http://127.0.0.1:${port}/mcp`
+  log("info", `OpenCode MCP bridge listening on ${url} (${transport})`)
+
+  const sweeper = setInterval(() => {
+    const cutoff = Date.now() - TOKEN_IDLE_MS
+    for (const [token, entry] of tokens) {
+      if (entry.lastUsed < cutoff) tokens.delete(token)
+    }
+  }, 10 * 60_000)
+  sweeper.unref?.()
+
+  function buildServers(token: string): AcpMcpServer[] {
+    if (transport === "http") {
+      return [
+        {
+          type: "http",
+          name: "opencode",
+          url,
+          headers: [{ name: "Authorization", value: `Bearer ${token}` }],
+        },
+      ]
+    }
+    const runtime = options.runtime ?? process.env.OPENCODE_MCP_NODE
+    const absolute = runtime?.startsWith("/")
+    return [
+      {
+        name: "opencode",
+        command: absolute ? runtime! : "/usr/bin/env",
+        args: absolute ? [bridgePath] : [runtime ?? "node", bridgePath],
+        env: [
+          { name: "OPENCODE_MCP_URL", value: url },
+          { name: "OPENCODE_MCP_TOKEN", value: token },
+        ],
+      },
+    ]
+  }
+
+  function issue(sessionKey: string): McpLease {
+    if (tokens.size >= MAX_TOKENS) {
+      const oldest = [...tokens.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0]
+      if (oldest) tokens.delete(oldest[0])
+    }
+    const token = randomUUID()
+    tokens.set(token, { sessionKey, lastUsed: Date.now() })
+    return {
+      servers: buildServers(token),
+      release: () => {
+        tokens.delete(token)
+      },
+    }
+  }
+
+  function resolveToken(req: IncomingMessage) {
+    const header = req.headers.authorization
+    if (typeof header !== "string" || !header.toLowerCase().startsWith("bearer ")) return undefined
+    const token = header.slice(7).trim()
+    const entry = tokens.get(token)
+    if (!entry) return undefined
+    entry.lastUsed = Date.now()
+    return { token, sessionKey: entry.sessionKey }
+  }
+
+  async function handleRequest(req: IncomingMessage, res: ServerResponse) {
+    res.on("error", () => {})
+    const urlPath = (req.url ?? "").split("?")[0]
+    if (urlPath !== "/mcp") {
+      res.writeHead(404, { "content-type": "application/json" })
+      res.end(JSON.stringify({ error: "Not found" }))
+      return
+    }
+    if (req.method === "OPTIONS") {
+      res.writeHead(204, { allow: "POST, DELETE, OPTIONS" })
+      res.end()
+      return
+    }
+    if (req.method === "GET") {
+      res.writeHead(405, { allow: "POST, DELETE, OPTIONS" })
+      res.end()
+      return
+    }
+
+    const auth = resolveToken(req)
+    if (req.method === "DELETE") {
+      if (auth) tokens.delete(auth.token)
+      res.writeHead(204)
+      res.end()
+      return
+    }
+    if (!auth) {
+      res.writeHead(401, { "content-type": "application/json", "www-authenticate": "Bearer" })
+      res.end(JSON.stringify({ error: "Unauthorized" }))
+      return
+    }
+
+    if (req.method !== "POST") {
+      res.writeHead(405, { allow: "POST, DELETE, OPTIONS" })
+      res.end()
+      return
+    }
+
+    const controller = new AbortController()
+    res.on("close", () => {
+      if (!res.writableEnded) controller.abort()
+    })
+
+    let raw: string
+    try {
+      raw = await readBody(req, MAX_BODY_BYTES)
+    } catch {
+      res.writeHead(413, { "content-type": "application/json" })
+      res.end(JSON.stringify({ error: "Request body too large" }))
+      return
+    }
+
+    let payload: JsonRpcRequest | JsonRpcRequest[]
+    try {
+      payload = JSON.parse(raw)
+    } catch {
+      res.writeHead(400, { "content-type": "application/json" })
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }))
+      return
+    }
+
+    const messages = Array.isArray(payload) ? payload : [payload]
+    const responses: unknown[] = []
+    for (const message of messages) {
+      if (!message || typeof message !== "object") continue
+      if (message.id === undefined || message.id === null) {
+        await dispatch(message, auth.sessionKey, controller.signal).catch(() => undefined)
+        continue
+      }
+      responses.push(await dispatch(message, auth.sessionKey, controller.signal))
+    }
+
+    if (!responses.length) {
+      res.writeHead(202)
+      res.end()
+      return
+    }
+    if (res.headersSent || res.writableEnded) return
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify(Array.isArray(payload) ? responses : responses[0]))
+  }
+
+  async function dispatch(message: JsonRpcRequest, sessionKey: string, signal: AbortSignal) {
+    const id = message.id ?? null
+    const reply = (result: unknown) => ({ jsonrpc: "2.0", id, result })
+    const fail = (code: number, text: string) => ({ jsonrpc: "2.0", id, error: { code, message: text } })
+
+    if (message.method === "notifications/initialized" || message.method === "notifications/cancelled") return undefined
+
+    try {
+      switch (message.method) {
+        case "initialize":
+          return reply({
+            protocolVersion:
+              typeof message.params?.protocolVersion === "string"
+                ? message.params.protocolVersion
+                : MCP_PROTOCOL_VERSION,
+            capabilities: { tools: { listChanged: false } },
+            serverInfo: { name: "opencode", version },
+          })
+        case "ping":
+          return reply({})
+        case "tools/list": {
+          const tools = await buildTools(ctx, sessionKey)
+          if (!loggedTools) {
+            loggedTools = true
+            log("info", `OpenCode MCP tools exposed: ${tools.map((tool) => tool.name).join(", ")}`)
+          }
+          return reply({
+            tools: tools.map((tool) => ({
+              name: tool.name,
+              description: tool.description,
+              inputSchema: tool.inputSchema,
+            })),
+          })
+        }
+        case "tools/call": {
+          const name = String(message.params?.name ?? "")
+          const args = message.params?.arguments ?? {}
+          const tools = await buildTools(ctx, sessionKey)
+          const tool = tools.find((candidate) => candidate.name === name)
+          if (!tool) return fail(-32602, `Unknown tool: ${name}`)
+          const startedAt = Date.now()
+          log("debug", `MCP tool ${name} started for ${sessionKey.slice(0, 12)}`)
+          try {
+            const result = await tool.call(args, signal)
+            log("debug", `MCP tool ${name} finished in ${Date.now() - startedAt}ms`)
+            return reply(result)
+          } catch (error) {
+            const text = error instanceof Error ? error.message : String(error)
+            log("debug", `MCP tool ${name} failed in ${Date.now() - startedAt}ms: ${text}`)
+            return reply({ content: [{ type: "text", text }], isError: true })
+          }
+        }
+        case "resources/list":
+          return reply({ resources: [] })
+        case "prompts/list":
+          return reply({ prompts: [] })
+        case "logging/setLevel":
+          return reply({})
+        default:
+          return fail(-32601, `Method not found: ${message.method}`)
+      }
+    } catch (error) {
+      return fail(-32603, error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  return {
+    url,
+    issue,
+    async close() {
+      clearInterval(sweeper)
+      tokens.clear()
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve())
+        server.closeAllConnections?.()
+      })
+    },
+  }
+}
+
+async function buildTools(ctx: Ctx, sessionKey: string): Promise<McpTool[]> {
+  const tools: McpTool[] = []
+  const available = await ctx.tool.list().catch(() => [])
+
+  const find = (...names: string[]) => {
+    for (const name of names) {
+      const match =
+        available.find((tool) => tool.name === name) ??
+        available.find((tool) => tool.name === `opencode.${name}`) ??
+        available.find((tool) => tool.id === `opencode.tool.${name}`) ??
+        available.find((tool) => tool.id.endsWith(`.${name}`))
+      if (match) return match
+    }
+    return undefined
+  }
+
+  const invoke = async (tool: any, args: any, signal: AbortSignal) => {
+    const session = await ctx.session.get({ sessionID: sessionKey }).catch(() => undefined)
+    const context = {
+      sessionID: sessionKey,
+      agent: session?.agent ?? "build",
+      messageID: randomUUID(),
+      id: randomUUID(),
+      signal,
+      progress: async () => {},
+    }
+    return tool.execute(args, context)
+  }
+
+  const addBuiltin = (
+    name: string,
+    aliases: string[],
+    description: string,
+    inputSchema: Record<string, unknown>,
+    mapArgs: (args: any) => any = (args) => args,
+  ) => {
+    const tool = find(name, ...aliases)
+    if (!tool) return
+    tools.push({
+      name,
+      description,
+      inputSchema,
+      call: async (args, signal) => toMcpResult(await invoke(tool, mapArgs(args ?? {}), signal)),
+    })
+  }
+
+  addBuiltin("models", ["models"], MODELS_DESCRIPTION, objectSchema({
+    query: stringSchema("Text to search for in model names and IDs."),
+    provider: stringSchema("Provider ID or name to filter by. Try your own provider first."),
+    type: { type: "string", enum: ["chat", "image"], description: "Which kind of model to list. Defaults to \"chat\"." },
+    all: { type: "boolean", description: "Include older versions of each model family. By default only the newest version is listed." },
+    limit: { type: "integer", minimum: 1, maximum: 100, description: "Maximum number of models to return. Defaults to 20." },
+    offset: { type: "integer", minimum: 0, description: "Number of models to skip, for paging through results." },
+  }))
+
+  const subagent = find("subagent")
+  if (subagent) {
+    tools.push({
+      name: "subagent",
+      description: await subagentDescription(ctx),
+      inputSchema: objectSchema(
+        {
+          agent: stringSchema(
+            "The type of specialized agent to use for this task. If the user asks for a subagent by a name that is not one of the available subagents, they most likely mean a model: pick a suitable agent and pass the name through the model parameter instead.",
+          ),
+          description: stringSchema("A short 3-5 word label for the task, displayed to the user"),
+          prompt: stringSchema("The task for the subagent to perform"),
+          model: stringSchema(
+            "NEVER set this unless the user explicitly asks for a particular model or variant. It must be a chat model; image and decision models can't run subagents. The value is written as \"providerID/modelID\", or \"providerID/modelID#variant\" to include a variant. Do not guess the ID: look the model up with the models tool, filtering to your own provider first.",
+          ),
+          sessionID: stringSchema("Send a follow-up to an existing subagent, running or finished. Omit to start a new one."),
+        },
+        ["agent", "description", "prompt"],
+      ),
+      call: async (args, signal) => {
+        const input = { ...(args ?? {}) }
+        if (!input.model) delete input.model
+        if (!input.sessionID) delete input.sessionID
+        return toMcpResult(await invoke(subagent, input, signal))
+      },
+    })
+  }
+
+  addBuiltin("question", ["question"], QUESTION_DESCRIPTION, objectSchema({
+    questions: {
+      type: "array",
+      description: "Questions to ask",
+      items: objectSchema(
+        {
+          header: stringSchema("Very short label (max 30 chars)"),
+          question: stringSchema("Complete question"),
+          options: {
+            type: "array",
+            items: objectSchema({ label: stringSchema("Display text (1-5 words, concise)"), description: stringSchema("Explanation of choice") }, ["label", "description"]),
+          },
+          multiple: { type: "boolean", description: "Allow selecting more than one option" },
+        },
+        ["header", "question", "options"],
+      ),
+    },
+  }, ["questions"]))
+
+  addBuiltin("todowrite", ["todowrite", "todo"], "Update the todo list for the current task.", objectSchema({
+    todos: {
+      type: "array",
+      items: objectSchema(
+        {
+          content: stringSchema("Brief description of the task"),
+          status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"], description: "Current status of the task" },
+        },
+        ["content", "status"],
+      ),
+    },
+  }, ["todos"]))
+
+  addBuiltin("skill", ["skill"], SKILL_DESCRIPTION, objectSchema({ id: stringSchema("The ID of an available skill or a skill explicitly referenced by the user") }, ["id"]))
+
+  addBuiltin("artifact_create", ["artifact_create"], ARTIFACT_DESCRIPTIONS.artifact_create, objectSchema({
+    title: stringSchema("Human-readable artifact title."),
+    files: { type: "object", additionalProperties: { type: "string" }, description: "UTF-8 file map keyed by relative path (for example index.html and assets/app.js)." },
+    entry: stringSchema("Entry file path relative to the artifact root. Defaults to index.html, index.md, or the sole file."),
+    provider: stringSchema("Artifact provider ID to override the default provider for this request."),
+  }, ["title", "files"]))
+  addBuiltin("artifact_read", ["artifact_read"], ARTIFACT_DESCRIPTIONS.artifact_read, objectSchema({ id: stringSchema("Artifact ID (art_...) to read.") }, ["id"]))
+  addBuiltin("artifact_update", ["artifact_update"], ARTIFACT_DESCRIPTIONS.artifact_update, objectSchema({
+    id: stringSchema("Artifact ID (art_...) to update."),
+    title: stringSchema("Updated title, or omit to keep the current title."),
+    files: { type: "object", additionalProperties: { type: "string" }, description: "Replacement UTF-8 file map keyed by relative path." },
+    entry: stringSchema("Updated entry file path."),
+  }, ["id"]))
+  addBuiltin("artifact_delete", ["artifact_delete"], ARTIFACT_DESCRIPTIONS.artifact_delete, objectSchema({ id: stringSchema("Artifact ID (art_...) to delete.") }, ["id"]))
+
+  tools.push(
+    {
+      name: "session_list",
+      description: "List sessions in this location, newest first. Mirrors session.list.",
+      inputSchema: objectSchema({
+        limit: { type: "integer", minimum: 1 },
+        order: { type: "string", enum: ["asc", "desc"] },
+        search: stringSchema("Filter by title or content."),
+        parentID: { type: ["string", "null"], description: "Only children of this session." },
+        archived: { type: "boolean" },
+        directory: stringSchema("Filter by directory."),
+        project: stringSchema("Filter by project."),
+        subpath: stringSchema("Filter by subpath."),
+        cursor: stringSchema("Paging cursor."),
+      }),
+      call: async (args) => toMcpResult(await ctx.session.list(args ?? {})),
+    },
+    {
+      name: "session_get",
+      description: "Read one session's status and metadata. Defaults to the calling session.",
+      inputSchema: objectSchema({ sessionID: stringSchema("Session ID. Omit for the calling session.") }),
+      call: async (args) => toMcpResult(await ctx.session.get({ sessionID: args?.sessionID ?? sessionKey })),
+    },
+    {
+      name: "session_prompt",
+      description: "Send a message to a session. delivery=steer joins a running turn; delivery=queue starts a follow-up run. Mirrors session.prompt.",
+      inputSchema: objectSchema(
+        {
+          sessionID: stringSchema("Target session ID."),
+          text: stringSchema("Message text."),
+          id: stringSchema("Stable message id for idempotent retries."),
+          files: { type: "array", items: { type: "object", additionalProperties: true } },
+          agents: { type: "array", items: { type: "object", additionalProperties: true } },
+          skills: { type: "array", items: { type: "object", additionalProperties: true } },
+          metadata: { type: "object", additionalProperties: true },
+          delivery: { type: "string", enum: ["steer", "queue"], description: "Default follows the session's current state." },
+          resume: { type: "boolean" },
+        },
+        ["sessionID", "text"],
+      ),
+      call: async (args, signal) => {
+        await assertSession(ctx, sessionKey, args.sessionID, "prompt", signal)
+        return toMcpResult(await ctx.session.prompt(args))
+      },
+    },
+    {
+      name: "session_context",
+      description: "Read a session's messages. Defaults to the calling session. Large timelines are truncated to the most recent items.",
+      inputSchema: objectSchema({ sessionID: stringSchema("Session ID. Omit for the calling session.") }),
+      call: async (args) => {
+        const messages = await ctx.session.context({ sessionID: args?.sessionID ?? sessionKey })
+        return toMcpResult(boundContext(messages))
+      },
+    },
+    {
+      name: "session_wait",
+      description: "Wait for a session to become idle. The timeout does not cancel the session.",
+      inputSchema: objectSchema(
+        {
+          sessionID: stringSchema("Target session ID."),
+          timeoutMs: { type: "integer", minimum: 0, description: "Maximum wait in milliseconds. Defaults to 45000 and is capped at 120000." },
+        },
+        ["sessionID"],
+      ),
+      call: async (args) => {
+        const sessionID = String(args.sessionID)
+        const requested = Number(args.timeoutMs ?? 45_000)
+        const timeout = requested > 0 ? Math.min(requested, 120_000) : 45_000
+        const wait = ctx.session.wait({ sessionID })
+        const outcome = await Promise.race([
+          wait.then(() => "done" as const),
+          new Promise<"timeout">((resolve) => {
+            const timer = setTimeout(() => resolve("timeout"), timeout)
+            timer.unref?.()
+          }),
+        ])
+        const timedOut = outcome === "timeout"
+        const info = await ctx.session.get({ sessionID }).catch(() => undefined)
+        return toMcpResult({ sessionID, session: info, waitTimedOut: timedOut })
+      },
+    },
+    {
+      name: "session_interrupt",
+      description: "Interrupt a session's active run. Mirrors session.interrupt.",
+      inputSchema: objectSchema({ sessionID: stringSchema("Target session ID."), resume: { type: "boolean" } }, ["sessionID"]) as Record<string, unknown>,
+      call: async (args, signal) => {
+        await assertSession(ctx, sessionKey, args.sessionID, "interrupt", signal)
+        return toMcpResult(await ctx.session.interrupt(args))
+      },
+    },
+  )
+
+  return tools
+}
+
+async function subagentDescription(ctx: Ctx) {
+  const parts = [SUBAGENT_DESCRIPTION]
+  try {
+    const agents = (await ctx.agent.list()).data
+    const available = agents
+      .filter((agent) => agent.mode !== "primary" && !agent.hidden)
+      .sort((left, right) => left.id.localeCompare(right.id))
+    if (available.length) {
+      parts.push("", "Available subagents:", ...available.map((agent) => `- ${agent.id}: ${agent.description ?? "This subagent should only be called when explicitly requested."}`))
+    }
+  } catch {
+    // agent discovery is best effort
+  }
+  return parts.join("\n")
+}
+
+async function assertSession(ctx: Ctx, caller: string, target: any, operation: string, signal: AbortSignal) {
+  if (!target) throw new Error(`session ${operation} requires a sessionID`)
+  try {
+    await ctx.permission.assert({
+      sessionID: caller as any,
+      action: "session",
+      resources: [String(target)],
+      metadata: { operation },
+    } as any)
+  } catch (error) {
+    if (signal.aborted) throw error
+    throw new Error(`Permission denied: session ${operation} on ${target}`)
+  }
+}
+
+function toMcpResult(value: any) {
+  const output = value && typeof value === "object" && "output" in value ? value.output : value
+  let content = value && typeof value === "object" && Array.isArray(value.content) ? value.content : undefined
+  if (!content) {
+    const text =
+      value && typeof value === "object" && typeof value.content === "string"
+        ? value.content
+        : typeof output === "string"
+          ? output
+          : JSON.stringify(output ?? null)
+    content = [{ type: "text", text }]
+  }
+  return {
+    content,
+    ...(output === undefined ? {} : { structuredContent: output }),
+  }
+}
+
+function boundContext(messages: any[]) {
+  const serialized = JSON.stringify(messages)
+  if (serialized.length <= MAX_CONTEXT_CHARS) return { messages, truncated: false, omittedMessages: 0 }
+  let size = 0
+  let start = messages.length
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const length = JSON.stringify(messages[index]).length
+    if (size + length > MAX_CONTEXT_CHARS) break
+    size += length
+    start = index
+  }
+  return { messages: messages.slice(start), truncated: true, omittedMessages: start }
+}
+
+function readBody(req: IncomingMessage, maxBytes: number) {
+  return new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    req.on("data", (chunk) => {
+      size += chunk.length
+      if (size > maxBytes) {
+        reject(new Error("Request body too large"))
+        req.destroy()
+        return
+      }
+      chunks.push(Buffer.from(chunk))
+    })
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")))
+    req.on("error", reject)
+  })
+}

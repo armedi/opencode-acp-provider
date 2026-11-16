@@ -1,0 +1,32 @@
+{
+  "name": "opencode-acp-client",
+  "version": "0.5.0",
+  "description": "OpenCode plugin that acts as an Agent Client Protocol (ACP) client and exposes registered ACP agents as model providers.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "typescript": "^5.9.3"
+  },
+  "keywords": [
+    "opencode",
+    "acp",
+    "agent-client-protocol"
+  ],
+  "license": "MIT"
+}
