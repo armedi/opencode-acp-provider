@@ -313,7 +313,6 @@ Plugin options:
 | --- | --- |
 | `logLevel` | `debug`, `info` (default), `warn`, or `error`. Debug logs also go to `$ACP_PLUGIN_LOG` (default `/tmp/opencode-acp.log`), which is truncated at 10 MB. |
 | `includeSystem` | Include OpenCode's system message in the ACP prompt. Defaults to `false`; the ACP agent uses its own instructions. |
-| `localTitles` | Answer session-title requests locally instead of spending an ACP turn. Defaults to `true`. |
 | `historyTurns` | Turns of history replayed into a brand new ACP session. Defaults to `16`. |
 | `historyChars` | Characters of history replayed into a brand new ACP session. Defaults to `8192`. The same cap applies to the recent conversation a `/compact` summary keeps. |
 | `maxSessions` | Most reused ACP sessions kept alive per location. Defaults to `32`; the least recently used idle session is closed when the cap is reached. |
@@ -365,7 +364,7 @@ error.
    transcript (last 16 turns, capped at 8k characters by default) so a restarted agent still sees the
    conversation without replaying an unbounded history. Idle sessions are closed after 30 minutes and
    the pool is capped at 32.
-5. **Titles** are answered locally instead of spending an ACP turn on session naming.
+5. **Titles** use OpenCode's default title behavior rather than a plugin-specific path.
 6. **Recovery** is automatic: if an agent process exits, the next turn restarts it and resumes the
    stored sessions. Every handshake, control call, and turn has a timeout, retries are bounded by
    `initTimeoutMs`, and a server that fails to start is retried in the background instead of
@@ -416,9 +415,9 @@ Press `<leader>k` (Ctrl+X then K by default) to show or hide them.
 ### Latency
 
 Turn time is dominated by the ACP agent's own model latency and tool loop, not the plugin. The plugin
-keeps fixed overhead to a few tens of milliseconds by reusing the ACP session, skipping title model
-calls, and not replaying conversation history into a session that already has it. If replies are slow,
-try `"effort": "low"` or `"off"` on the server, or a faster model tier exposed by the agent.
+keeps fixed overhead to a few tens of milliseconds by reusing the ACP session and not replaying
+conversation history into a session that already has it. If replies are slow, try `"effort": "low"`
+or `"off"` on the server, or a faster model tier exposed by the agent.
 
 ACP models are registered with `capabilities.tools: false`: the ACP agent uses *its own* tools, which
 is the point of delegating to it. OpenCode's built-in tools remain available to normal models, and

@@ -36,8 +36,6 @@ interface AcpPluginOptions {
   servers?: AcpServerConfig[]
   includeSystem?: boolean
   logLevel?: LogLevel
-  /** Answer OpenCode's session-title requests without spending an ACP turn. Defaults to true. */
-  localTitles?: boolean
   /** Turns of history replayed into a brand new ACP session. Defaults to 16. */
   historyTurns?: number
   /** Characters of history replayed into a brand new ACP session. Defaults to 8192. */
@@ -378,7 +376,6 @@ export default Plugin.define({
         resolveModel,
         token: shimToken,
         includeSystem: options.includeSystem === true,
-        localTitles: options.localTitles !== false,
         toolCallDisplay: options.toolCallDisplay,
         historyTurns: options.historyTurns,
         historyChars: options.historyChars,

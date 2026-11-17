@@ -13,8 +13,6 @@ export interface ShimOptions {
   token?: string
   /** Include OpenCode's system message in the ACP prompt. Defaults to false. */
   includeSystem?: boolean
-  /** Answer OpenCode's session-title requests locally. Defaults to true. */
-  localTitles?: boolean
   /** Turns of history replayed into a brand new ACP session. Defaults to 16. */
   historyTurns?: number
   /** Characters of history replayed into a brand new ACP session. Defaults to 8192. */
@@ -133,21 +131,6 @@ function effortOf(body: any): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined
 }
 
-/** OpenCode asks the same model to name a session; answer locally to keep ACP turns focused. */
-function isTitleRequest(messages: ChatMessage[]) {
-  const system = messages.find((message) => message.role === "system")
-  return typeof system?.content === "string" && /name conversations|conversation title/i.test(system.content)
-}
-
-function deriveTitle(messages: ChatMessage[]) {
-  const last = messages[messages.length - 1]
-  const raw = textOf(last ?? { role: "", content: "" })
-  const match = raw.match(/<message>([\s\S]*?)<\/message>/i)
-  const text = (match?.[1] ?? raw).replace(/\s+/g, " ").trim()
-  if (!text) return "New session"
-  return text.length > 60 ? `${text.slice(0, 57)}...` : text
-}
-
 function finishReason(stopReason: string) {
   if (stopReason === "max_tokens" || stopReason === "max_turn_requests") return "length"
   if (stopReason === "refusal") return "content_filter"
@@ -202,7 +185,6 @@ export async function createShim(options: ShimOptions) {
   const debug = options.debugEnabled === true
   const limits = historyLimits(options)
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES
-  const localTitles = options.localTitles !== false
   const toolCallDisplay = options.toolCallDisplay !== "off"
   const token = options.token
   let loggedRequest = false
@@ -316,42 +298,6 @@ export async function createShim(options: ShimOptions) {
     }
     const id = `chatcmpl-${randomUUID()}`
     const created = Math.floor(Date.now() / 1000)
-
-    if (localTitles && isTitleRequest(messages)) {
-      const title = deriveTitle(messages)
-      log("debug", `answering session-title request locally: ${title}`)
-      if (stream) {
-        res.writeHead(200, {
-          "content-type": "text/event-stream",
-          "cache-control": "no-cache",
-          connection: "keep-alive",
-        })
-        const chunk = (delta: Record<string, unknown>, reason: string | null = null) =>
-          `data: ${JSON.stringify({
-            id,
-            object: "chat.completion.chunk",
-            created,
-            model: modelID,
-            choices: [{ index: 0, delta, finish_reason: reason }],
-          })}\n\n`
-        res.write(chunk({ role: "assistant", content: title }))
-        res.write(chunk({}, "stop"))
-        res.write("data: [DONE]\n\n")
-      } else {
-        res.writeHead(200, { "content-type": "application/json" })
-        res.write(
-          JSON.stringify({
-            id,
-            object: "chat.completion",
-            created,
-            model: modelID,
-            choices: [{ index: 0, message: { role: "assistant", content: title }, finish_reason: "stop" }],
-          }),
-        )
-      }
-      res.end()
-      return
-    }
 
     const key = sessionKey(req, body)
     if (!key && !loggedOneOff) {
