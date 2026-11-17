@@ -97,7 +97,7 @@ test("returns explicit tool guidance on initialize", async () => {
     expect(instructions).toContain("Available tools: `question`, `subagent`, `models`")
     expect(instructions).toContain("`mcp__opencode__question`")
     expect(instructions).toContain("`opencode.question`")
-    expect(instructions).toContain("`tools.mcp__opencode__question`")
+    expect(instructions).toContain("`mcp.opencode.question`")
   } finally {
     lease.release()
     await server.close()

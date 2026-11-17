@@ -9,6 +9,8 @@ import type { LogFn } from "./server-manager.ts"
 type Ctx = Plugin.Context
 
 const MCP_PROTOCOL_VERSION = "2025-06-18"
+/** ACP server name of this plugin's bridge. */
+export const MCP_SERVER_NAME = "opencode"
 const MAX_BODY_BYTES = 4 * 1024 * 1024
 const MAX_CONTEXT_CHARS = 60_000
 const TOKEN_IDLE_MS = 2 * 60 * 60_000
@@ -180,7 +182,7 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
       return [
         {
           type: "http",
-          name: "opencode",
+          name: MCP_SERVER_NAME,
           url,
           headers: [{ name: "Authorization", value: `Bearer ${token}` }],
         },
@@ -190,7 +192,7 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
     const absolute = runtime?.startsWith("/")
     return [
       {
-        name: "opencode",
+        name: MCP_SERVER_NAME,
         command: absolute ? runtime! : "/usr/bin/env",
         args: absolute ? [bridgePath] : [runtime ?? "node", bridgePath],
         env: [

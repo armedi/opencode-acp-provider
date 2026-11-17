@@ -12,6 +12,7 @@ import {
 import { createShim, historyLimits, recentConversation, type ChatMessage } from "./shim.ts"
 import { createAcpLanguageModel } from "./language-model.ts"
 import { createMcpServer } from "./mcp-server.ts"
+import { createOpenCodeMcpSource } from "./mcp-config.ts"
 import { createSkillMirror } from "./skills.ts"
 import { debugLog } from "./debug.ts"
 
@@ -166,11 +167,35 @@ export default Plugin.define({
       }
     }
 
+    // Forward the MCP servers OpenCode is configured with so a server is set up
+    // once and reaches every ACP agent, alongside this plugin's own bridge.
+    let openCodeMcp: Awaited<ReturnType<typeof createOpenCodeMcpSource>> | undefined
+    try {
+      openCodeMcp = await createOpenCodeMcpSource(ctx, log)
+    } catch (error) {
+      log("warn", `OpenCode MCP servers disabled: ${error instanceof Error ? error.message : String(error)}`)
+    }
+
     const manager = new AcpServerManager({
       servers,
       defaultCwd: ctx.location.directory,
       log,
-      mcp: mcp ? { servers: (sessionKey) => mcp!.issue(sessionKey) } : undefined,
+      mcp:
+        mcp || openCodeMcp
+          ? {
+              servers: (sessionKey) => {
+                const lease = mcp?.issue(sessionKey)
+                const configured = openCodeMcp?.servers() ?? []
+                // Let the plugin's own bridge win a name collision with a
+                // configured server, since that is the one agents rely on.
+                const taken = new Set(lease?.servers.map((server) => server.name) ?? [])
+                return {
+                  servers: [...(lease?.servers ?? []), ...configured.filter((server) => !taken.has(server.name))],
+                  release: () => lease?.release(),
+                }
+              },
+            }
+          : undefined,
       additionalDirectories: skills ? [skills.root] : undefined,
       cmdSkillDir: skills?.agentsDir,
       cmdSkillMod: skills?.modPath,
@@ -339,6 +364,7 @@ export default Plugin.define({
       await manager.stop().catch(() => {})
       await mcp?.close().catch(() => {})
       await skills?.close().catch(() => {})
+      await openCodeMcp?.close().catch(() => {})
       throw error
     }
 
@@ -353,6 +379,7 @@ export default Plugin.define({
       await manager.stop().catch(() => {})
       await skills?.close().catch(() => {})
       await mcp?.close().catch(() => {})
+      await openCodeMcp?.close().catch(() => {})
     }
 
     try {
