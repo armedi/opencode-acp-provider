@@ -103,7 +103,7 @@ test("warns once about settings ACP cannot forward", async () => {
     source.servers()
     expect(fake.logs).toEqual([
       'warn: MCP server "with-cwd" sets cwd, which ACP cannot forward; the agent starts it in its own directory',
-      'warn: MCP server "with-oauth" signs in through OpenCode, which cannot be shared; the ACP agent needs its own credentials',
+      'warn: MCP server "with-oauth" signs in through OpenCode, whose login is not shared; the ACP agent authenticates on its own',
     ])
   } finally {
     await source.close()

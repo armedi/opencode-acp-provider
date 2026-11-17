@@ -64,7 +64,7 @@ export async function createOpenCodeMcpSource(ctx: Ctx, log: LogFn): Promise<Ope
         if (config.oauth) {
           warnOnce(
             `${name}:oauth`,
-            `MCP server "${name}" signs in through OpenCode, which cannot be shared; the ACP agent needs its own credentials`,
+            `MCP server "${name}" signs in through OpenCode, whose login is not shared; the ACP agent authenticates on its own`,
           )
         }
         servers.push({ type: "http", name, url: config.url, headers: pairs(config.headers) })
