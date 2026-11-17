@@ -124,8 +124,42 @@ function handle(message) {
             ...(canRestore ? { loadSession: true } : {}),
           },
           authMethods: [],
+          ...(steeringSupported ? { _meta: { steering: { supported: true } } } : {}),
         },
       })
+    case "_session/steering": {
+      const sessionId = message.params?.sessionId
+      const text = (message.params?.prompt ?? [])
+        .filter((block) => block?.type === "text")
+        .map((block) => block.text)
+        .join("\n")
+      if (/\bfail\b/i.test(text)) {
+        return send({
+          jsonrpc: "2.0",
+          id: message.id,
+          error: { code: -32000, message: "scripted steering failure" },
+        })
+      }
+      const pending = runningTurns.get(sessionId)
+      if (!pending) {
+        const idle = message.params?._meta?.steering?.idleBehavior
+        return send({
+          jsonrpc: "2.0",
+          id: message.id,
+          result:
+            idle === "promptRequired"
+              ? { outcome: "promptRequired", reason: "noRunningTurn" }
+              : { outcome: "startedNewTurn" },
+        })
+      }
+      runningTurns.delete(sessionId)
+      update(sessionId, {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: `steer:${text}` },
+      })
+      send({ jsonrpc: "2.0", id: pending.id, result: { stopReason: "end_turn" } })
+      return send({ jsonrpc: "2.0", id: message.id, result: { outcome: "injected" } })
+    }
     case "session/new": {
       const sessionId = `sess-${nextSession++}`
       sessionDirectories.set(sessionId, message.params?.additionalDirectories ?? [])

@@ -18,6 +18,8 @@ function client(options: { promptTimeoutMs?: number; requestTimeoutMs?: number; 
   })
 }
 
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
 test("runs an ACP session end to end", async () => {
   const acp = client()
   try {
@@ -89,6 +91,52 @@ test("keeps fs writes inside the session directory", async () => {
     await acp.stop()
     await rm(root, { recursive: true, force: true })
     await rm(outside, { recursive: true, force: true })
+  }
+})
+
+test("reads steering support from the initialize handshake", async () => {
+  const supports = client()
+  const plain = client({ agentArgs: ["--no-steering"] })
+  try {
+    expect((await supports.start()).steering).toBe(true)
+    expect(supports.supportsSteering).toBe(true)
+    expect((await plain.start()).steering).toBe(false)
+    expect(plain.supportsSteering).toBe(false)
+  } finally {
+    await supports.stop()
+    await plain.stop()
+  }
+})
+
+test("steers a running turn and cancels one that is not steered", async () => {
+  const acp = client()
+  try {
+    const session = await acp.newSession(tmpdir())
+
+    const turn = acp.prompt(session.sessionId, "steer-me")
+    await delay(100)
+    expect(await acp.steer(session.sessionId, "change of plan")).toEqual({ outcome: "injected" })
+    expect(await turn).toEqual({ stopReason: "end_turn", text: "steer:change of plan" })
+
+    const second = acp.prompt(session.sessionId, "steer-me")
+    await delay(100)
+    acp.cancelTurn(session.sessionId)
+    expect(await second).toEqual({ stopReason: "cancelled", text: "cancelled" })
+  } finally {
+    await acp.stop()
+  }
+})
+
+test("hands a steer back when no turn is running", async () => {
+  const acp = client()
+  try {
+    const session = await acp.newSession(tmpdir())
+    expect(await acp.steer(session.sessionId, "too early")).toEqual({
+      outcome: "promptRequired",
+      reason: "noRunningTurn",
+    })
+  } finally {
+    await acp.stop()
   }
 })
 

@@ -149,6 +149,15 @@ export interface AcpRunResult {
   text: string
 }
 
+/** What happened to a mid-turn message handed to `AcpServerManager.steer`. */
+export type AcpSteerResult =
+  /** The agent took the text into the turn that was already running. */
+  | { status: "steered" }
+  /** The agent cannot steer, so the running turn was cancelled to let the message land next. */
+  | { status: "interrupted" }
+  /** No ACP turn is running for this session, so there is nothing to steer. */
+  | { status: "unavailable" }
+
 export type AcpCompactResult =
   /** `text` is what the agent said; `tokens` is its context size before and after, when it reports them. */
   | { status: "compacted"; text: string; tokens?: { before: number; after: number } }
@@ -739,6 +748,60 @@ export class AcpServerManager {
     pooled.mcpRelease?.()
     void pooled.client.closeSession(pooled.sessionId).catch(() => {})
   }
+
+  /** Whether an ACP turn is streaming for this OpenCode session right now. */
+  running(key: string) {
+    return [...this.pools.values()].some((entry) => entry.key === key && entry.active > 0 && !entry.broken)
+  }
+
+  /**
+   * Deliver a message into the turn that is running for an OpenCode session.
+   *
+   * An agent that advertises `_session/steering` takes the text where it is, so
+   * the caller can drop the queued OpenCode message and avoid delivering it
+   * twice. Every other agent is interrupted instead: the turn ends at its next
+   * safe point and OpenCode delivers the queued message as its own prompt, which
+   * resumes the same ACP session with its context intact.
+   */
+  async steer(input: { key: string; text: string; inPlace?: boolean }): Promise<AcpSteerResult> {
+    const pooled = [...this.pools.values()]
+      .filter((entry) => entry.key === input.key && entry.active > 0 && !entry.broken)
+      .sort((left, right) => right.lastUsed - left.lastUsed)[0]
+    if (!pooled) return { status: "unavailable" }
+
+    const client = pooled.client
+    pooled.lastUsed = Date.now()
+    if (input.inPlace !== false && client.supportsSteering) {
+      try {
+        const result = await client.steer(pooled.sessionId, input.text)
+        if (result.outcome === "injected" || result.outcome === "startedNewTurn") {
+          this.log("debug", `steered ACP session ${pooled.sessionId} (${result.outcome})`)
+          return { status: "steered" }
+        }
+        this.log(
+          "debug",
+          `ACP session ${pooled.sessionId} did not take the steer: ${result.outcome}${result.reason ? ` (${result.reason})` : ""}`,
+        )
+      } catch (error) {
+        if (error instanceof AcpError && error.code === ACP_REQUEST_TIMEOUT) {
+          // The steer may or may not have landed. Interrupting now could undo
+          // work the agent already accepted, so leave the queued message for
+          // OpenCode's normal delivery instead.
+          this.log("warn", `steering ACP session ${pooled.sessionId} timed out; leaving the message queued`)
+          return { status: "unavailable" }
+        }
+        this.log(
+          "warn",
+          `could not steer ACP session ${pooled.sessionId}: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
+
+    client.cancelTurn(pooled.sessionId)
+    this.log("debug", `interrupted ACP session ${pooled.sessionId} so the queued message can be delivered`)
+    return { status: "interrupted" }
+  }
+
   /**
    * Compact the agent's own context for an OpenCode session with the agent's
    * `/compact` command. Only an existing pooled session is compacted; opening

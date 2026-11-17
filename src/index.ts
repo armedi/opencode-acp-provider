@@ -14,6 +14,7 @@ import { createShim, historyLimits, recentConversation, type ChatMessage } from 
 import { createAcpLanguageModel } from "./language-model.ts"
 import { createMcpServer } from "./mcp-server.ts"
 import { createOpenCodeMcpSource } from "./mcp-config.ts"
+import { createSteering } from "./steering.ts"
 import { createSkillMirror } from "./skills.ts"
 import { debugLog } from "./debug.ts"
 
@@ -477,6 +478,23 @@ export default Plugin.define({
           }
           const recent = recentConversation(evt.messages as ChatMessage[], limits)
           evt.result = { summary: recent ? `${outcome}\n\nRecent conversation:\n\n${recent}` : outcome }
+        }),
+      )
+
+      // A message the user sends mid-turn is parked until the next step, and an
+      // ACP turn is one step. Offer it to the running turn instead, and drop
+      // OpenCode's copy once an agent has taken it.
+      const steer = createSteering({
+        manager,
+        localService: () => readLocalService(),
+        directory: ctx.location.directory,
+        log,
+      })
+      registrations.push(
+        await ctx.session.hook("prompt", (event) => {
+          // Admission happens after this hook returns, so the steer runs on its
+          // own: it waits for the queued row to appear before dropping it.
+          void steer(event)
         }),
       )
 

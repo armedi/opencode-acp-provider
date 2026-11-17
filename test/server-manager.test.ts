@@ -328,6 +328,71 @@ test("does not open an ACP session just to compact it", async () => {
 /** The fixture holds "steer-me" open, so give it a moment to start before steering. */
 const running = () => new Promise((resolve) => setTimeout(resolve, 200))
 
+test("steers the running turn when the agent supports it", async () => {
+  const { instance } = manager()
+  try {
+    await instance.initialize()
+    const turn = instance.run({ server: "fake", prompt: "steer-me", key: "ses_steer", sessionKey: "ses_steer" })
+    await running()
+    expect(await instance.steer({ key: "ses_steer", text: "change of plan" })).toEqual({ status: "steered" })
+    expect(await turn).toEqual({ stopReason: "end_turn", text: "steer:change of plan" })
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("interrupts the turn when the agent cannot steer", async () => {
+  const { instance } = manager({ agentArgs: ["--no-steering"] })
+  try {
+    await instance.initialize()
+    const turn = instance.run({ server: "fake", prompt: "steer-me", key: "ses_fallback", sessionKey: "ses_fallback" })
+    await running()
+    expect(await instance.steer({ key: "ses_fallback", text: "change of plan" })).toEqual({ status: "interrupted" })
+    expect(await turn).toEqual({ stopReason: "cancelled", text: "cancelled" })
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("does not steer a session with no turn running", async () => {
+  const { instance } = manager()
+  try {
+    await instance.initialize()
+    expect(await instance.steer({ key: "ses_idle", text: "hello" })).toEqual({ status: "unavailable" })
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("falls back to an interrupt when the caller cannot consume the queued message", async () => {
+  const { instance } = manager()
+  try {
+    await instance.initialize()
+    const turn = instance.run({ server: "fake", prompt: "steer-me", key: "ses_inplace", sessionKey: "ses_inplace" })
+    await running()
+    // inPlace=false means the queued copy will still be delivered by OpenCode.
+    expect(await instance.steer({ key: "ses_inplace", text: "change of plan", inPlace: false })).toEqual({
+      status: "interrupted",
+    })
+    expect((await turn).stopReason).toBe("cancelled")
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("interrupts when the agent rejects the steer", async () => {
+  const { instance } = manager()
+  try {
+    await instance.initialize()
+    const turn = instance.run({ server: "fake", prompt: "steer-me", key: "ses_reject", sessionKey: "ses_reject" })
+    await running()
+    expect(await instance.steer({ key: "ses_reject", text: "please fail" })).toEqual({ status: "interrupted" })
+    expect((await turn).stopReason).toBe("cancelled")
+  } finally {
+    await instance.stop()
+  }
+})
+
 test("recycles a session that keeps failing", async () => {
   const { entries, sessionStore } = store()
   const { instance } = manager({ sessions: sessionStore })

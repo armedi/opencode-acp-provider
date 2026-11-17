@@ -30,6 +30,19 @@ export interface PromptResult {
   text: string
 }
 
+/**
+ * Outcome of `_session/steering`, the pre-standard extension shipped by
+ * codex-acp and claude-agent-acp. `promptRequired` means the agent had no turn
+ * that could take the message and left it with the client.
+ */
+export type SteeringOutcome = "injected" | "startedNewTurn" | "promptRequired" | "failed"
+
+export interface SteeringResult {
+  outcome: SteeringOutcome
+  /** Why the agent could not take the steer, e.g. "noRunningTurn". */
+  reason?: string
+}
+
 /** MCP servers the agent should connect to for a session (ACP `session/new`). */
 export type AcpMcpServer =
   | {
@@ -83,6 +96,8 @@ interface AgentHandshake {
     [key: string]: unknown
   }
   authMethods: unknown
+  /** The agent advertised `_session/steering` (`_meta.steering.supported`). */
+  steering: boolean
 }
 
 /**
@@ -177,6 +192,8 @@ interface RequestOptions {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
+/** Steering may wait for a pending permission or elicitation to settle inside the agent. */
+const DEFAULT_STEER_TIMEOUT_MS = 60_000
 const DEFAULT_PROMPT_TIMEOUT_MS = 30 * 60_000
 const DEFAULT_ABORT_GRACE_MS = 5_000
 const DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -292,6 +309,9 @@ export class AcpClient {
       agentInfo: result?.agentInfo,
       agentCapabilities: result?.agentCapabilities ?? {},
       authMethods: result?.authMethods ?? [],
+      // `_session/steering` is advertised out of band: the standard capability
+      // block has no room for an extension.
+      steering: result?._meta?.steering?.supported === true,
     }
     this.log("debug", `initialized ACP agent ${JSON.stringify(this.handshake.agentInfo ?? {})}`)
     return this.handshake
@@ -692,6 +712,11 @@ export class AcpClient {
     )
   }
 
+  /** Whether the agent advertised the `_session/steering` extension. */
+  get supportsSteering() {
+    return this.handshake?.steering === true
+  }
+
   /** Send a prompt turn and stream `session/update` notifications. */
   async prompt(
     sessionId: string,
@@ -748,6 +773,37 @@ export class AcpClient {
     }
   }
 
+  /**
+   * Deliver a message into the turn that is running now with `_session/steering`,
+   * the pre-standard ACP extension shared by codex-acp and claude-agent-acp.
+   *
+   * The request opts into the host-owned idle fallback (`promptRequired`): when no
+   * turn can take the message, the agent hands it back instead of starting a turn
+   * whose updates this client is not listening for. The caller then keeps the
+   * message and sends it as a normal prompt.
+   */
+  async steer(
+    sessionId: string,
+    prompt: string | ContentBlock[],
+    options: { timeoutMs?: number } = {},
+  ): Promise<SteeringResult> {
+    const blocks: ContentBlock[] = typeof prompt === "string" ? [{ type: "text", text: prompt }] : prompt
+    const result = await this.request(
+      "_session/steering",
+      {
+        sessionId,
+        prompt: blocks,
+        _meta: { steering: { idleBehavior: "promptRequired" } },
+      },
+      { timeout: options.timeoutMs ?? DEFAULT_STEER_TIMEOUT_MS },
+    )
+    const outcome = result?.outcome
+    if (outcome === "injected" || outcome === "startedNewTurn" || outcome === "promptRequired" || outcome === "failed") {
+      const reason = typeof result?.reason === "string" ? result.reason : undefined
+      return reason ? { outcome, reason } : { outcome }
+    }
+    return { outcome: "failed", reason: `unexpected steering outcome: ${JSON.stringify(outcome)}` }
+  }
 
   /** Ask the agent to end the running turn; `session/prompt` then resolves with `cancelled`. */
   cancelTurn(sessionId: string) {
