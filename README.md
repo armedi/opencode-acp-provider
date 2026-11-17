@@ -26,7 +26,12 @@ For a server named `cmd`:
   (`category: "thought_level"`), exposed as model variants: `#off`, `#low`, `#high`, `#max`.
   Picking a variant sends `reasoning_effort` to the shim, which calls
   `session/set_config_option` on the ACP session before prompting.
-- Reused ACP sessions per OpenCode session, so the agent keeps its context between turns.
+- Reused ACP sessions per OpenCode session, so the agent keeps its context between turns, across a
+  failed or cancelled turn, and across a plugin reload or agent restart when the agent can restore
+  sessions.
+- Mid-turn steering: a message you send while the agent is working reaches the running turn through
+  `_session/steering` when the agent supports it, and interrupts the turn to land next when it does
+  not (see [Steering](#steering)).
 - No custom OpenCode tools and no agent config. Normal models delegate through OpenCode's builtin
   `subagent` tool by passing an ACP model as its `model` override (see
   [Delegating to an ACP agent](#delegating-to-an-acp-agent)).
@@ -346,21 +351,51 @@ error.
    model variants whose `reasoningEffort` setting reaches the shim as `reasoning_effort`.
 3. **Shim** turns an OpenAI chat-completions request into one `session/prompt`. Text deltas come from
    `session/update` → `agent_message_chunk` and reasoning from `agent_thought_chunk`; both are
-   re-emitted as SSE chunks (`content` and `reasoning_content`).
+   re-emitted as SSE chunks (`content` and `reasoning_content`). A request whose connection is reset
+   before the response starts is retried, and closing the shim lets a turn that is already streaming
+   finish first, so a plugin reload does not surface as `ECONNRESET` mid-turn.
 4. **Sessions** are keyed by OpenCode's `x-opencode-session-id` header (falling back to
    `x-opencode-session`), model, and reasoning effort, created once and reused, with prompts
    serialized per session. The reuse decision is made inside the pool, so a retry after a failed turn
-   cannot replay the wrong prompt. Reused sessions receive only the newest user turn; a fresh session
-   receives a short transcript (last 16 turns, capped at 8k characters by default) so a restarted
-   agent still sees the conversation without replaying an unbounded history. Idle sessions are
-   closed after 30 minutes and the pool is capped at 32.
+   cannot replay the wrong prompt. A failed or cancelled turn keeps the ACP session: the agent is
+   asked to end the turn, and the next prompt continues the same context. Only a dead process or a
+   session the agent no longer knows ends it. Session ids are also stored in OpenCode's plugin
+   storage, so a new agent process reattaches with `session/resume` (or `session/load`) instead of
+   starting over. Reused sessions receive only the newest user turn; a fresh session receives a short
+   transcript (last 16 turns, capped at 8k characters by default) so a restarted agent still sees the
+   conversation without replaying an unbounded history. Idle sessions are closed after 30 minutes and
+   the pool is capped at 32.
 5. **Titles** are answered locally instead of spending an ACP turn on session naming.
-6. **Recovery** is automatic: if an agent process exits, the next turn restarts it and stale pooled
-   sessions are dropped. Every handshake, control call, and turn has a timeout, retries are bounded
-   by `initTimeoutMs`, and a server that fails to start is retried in the background instead of
+6. **Recovery** is automatic: if an agent process exits, the next turn restarts it and resumes the
+   stored sessions. Every handshake, control call, and turn has a timeout, retries are bounded by
+   `initTimeoutMs`, and a server that fails to start is retried in the background instead of
    disappearing from the model picker.
 7. **Cancellation** is wired to the response connection: stopping a turn sends `session/cancel` to
    the agent and gives it a short grace period to finish.
+
+### Steering
+
+A message sent while the agent is working is a *steer*: OpenCode parks it in the session inbox and
+delivers it at the next step boundary. An ACP turn is a single step however many tools the agent
+runs, so the message would otherwise wait for the whole turn.
+
+The plugin watches the prompt hook for those messages and asks the running ACP turn to take one:
+
+- If the agent advertised `_meta.steering.supported` in `initialize`, the text goes to it through
+  `_session/steering` and joins the turn in progress. The queued copy is then removed through the
+  local HTTP API, so the message is not delivered a second time at the step boundary. Because the
+  message is consumed inside the running turn rather than delivered as its own prompt, it does not
+  appear as a separate user message in the transcript; the agent's answer arrives in the step that
+  was already streaming.
+- Otherwise the turn is interrupted with `session/cancel`. OpenCode then delivers the queued message
+  as its own prompt at the step boundary, which resumes the same ACP session with the agent's
+  context intact.
+
+A steer only applies to a plain text message: one that carries files, or that names skills whose
+content is expanded after the hook runs, keeps the normal delivery so the agent receives the full
+prompt. The in-place path needs the local server's HTTP API (`~/.local/state/opencode/service.json`,
+written by `serve --service`, which the CLI and desktop app use). If it is unavailable, the plugin
+falls back to the interrupt path rather than risk delivering the message twice.
 
 ### Thinking blocks
 
@@ -405,6 +440,10 @@ those models reach an ACP agent through the builtin `subagent` tool (see
   tool have no location on their event, and the desktop client ignores those events; the HTTP route
   attaches the session location so the question dock appears. Default CLI servers fall back to the
   builtin question tool.
+- Steering needs the agent to advertise `_meta.steering.supported` in `initialize` (codex-acp and
+  claude-agent-acp do). Everything else is interrupted instead, so the message arrives at the next
+  step boundary rather than mid-turn. In-place steering also needs the local server's HTTP API to
+  drop the queued copy; without it the plugin interrupts instead of risking a duplicate.
 - Plugin setup runs per OpenCode location, so each open location gets its own agent process and
   shim. Startup is bounded by `initTimeoutMs`, and a server that is not ready yet is retried in the
   background.
