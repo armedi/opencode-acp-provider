@@ -284,14 +284,17 @@ function translate(body: ReadableStream<Uint8Array>, log?: Log) {
         push({ type: "reasoning-delta", id: reasoningID, delta: delta.reasoning_content })
       }
       if (delta._acp_tool) handleTool(delta._acp_tool)
-      if (delta._acp_usage && typeof delta._acp_usage === "object") {
-        const used = Number(delta._acp_usage.used)
-        if (Number.isFinite(used) && used >= 0) {
-          usage = {
-            inputTokens: { total: used, noCache: used, cacheRead: 0, cacheWrite: 0 },
-            outputTokens: { total: 0, text: 0, reasoning: 0 },
-          }
-        }
+    }
+    const handleUsage = (value: Record<string, any>) => {
+      const count = (n: unknown) => (typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 0)
+      const input = count(value.prompt_tokens)
+      const cacheRead = Math.min(count(value.prompt_tokens_details?.cached_tokens), input)
+      const cacheWrite = Math.min(count(value.prompt_tokens_details?.cache_write_tokens), input - cacheRead)
+      const output = count(value.completion_tokens)
+      const reasoning = Math.min(count(value.completion_tokens_details?.reasoning_tokens), output)
+      usage = {
+        inputTokens: { total: input, noCache: input - cacheRead - cacheWrite, cacheRead, cacheWrite },
+        outputTokens: { total: output, text: output - reasoning, reasoning },
       }
     }
     let failed = false
@@ -317,6 +320,7 @@ function translate(body: ReadableStream<Uint8Array>, log?: Log) {
           }
           const choice = frame?.choices?.[0]
           if (choice?.delta) handleDelta(choice.delta)
+          if (frame?.usage && typeof frame.usage === "object") handleUsage(frame.usage)
           if (typeof choice?.finish_reason === "string" && choice.finish_reason) reason = choice.finish_reason
         }
       }

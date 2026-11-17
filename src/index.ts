@@ -32,8 +32,6 @@ interface AcpPluginOptions {
   maxFileBytes?: number
   /** Largest chat-completions body accepted by the shim. Defaults to 32 MB. */
   maxBodyBytes?: number
-  /** Context window advertised for ACP models. Defaults to 200000. */
-  contextLimit?: number
   /** Output limit advertised for ACP models. Defaults to 32000. */
   outputLimit?: number
   /** How long to wait for one agent to initialize. Defaults to 20 seconds. */
@@ -192,7 +190,6 @@ export default Plugin.define({
       },
     })
 
-    const contextLimit = options.contextLimit ?? 200_000
     const outputLimit = options.outputLimit ?? 32_000
     const shimToken = randomUUID()
 
@@ -238,7 +235,11 @@ export default Plugin.define({
           temperature: false,
         },
         variants,
-        limit: { context: contextLimit, output: outputLimit },
+        // The agent keeps the conversation in its reused ACP session and
+        // compacts it itself. A known window would let OpenCode auto-compact,
+        // which only spends a turn on a summary the agent never reads. OpenCode
+        // treats 0 as an unknown window and never auto-compacts it.
+        limit: { context: 0, output: outputLimit },
         // Pricing is reported by the ACP agent, not known here. An empty cost
         // list means "unknown" and avoids OpenCode's zero-cost "Free" badge.
         cost: [],

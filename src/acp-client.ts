@@ -25,9 +25,42 @@ export interface SessionUpdate {
   [key: string]: unknown
 }
 
+/**
+ * ACP `PromptResponse.usage` (draft): the tokens the finished turn consumed,
+ * summed over every model call in it. Agents disagree on whether
+ * `inputTokens` includes cached tokens; `totalTokens` tells them apart.
+ */
+export interface AcpTurnUsage {
+  inputTokens: number
+  outputTokens: number
+  totalTokens?: number
+  thoughtTokens?: number | null
+  cachedReadTokens?: number | null
+  cachedWriteTokens?: number | null
+}
+
+function turnUsage(result: any): AcpTurnUsage | undefined {
+  // Command Code reports session-cumulative `usage` and this turn alone in
+  // `_meta.usage`. Its totals show input includes cache reads, so the total
+  // here is input + output.
+  const own = result?._meta?.usage
+  if (own && typeof own === "object" && typeof own.inputTokens === "number") {
+    const output = typeof own.outputTokens === "number" ? own.outputTokens : 0
+    return {
+      inputTokens: own.inputTokens,
+      outputTokens: output,
+      cachedReadTokens: own.cacheReadTokens,
+      cachedWriteTokens: own.cacheWriteTokens,
+      totalTokens: own.inputTokens + output,
+    }
+  }
+  return result?.usage && typeof result.usage === "object" ? (result.usage as AcpTurnUsage) : undefined
+}
+
 export interface PromptResult {
   stopReason: string
   text: string
+  usage?: AcpTurnUsage
 }
 
 /** MCP servers the agent should connect to for a session (ACP `session/new`). */
@@ -666,7 +699,8 @@ export class AcpClient {
           },
         },
       )
-      return { stopReason: result?.stopReason ?? "end_turn", text }
+      const usage = turnUsage(result)
+      return { stopReason: result?.stopReason ?? "end_turn", text, ...(usage ? { usage } : {}) }
     } finally {
       if (this.sessions.get(sessionId)?.onUpdate === onUpdate) {
         const current = this.sessions.get(sessionId)

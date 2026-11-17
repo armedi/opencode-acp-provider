@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { randomUUID } from "node:crypto"
 import type { AcpServerManager } from "./server-manager.ts"
-import type { SessionUpdate } from "./acp-client.ts"
+import type { AcpTurnUsage, SessionUpdate } from "./acp-client.ts"
 import { applyToolUpdate, type AcpToolState } from "./acp-tools.ts"
 
 export interface ShimOptions {
@@ -141,8 +141,36 @@ function finishReason(stopReason: string) {
   return "stop"
 }
 
-function estimateTokens(text: string) {
-  return Math.ceil(text.length / 4)
+/**
+ * Chat-completions `usage` for an ACP turn. `prompt_tokens` includes cached
+ * tokens and `completion_tokens` includes reasoning, as in OpenAI's API;
+ * `cache_write_tokens` carries Anthropic-style cache writes.
+ *
+ * Codex counts cache reads inside `inputTokens` (total = input + output);
+ * Claude counts them beside it (total = input + output + cache), so the total
+ * decides which convention a report uses.
+ */
+function completionUsage(usage: AcpTurnUsage | undefined) {
+  if (!usage) return undefined
+  const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0)
+  const input = count(usage.inputTokens)
+  const output = count(usage.outputTokens)
+  const thought = count(usage.thoughtTokens)
+  const cacheRead = count(usage.cachedReadTokens)
+  const cacheWrite = count(usage.cachedWriteTokens)
+  const total = typeof usage.totalTokens === "number" ? usage.totalTokens : undefined
+  const cached = cacheRead + cacheWrite
+  const cacheBeside = cached > 0 && (total === undefined ? cached > input : total >= input + output + cached)
+  const prompt = input + (cacheBeside ? cached : 0)
+  const thoughtBeside = thought > 0 && total !== undefined && total >= prompt + output + thought
+  const completion = output + (thoughtBeside ? thought : 0)
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    prompt_tokens_details: { cached_tokens: cacheRead, cache_write_tokens: cacheWrite },
+    completion_tokens_details: { reasoning_tokens: Math.min(thought, completion) },
+  }
 }
 
 interface ToolCallState {
@@ -374,7 +402,7 @@ export async function createShim(options: ShimOptions) {
       if (!res.writableEnded) controller.abort()
     })
 
-    const writeChunk = (delta: Record<string, unknown>, reason: string | null = null) => {
+    const writeChunk = (delta: Record<string, unknown>, reason: string | null = null, usage?: unknown) => {
       if (!stream || res.destroyed || res.writableEnded) return
       res.write(
         `data: ${JSON.stringify({
@@ -383,6 +411,7 @@ export async function createShim(options: ShimOptions) {
           created,
           model: modelID,
           choices: [{ index: 0, delta, finish_reason: reason }],
+          ...(usage ? { usage } : {}),
         })}\n\n`,
       )
     }
@@ -412,7 +441,6 @@ export async function createShim(options: ShimOptions) {
     const startedAt = Date.now()
     const toolCalls = new Map<string, ToolCallState>()
     const acpTools = new Map<string, AcpToolState>()
-    let usage: { used?: number; size?: number; cost?: number } = {}
     try {
       const result = await manager.run({
         server: target.server,
@@ -466,13 +494,6 @@ export async function createShim(options: ShimOptions) {
                 writeChunk({ content: line })
               }
             }
-          } else if (update.sessionUpdate === "usage_update") {
-            usage = {
-              used: typeof update.used === "number" ? update.used : undefined,
-              size: typeof update.size === "number" ? update.size : undefined,
-              cost: (update.cost as { amount?: number } | undefined)?.amount,
-            }
-            if (debug) log("debug", `ACP usage ${usage.used ?? "?"}/${usage.size ?? "?"} tokens, cost ${usage.cost ?? "?"}`)
           }
         },
       })
@@ -489,16 +510,16 @@ export async function createShim(options: ShimOptions) {
       }
 
       const reason = finishReason(result.stopReason)
+      // Only the turn's own accounting is billed usage. `usage_update.used` is
+      // context occupancy (and session-cumulative in codex-acp), never input.
+      const usage = completionUsage(result.usage)
       if (stream) {
-        writeChunk(structuredTools && usage.used !== undefined ? { _acp_usage: usage } : {}, reason)
+        writeChunk({}, reason, usage)
         if (!res.destroyed && !res.writableEnded) {
           res.write("data: [DONE]\n\n")
           res.end()
         }
       } else {
-        const completionTokens = estimateTokens(emitted)
-        const totalTokens = usage.used ?? completionTokens
-        const promptTokens = Math.max(0, totalTokens - completionTokens)
         if (res.destroyed) return
         res.writeHead(200, { "content-type": "application/json" })
         res.end(
@@ -514,11 +535,7 @@ export async function createShim(options: ShimOptions) {
                 finish_reason: reason,
               },
             ],
-            usage: {
-              prompt_tokens: promptTokens,
-              completion_tokens: completionTokens,
-              total_tokens: totalTokens,
-            },
+            ...(usage ? { usage } : {}),
           }),
         )
       }

@@ -1,6 +1,12 @@
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
-import { AcpClient, type AcpMcpServer, type SessionUpdate, type PermissionHandler } from "./acp-client.ts"
+import {
+  AcpClient,
+  type AcpMcpServer,
+  type PermissionHandler,
+  type PromptResult,
+  type SessionUpdate,
+} from "./acp-client.ts"
 import { applyCmdSkillFlag, isCmdCommand } from "./skills.ts"
 
 const execFileAsync = promisify(execFile)
@@ -127,10 +133,7 @@ interface PooledSession {
   mcpRelease?: () => void
 }
 
-export interface AcpRunResult {
-  stopReason: string
-  text: string
-}
+export type AcpRunResult = PromptResult
 
 const DEFAULT_MAX_SESSIONS = 32
 const DEFAULT_SESSION_IDLE_MS = 30 * 60_000

@@ -34,8 +34,26 @@ test("runs an ACP session end to end", async () => {
     expect(result.text).toBe("got:hello")
     expect(updates.some((update) => update.sessionUpdate === "tool_call")).toBe(true)
     expect(updates.some((update) => update.sessionUpdate === "usage_update")).toBe(true)
+    expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 2, cachedReadTokens: 8, totalTokens: 12 })
 
     await acp.closeSession(session.sessionId)
+  } finally {
+    await acp.stop()
+  }
+})
+
+test("reports this turn's usage when the agent's usage is session-cumulative", async () => {
+  const acp = client()
+  try {
+    const session = await acp.newSession(tmpdir())
+    const result = await acp.prompt(session.sessionId, "report session totals")
+    expect(result.usage).toEqual({
+      inputTokens: 16833,
+      outputTokens: 3,
+      cachedReadTokens: 16768,
+      cachedWriteTokens: 0,
+      totalTokens: 16836,
+    })
   } finally {
     await acp.stop()
   }

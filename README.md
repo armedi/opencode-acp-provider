@@ -316,7 +316,6 @@ Plugin options:
 | `allowPathsOutsideCwd` | Allow the agent's `fs/read_text_file` and `fs/write_text_file` calls outside the session directory. Defaults to `false`. |
 | `maxFileBytes` | Largest file the client reads for the agent. Defaults to `16777216` (16 MB). |
 | `maxBodyBytes` | Largest chat-completions body the shim accepts. Defaults to `33554432` (32 MB). |
-| `contextLimit` | Context window advertised for ACP models. Defaults to `200000`. Tune it to the real window. |
 | `outputLimit` | Output limit advertised for ACP models. Defaults to `32000`. |
 | `initTimeoutMs` | How long one agent may take to initialize. Defaults to `20000`; a failed server is retried in the background, with each retry bounded by the same timeout. |
 | `requestTimeoutMs` | Timeout for the ACP handshake and control calls such as `session/new`. Defaults to `15000`; raise it for agents that start slowly. |
@@ -429,9 +428,16 @@ those models reach an ACP agent through the builtin `subagent` tool (see
 - Command Code's MCP client ignores `initialize` instructions. It relies on its own "Additional
   tools" list, which names the bridge tools once `tools/list` succeeds.
 - The provider does not know per-token pricing, so models are registered with an empty cost list
-  (pricing unknown, not free). The agent still reports actual per-turn cost in `usage_update` logs.
-  Token counts in the completion are estimated from the response length; context usage comes from
-  `usage_update`.
+  (pricing unknown, not free).
+- Token counts come from the turn's `PromptResponse.usage`, summed over every model call in the
+  turn, with cache reads and writes split out. Codex counts cache reads inside `inputTokens` and
+  Claude counts them beside it; `totalTokens` tells the two apart. Command Code's top-level `usage`
+  is session-cumulative, so its per-turn `_meta.usage` is used instead. `usage_update.used` is
+  ignored: it is context occupancy, and codex-acp reports a session-cumulative total there.
+- ACP models advertise an unknown context window (`0`), so OpenCode never auto-compacts them. The
+  agent keeps the conversation in its reused ACP session and compacts it itself; an OpenCode
+  summary would cost a full turn and never be read. Manual `/compact` still works but has the same
+  problem.
 
 ## Develop
 
