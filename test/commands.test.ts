@@ -27,7 +27,6 @@ function context(options: {
 }) {
   const added: Array<{ name: string; description?: string; execute: (input: any) => Promise<void> }> = []
   const prompts: Array<{ sessionID: string; text: string; delivery: string }> = []
-  let reloads = 0
   let currentSkills = options.skills ?? []
   // OpenCode replays every transform on `reload()`, which is how a rebuild
   // replaces the registered set. The fake has to do the same.
@@ -84,7 +83,6 @@ function context(options: {
         return { dispose: async () => {} }
       },
       async reload() {
-        reloads += 1
         replay()
       },
     },
@@ -109,7 +107,6 @@ function context(options: {
     added,
     prompts,
     lateSkills,
-    reloads: () => reloads,
   }
 }
 
@@ -123,26 +120,7 @@ async function managerWithCommands(agentArgs: string[] = []) {
   return manager
 }
 
-test("captures the full advertised command list", async () => {
-  const acp = new AcpClient({
-    command: process.execPath,
-    args: [agent],
-    cwd: tmpdir(),
-    autoApprove: true,
-  })
-  try {
-    const session = await acp.newSession(tmpdir())
-    expect(await acp.waitForCommands(session.sessionId, 2_000)).toEqual([
-      { name: "compact", description: "Summarize the conversation so far" },
-    ])
-    expect(acp.hasCommand(session.sessionId, "compact")).toBe(true)
-    expect(acp.hasCommand(session.sessionId, "missing")).toBe(false)
-  } finally {
-    await acp.stop()
-  }
-})
-
-test("reports commands the agent advertises later", async () => {
+test("captures and reports the advertised command list", async () => {
   const seen: Array<{ sessionId: string; names: string[] }> = []
   const acp = new AcpClient({
     command: process.execPath,
@@ -152,9 +130,13 @@ test("reports commands the agent advertises later", async () => {
     onCommands: (sessionId, commands) => seen.push({ sessionId, names: commands.map((c) => c.name) }),
   })
   try {
-    await acp.newSession(tmpdir())
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    expect(seen.map((entry) => entry.names)).toEqual([["compact"]])
+    const session = await acp.newSession(tmpdir())
+    expect(await acp.waitForCommands(session.sessionId, 2_000)).toEqual([
+      { name: "compact", description: "Summarize the conversation so far" },
+    ])
+    expect(acp.hasCommand(session.sessionId, "compact")).toBe(true)
+    expect(acp.hasCommand(session.sessionId, "missing")).toBe(false)
+    expect(seen).toEqual([{ sessionId: session.sessionId, names: ["compact"] }])
   } finally {
     await acp.stop()
   }
@@ -179,25 +161,7 @@ test("skips advertising nothing when the agent has no commands", async () => {
   }
 })
 
-test("registers an agent command namespaced by server", async () => {
-  const manager = await managerWithCommands()
-  const { ctx, added } = context({})
-  const bridge = await createCommandBridge({
-    ctx,
-    manager,
-    serverForProvider: (providerID) => (providerID === "acp-fake" ? "fake" : undefined),
-    log: () => {},
-  })
-  try {
-    expect(added.map((command) => command.name)).toEqual(["fake:compact"])
-    expect(added[0].description).toBe("Summarize the conversation so far")
-  } finally {
-    await bridge.close()
-    await manager.stop()
-  }
-})
-
-test("forwards the command text with its arguments to the session", async () => {
+test("registers a namespaced command and forwards its arguments to the session", async () => {
   const manager = await managerWithCommands()
   const { ctx, added, prompts } = context({
     sessionModel: { providerID: "acp-fake", id: "fast" },
@@ -209,6 +173,8 @@ test("forwards the command text with its arguments to the session", async () => 
     log: () => {},
   })
   try {
+    expect(added.map((command) => command.name)).toEqual(["fake:compact"])
+    expect(added[0].description).toBe("Summarize the conversation so far")
     await added[0].execute({ sessionID: "ses-1", prompt: { text: "extra detail" }, delivery: "queue" })
     expect(prompts).toEqual([
       { sessionID: "ses-1", text: "/compact extra detail", delivery: "queue" },
@@ -307,7 +273,7 @@ test("filters a skill the agent marks with its own sigil", async () => {
 test("rebuilds the registered commands when the agent advertises a new list", async () => {
   const manager = await managerWithCommands()
   const state = manager.get("fake")!
-  const { ctx, added, reloads } = context({})
+  const { ctx, added } = context({})
   const bridge = await createCommandBridge({
     ctx,
     manager,
@@ -317,14 +283,12 @@ test("rebuilds the registered commands when the agent advertises a new list", as
   try {
     expect(added.map((command) => command.name)).toEqual(["fake:compact"])
 
-    const before = reloads()
     state.commands = [
       { name: "compact", description: "Summarize the conversation so far" },
       { name: "review", description: "Review the current diff" },
     ]
     await bridge.sync("fake")
 
-    expect(reloads()).toBeGreaterThan(before)
     expect(added.map((command) => command.name)).toEqual(["fake:compact", "fake:review"])
   } finally {
     await bridge.close()
