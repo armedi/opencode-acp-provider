@@ -1,6 +1,7 @@
 import type { Mcp, Plugin } from "@opencode/plugin"
 import type { AcpMcpServer } from "./acp-client.ts"
 import type { AcpServerConfig, LogFn } from "./server-manager.ts"
+import { executableName, isCmdCommand } from "./skills.ts"
 
 type Ctx = Plugin.Context
 type ServerConfig = Mcp.ServerConfig
@@ -9,6 +10,43 @@ export interface OpenCodeMcpSource {
   /** Servers to add to an ACP `session/new`, read from the current config. */
   servers: (agent: AcpServerConfig) => AcpMcpServer[]
   close: () => Promise<void>
+}
+
+interface OauthHint {
+  /** How the agent is named in the warning. */
+  label: string
+  /** Commands that give it a grant; empty when its CLI is not recognized. */
+  steps: string[]
+}
+
+/**
+ * How one agent signs in to a remote MCP server, when its executable is
+ * recognizable. Each CLI keys credentials by a server it already has in its own
+ * config, so a login command alone fails with "no MCP server named ...": the
+ * server has to be registered with the agent first.
+ *
+ * Syntax checked against `cmd`, `codex`, and `claude` (`mcp --help`).
+ */
+function oauthHint(agent: AcpServerConfig, name: string, url: string): OauthHint {
+  const server = JSON.stringify(name)
+  const target = JSON.stringify(url)
+  if (isCmdCommand(agent.command))
+    return {
+      label: "Command Code",
+      steps: [`cmd mcp add --transport http ${server} ${target}`, `cmd mcp auth ${server}`],
+    }
+  const executable = executableName(agent.command)
+  if (executable.startsWith("codex"))
+    return {
+      label: "Codex",
+      steps: [`codex mcp add ${server} --url ${target}`, `codex mcp login ${server}`],
+    }
+  if (executable.startsWith("claude"))
+    return {
+      label: "Claude Code",
+      steps: [`claude mcp add --transport http ${server} ${target}`, `claude mcp login ${server}`],
+    }
+  return { label: executable || "the ACP agent", steps: [] }
 }
 
 /**
@@ -41,7 +79,7 @@ export async function createOpenCodeMcpSource(ctx: Ctx, log: LogFn): Promise<Ope
   }
 
   return {
-    servers(_agent) {
+    servers(agent) {
       const servers: AcpMcpServer[] = []
       for (const [name, config] of configs) {
         if (config.disabled) continue
@@ -62,9 +100,13 @@ export async function createOpenCodeMcpSource(ctx: Ctx, log: LogFn): Promise<Ope
           continue
         }
         if (config.oauth) {
+          const hint = oauthHint(agent, name, config.url)
+          const steps = hint.steps.length ? ` Run ${hint.steps.join(" then ")} to sign in first.` : ""
+          // Keyed by agent: each one signs in on its own, so each needs its own
+          // commands, and a warning logged for one says nothing about another.
           warnOnce(
-            `${name}:oauth`,
-            `MCP server "${name}" signs in through OpenCode, whose login is not shared; the ACP agent authenticates on its own`,
+            `${agent.id}:${name}:oauth`,
+            `MCP server "${name}" signs in through OpenCode, whose login is not shared; ${hint.label} signs in on its own.${steps}`,
           )
         }
         servers.push({ type: "http", name, url: config.url, headers: pairs(config.headers) })

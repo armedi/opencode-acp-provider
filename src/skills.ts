@@ -138,11 +138,18 @@ export function applyCmdSkillFlag(command: string | string[], directory: string,
 
 /** True when the command starts Command Code. */
 export function isCmdCommand(command: string | string[]) {
+  return ["cmd", "cmdc", "commandcode"].includes(executableName(command))
+}
+
+/**
+ * The executable a launch command runs, without its directory or a script
+ * suffix, so a Windows shim and the bare name compare the same way.
+ */
+export function executableName(command: string | string[]) {
   const argv = Array.isArray(command) ? command : [command]
-  const executable = basename(argv[0] ?? "")
+  return basename(argv[0] ?? "")
     .toLowerCase()
     .replace(/\.(?:exe|cmd|bat|js|mjs|cjs)$/, "")
-  return ["cmd", "cmdc", "commandcode"].includes(executable)
 }
 
 function hasOption(argv: string[], name: string, value?: string) {
