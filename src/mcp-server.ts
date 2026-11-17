@@ -192,6 +192,7 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
     const absolute = runtime?.startsWith("/")
     return [
       {
+        type: "stdio",
         name: MCP_SERVER_NAME,
         command: absolute ? runtime! : "/usr/bin/env",
         args: absolute ? [bridgePath] : [runtime ?? "node", bridgePath],

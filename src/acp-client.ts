@@ -672,12 +672,6 @@ export class AcpClient {
     return resume ? "resumed" : "loaded"
   }
 
-  /** Whether the agent can reattach to a session that an earlier process opened. */
-  get canRestoreSessions() {
-    const capabilities = this.handshake?.agentCapabilities
-    return capabilities?.sessionCapabilities?.resume !== undefined || capabilities?.loadSession === true
-  }
-
   /** Whether this client still holds the ACP session and can take another prompt. */
   hasSession(sessionId: string) {
     return this.sessions.has(sessionId)

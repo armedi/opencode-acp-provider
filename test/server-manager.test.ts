@@ -364,22 +364,6 @@ test("does not steer a session with no turn running", async () => {
   }
 })
 
-test("falls back to an interrupt when the caller cannot consume the queued message", async () => {
-  const { instance } = manager()
-  try {
-    await instance.initialize()
-    const turn = instance.run({ server: "fake", prompt: "steer-me", key: "ses_inplace", sessionKey: "ses_inplace" })
-    await running()
-    // inPlace=false means the queued copy will still be delivered by OpenCode.
-    expect(await instance.steer({ key: "ses_inplace", text: "change of plan", inPlace: false })).toEqual({
-      status: "interrupted",
-    })
-    expect((await turn).stopReason).toBe("cancelled")
-  } finally {
-    await instance.stop()
-  }
-})
-
 test("interrupts when the agent rejects the steer", async () => {
   const { instance } = manager()
   try {

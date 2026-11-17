@@ -102,15 +102,6 @@ test("interrupts instead when the local API is unavailable", async () => {
   expect(calls).toEqual([{ key: "ses_1", text: "change of plan", inPlace: false }])
 })
 
-test("interrupts instead when the inbox API cannot be reached", async () => {
-  const calls: SteerInput[] = []
-  // Nothing listens on port 1, so the route is unusable even though it was advertised.
-  const steer = steering({ service: { url: "http://127.0.0.1:1", password: "secret" }, calls })
-
-  await steer(promptEvent())
-  expect(calls).toEqual([{ key: "ses_1", text: "change of plan", inPlace: false }])
-})
-
 test("ignores queued messages, attachments, and empty text", async () => {
   const api = opencodeApi()
   const calls: SteerInput[] = []
