@@ -77,7 +77,9 @@ interface AgentHandshake {
   protocolVersion: number
   agentInfo: unknown
   agentCapabilities: {
-    sessionCapabilities?: { close?: boolean }
+    /** The agent can reload a persisted session with `session/load`. */
+    loadSession?: boolean
+    sessionCapabilities?: { close?: boolean; resume?: unknown }
     [key: string]: unknown
   }
   authMethods: unknown
@@ -612,10 +614,62 @@ export class AcpClient {
     }
   }
 
+  /**
+   * Reattach to a session the agent persisted in an earlier process, keeping
+   * the conversation it holds. `session/resume` restores without replaying the
+   * transcript; `session/load` replays it, and those updates are ignored here
+   * because OpenCode already shows the conversation. Returns undefined when
+   * the agent advertises neither capability.
+   */
+  async restoreSession(
+    sessionId: string,
+    options: {
+      cwd: string
+      mcpServers?: AcpMcpServer[]
+      additionalDirectories?: string[]
+      meta?: Record<string, unknown>
+    },
+  ): Promise<"resumed" | "loaded" | undefined> {
+    const capabilities = (await this.start()).agentCapabilities
+    const resume = capabilities?.sessionCapabilities?.resume !== undefined
+    const load = capabilities?.loadSession === true
+    if (!resume && !load) return undefined
+    const timeout = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+    await this.request(
+      resume ? "session/resume" : "session/load",
+      {
+        sessionId,
+        cwd: options.cwd,
+        mcpServers: options.mcpServers ?? [],
+        ...(options.additionalDirectories?.length ? { additionalDirectories: options.additionalDirectories } : {}),
+        ...(options.meta ? { _meta: options.meta } : {}),
+      },
+      // Replaying a long conversation through session/load is not a control call.
+      { timeout: resume ? timeout : Math.max(60_000, timeout) },
+    )
+    this.sessions.set(sessionId, { cwd: options.cwd })
+    return resume ? "resumed" : "loaded"
+  }
+
+  /** Whether the agent can reattach to a session that an earlier process opened. */
+  get canRestoreSessions() {
+    const capabilities = this.handshake?.agentCapabilities
+    return capabilities?.sessionCapabilities?.resume !== undefined || capabilities?.loadSession === true
+  }
+
+  /** Whether this client still holds the ACP session and can take another prompt. */
+  hasSession(sessionId: string) {
+    return this.sessions.has(sessionId)
+  }
+
+  /** Whether the agent process is running and usable. */
+  get alive() {
+    return Boolean(this.child) && !this.closed && !this.disposed
+  }
+
   async setModel(sessionId: string, modelId: string, configId = "model") {
     return this.setConfigOption(sessionId, configId, modelId)
   }
-
   /** Set the agent's reasoning effort for a session. */
   async setEffort(sessionId: string, effort: string, configId = "effort") {
     return this.setConfigOption(sessionId, configId, effort)
@@ -671,13 +725,7 @@ export class AcpClient {
         {
           timeout: promptTimeout,
           signal: handlers.signal,
-          onAbort: () => {
-            try {
-              this.notify("session/cancel", { sessionId })
-            } catch {
-              // the agent is already gone
-            }
-          },
+          onAbort: () => this.cancelTurn(sessionId),
         },
       )
       // Usage stays in the debug log: no ACP number is right for both of the
@@ -697,6 +745,16 @@ export class AcpClient {
           current.requestPermission = undefined
         }
       }
+    }
+  }
+
+
+  /** Ask the agent to end the running turn; `session/prompt` then resolves with `cancelled`. */
+  cancelTurn(sessionId: string) {
+    try {
+      this.notify("session/cancel", { sessionId })
+    } catch {
+      // the agent is already gone
     }
   }
 

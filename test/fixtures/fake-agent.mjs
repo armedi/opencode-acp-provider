@@ -2,6 +2,8 @@
 // Scripted ACP agent used by the tests. Speaks newline-delimited JSON-RPC on
 // stdio and implements just enough of the protocol for the client.
 
+import { readFileSync, writeFileSync } from "node:fs"
+
 let nextSession = 1
 const sessionDirectories = new Map()
 const configOptions = [
@@ -37,6 +39,39 @@ function send(message) {
 const replies = new Map()
 let nextRequest = 1000
 
+// `_session/steering` support is advertised by default so the client path is
+// exercised; `--no-steering` covers agents that only understand prompts.
+const steeringSupported = !process.argv.includes("--no-steering")
+const runningTurns = new Map()
+
+function argument(name) {
+  const index = process.argv.indexOf(name)
+  return index >= 0 ? process.argv[index + 1] : undefined
+}
+
+// A sessions file lets a later process resume sessions this one opened, which
+// is how an agent survives a plugin reload. `--no-restore` keeps the same file
+// but hides the capabilities, covering agents without session restore.
+const sessionsFile = argument("--sessions-file")
+const canRestore = Boolean(sessionsFile) && !process.argv.includes("--no-restore")
+
+function knownSessions() {
+  if (!sessionsFile) return []
+  try {
+    const value = JSON.parse(readFileSync(sessionsFile, "utf8"))
+    return Array.isArray(value) ? value.filter((id) => typeof id === "string") : []
+  } catch {
+    return []
+  }
+}
+
+function rememberSession(sessionId) {
+  if (!sessionsFile) return
+  const ids = new Set(knownSessions())
+  ids.add(sessionId)
+  writeFileSync(sessionsFile, JSON.stringify([...ids]))
+}
+
 function ask(method, params) {
   const id = nextRequest++
   return new Promise((resolve) => {
@@ -60,6 +95,20 @@ function handle(message) {
     }
     return
   }
+  if (message.method === "session/cancel") {
+    // Cancellation is a notification: end the held turn, if there is one.
+    const sessionId = message.params?.sessionId
+    const pending = runningTurns.get(sessionId)
+    if (pending) {
+      runningTurns.delete(sessionId)
+      update(sessionId, {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "cancelled" },
+      })
+      send({ jsonrpc: "2.0", id: pending.id, result: { stopReason: "cancelled" } })
+    }
+    return
+  }
   if (message.id === undefined) return
 
   switch (message.method) {
@@ -70,13 +119,17 @@ function handle(message) {
         result: {
           protocolVersion: 1,
           agentInfo: { name: "fake-agent", version: "1.0.0" },
-          agentCapabilities: { sessionCapabilities: { close: true } },
+          agentCapabilities: {
+            sessionCapabilities: { close: true, ...(canRestore ? { resume: {} } : {}) },
+            ...(canRestore ? { loadSession: true } : {}),
+          },
           authMethods: [],
         },
       })
     case "session/new": {
       const sessionId = `sess-${nextSession++}`
       sessionDirectories.set(sessionId, message.params?.additionalDirectories ?? [])
+      rememberSession(sessionId)
       send({
         jsonrpc: "2.0",
         id: message.id,
@@ -89,6 +142,22 @@ function handle(message) {
         })
       }
       return
+    }
+    case "session/resume":
+    case "session/load": {
+      const sessionId = message.params?.sessionId
+      if (typeof sessionId !== "string" || !knownSessions().includes(sessionId)) {
+        return send({
+          jsonrpc: "2.0",
+          id: message.id,
+          error: { code: -32002, message: `unknown session: ${sessionId}` },
+        })
+      }
+      sessionDirectories.set(sessionId, message.params?.additionalDirectories ?? [])
+      // Never hand out an id this process already restored.
+      const suffix = Number(sessionId.slice("sess-".length))
+      if (Number.isFinite(suffix) && suffix >= nextSession) nextSession = suffix + 1
+      return send({ jsonrpc: "2.0", id: message.id, result: {} })
     }
     case "session/set_config_option": {
       const value = message.params?.value
@@ -120,8 +189,11 @@ function handle(message) {
         })
       }
       if (/\bhang\b/i.test(text)) return
-      if (/\bpermission\b/i.test(text)) {
-        void (async () => {
+      if (/\bcrash\b/i.test(text)) {
+        // Simulate the agent process dying mid-turn.
+        process.exit(1)
+      }
+      if (/\bpermission\b/i.test(text)) {        void (async () => {
           const reply = await ask("session/request_permission", {
             sessionId,
             toolCall: {
@@ -200,6 +272,12 @@ function handle(message) {
           update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `write:${label}` } })
           send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
         })()
+        return
+      }
+
+      if (/\bsteer-me\b/i.test(text)) {
+        // Hold the turn open so the test can steer it or cancel it.
+        runningTurns.set(sessionId, { id: message.id, text })
         return
       }
 

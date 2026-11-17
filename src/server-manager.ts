@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
-import { AcpClient, type AcpMcpServer, type SessionUpdate, type PermissionHandler } from "./acp-client.ts"
+import { AcpClient, AcpError, type AcpMcpServer, type SessionUpdate, type PermissionHandler } from "./acp-client.ts"
 import { applyCmdSkillFlag, isCmdCommand } from "./skills.ts"
 
 const execFileAsync = promisify(execFile)
@@ -85,6 +85,18 @@ export interface McpProvider {
   servers: (sessionKey: string, agent: AcpServerConfig) => McpLease
 }
 
+/**
+ * Remembers which ACP session belongs to an OpenCode session. A plugin reload
+ * or a crashed agent starts a new process with no in-memory sessions; looking
+ * the id up lets it reattach with `session/resume` instead of starting over
+ * with no context. Implementations are expected to persist across processes.
+ */
+export interface AcpSessionStore {
+  get(key: string): Promise<string | undefined>
+  set(key: string, sessionId: string): Promise<void>
+  delete(key: string): Promise<void>
+}
+
 const DEFAULT_CREDENTIAL_ENV: Record<string, string> = {
   commandcode: "COMMAND_CODE_API_KEY",
   deepseek: "DEEPSEEK_API_KEY",
@@ -124,6 +136,10 @@ interface PooledSession {
   queue: Promise<unknown>
   lastUsed: number
   pending: number
+  /** Prompts actually being streamed right now, as opposed to queued behind them. */
+  active: number
+  /** Consecutive turns that failed; the session is recycled after a few. */
+  failures: number
   broken: boolean
   mcpRelease?: () => void
 }
@@ -144,6 +160,14 @@ export type AcpCompactResult =
 const DEFAULT_MAX_SESSIONS = 32
 const DEFAULT_SESSION_IDLE_MS = 30 * 60_000
 const DEFAULT_INIT_TIMEOUT_MS = 20_000
+/** `AcpClient` uses this code when a request exceeded its timeout. */
+const ACP_REQUEST_TIMEOUT = -32001
+/** `AcpClient` uses this code when a request was cancelled. */
+const ACP_REQUEST_CANCELLED = -32800
+/** ACP's "resource not found": the agent no longer knows the session. */
+const ACP_UNKNOWN_SESSION = -32002
+/** Failed turns in a row before the pooled session is recycled. */
+const MAX_TURN_FAILURES = 3
 const SWEEP_INTERVAL_MS = 60_000
 /** Do not evict a session that was created or used this recently, so a turn that is
  * between negotiation and its first `pending` increment cannot be closed under it. */
@@ -159,6 +183,7 @@ export class AcpServerManager {
   private negotiating = new Map<string, Promise<{ pooled: PooledSession; reused: boolean }>>()
   private preparing = new Map<string, Promise<void>>()
   private mcp?: McpProvider
+  private sessions?: AcpSessionStore
   private sweeper?: ReturnType<typeof setInterval>
   private maxSessions: number
   private sessionIdleMs: number
@@ -178,6 +203,8 @@ export class AcpServerManager {
     resolveCredential?: CredentialResolver
     requestPermission?: PermissionResolver
     mcp?: McpProvider
+    /** Persisted ACP session ids, so a restarted agent can resume its conversation. */
+    sessions?: AcpSessionStore
     log?: LogFn
     initTimeoutMs?: number
     requestTimeoutMs?: number
@@ -197,6 +224,7 @@ export class AcpServerManager {
     this.resolver = input.resolveCredential ?? (async () => undefined)
     this.permissionResolver = input.requestPermission
     this.mcp = input.mcp
+    this.sessions = input.sessions
     this.log = input.log ?? (() => {})
     this.initTimeoutMs = input.initTimeoutMs ?? DEFAULT_INIT_TIMEOUT_MS
     this.requestTimeoutMs = input.requestTimeoutMs
@@ -249,6 +277,34 @@ export class AcpServerManager {
 
   private poolKey(server: string, key: string, model: string | undefined, effort: string | undefined, cwd: string) {
     return `${server}\u0000${key}\u0000${model ?? ""}\u0000${cwd}\u0000${effort ?? ""}`
+  }
+
+  private async storedSession(poolKey: string) {
+    if (!this.sessions) return undefined
+    try {
+      return await this.sessions.get(poolKey)
+    } catch (error) {
+      this.log("warn", `could not read a stored ACP session: ${error instanceof Error ? error.message : String(error)}`)
+      return undefined
+    }
+  }
+
+  private async rememberSession(poolKey: string, sessionId: string) {
+    if (!this.sessions) return
+    try {
+      await this.sessions.set(poolKey, sessionId)
+    } catch (error) {
+      this.log("warn", `could not store ACP session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  private async forgetSession(poolKey: string) {
+    if (!this.sessions) return
+    try {
+      await this.sessions.delete(poolKey)
+    } catch {
+      // a stale id only costs one failed resume
+    }
   }
 
   /** Effort to apply for a run: explicit request, then server config, then agent default. */
@@ -516,14 +572,59 @@ export class AcpServerManager {
         let session: { sessionId: string } | undefined
         let reused = false
         try {
-          session = await client.newSession(cwd, {
-            model,
-            mcpServers: lease?.servers,
-            meta: state.config.meta,
-            additionalDirectories: this.sessionDirectories(state.config),
-          })
+          // A plugin reload or an agent crash leaves a fresh process with no
+          // sessions. Reattach to the one this OpenCode session had instead of
+          // starting over and losing the conversation.
+          const stored = await this.storedSession(poolKey)
+          if (stored) {
+            const restored = await client
+              .restoreSession(stored, {
+                cwd,
+                mcpServers: lease?.servers,
+                meta: state.config.meta,
+                additionalDirectories: this.sessionDirectories(state.config),
+              })
+              .catch(async (error) => {
+                this.log(
+                  "warn",
+                  `could not restore ACP session ${stored} for key ${input.key!.slice(0, 24)}: ${
+                    error instanceof Error ? error.message : String(error)
+                  }; starting a new one`,
+                )
+                await this.forgetSession(poolKey)
+                return undefined
+              })
+            if (restored) {
+              session = { sessionId: stored }
+              reused = true
+              this.log(
+                "debug",
+                `restored ACP session ${stored} (${restored}) for key ${input.key!.slice(0, 24)}`,
+              )
+            }
+          }
+          if (!session) {
+            session = await client.newSession(cwd, {
+              model,
+              mcpServers: lease?.servers,
+              meta: state.config.meta,
+              additionalDirectories: this.sessionDirectories(state.config),
+            })
+            await this.rememberSession(poolKey, session.sessionId)
+          }
           if (mode) await client.setMode(session.sessionId, mode).catch(() => {})
           await this.applyEffort(state, client, session.sessionId, effort)
+          // A restored session keeps its old model, so put the requested one back.
+          if (reused && model) {
+            await client.setModel(session.sessionId, model).catch((error) => {
+              this.log(
+                "warn",
+                `could not set model "${model}" on restored ACP session: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              )
+            })
+          }
         } catch (error) {
           lease?.release()
           if (session) await client.closeSession(session.sessionId).catch(() => {})
@@ -540,6 +641,8 @@ export class AcpServerManager {
           queue: Promise.resolve(),
           lastUsed: Date.now(),
           pending: 0,
+          active: 0,
+          failures: 0,
           broken: false,
           mcpRelease: lease?.release,
         }
@@ -548,7 +651,7 @@ export class AcpServerManager {
           "debug",
           `opened ACP session ${session.sessionId} for key ${input.key!.slice(0, 24)} in ${Date.now() - sessionStartedAt}ms`,
         )
-        return { pooled: created, reused: false }
+        return { pooled: created, reused }
       })()
       this.negotiating.set(poolKey, negotiating)
       negotiating.finally(() => this.negotiating.delete(poolKey)).catch(() => {})
@@ -564,11 +667,16 @@ export class AcpServerManager {
     pooled.pending += 1
     const run = pooled.queue.then(() => {
       if (pooled.broken) throw new Error(`ACP session ${pooled.sessionId} is no longer usable`)
-      return pooled.client.prompt(pooled.sessionId, prompt, {
-        onUpdate: input.onUpdate,
-        signal: input.signal,
-        requestPermission: onPermission,
-      })
+      pooled.active += 1
+      return pooled.client
+        .prompt(pooled.sessionId, prompt, {
+          onUpdate: input.onUpdate,
+          signal: input.signal,
+          requestPermission: onPermission,
+        })
+        .finally(() => {
+          pooled.active = Math.max(0, pooled.active - 1)
+        })
     })
     pooled.queue = run.catch(() => {})
     const settled = run.then(
@@ -581,19 +689,56 @@ export class AcpServerManager {
         pooled.lastUsed = Date.now()
       })
       .catch(() => {})
-    run.catch(() => {
-      // A failed turn can leave the ACP session unusable; recreate it next time.
-      // Queued turns on this pool notice `broken` and fail instead of prompting
-      // a session that has already been closed.
-      pooled.broken = true
+    run.then(
+      () => {
+        pooled.failures = 0
+      },
+      () => {},
+    ).catch(() => {})
+    run.catch((error: unknown) => {
+      // A failed turn does not necessarily invalidate the ACP session. The
+      // process dying or the agent forgetting the session does; everything else
+      // (cancel, timeout, reset) keeps the context, so a retry resumes the same
+      // conversation instead of starting a new one.
       if (this.pools.get(poolKey) !== pooled) return
-      this.pools.delete(poolKey)
-      pooled.mcpRelease?.()
-      void pooled.client.closeSession(pooled.sessionId).catch(() => {})
+      const message = error instanceof Error ? error.message : String(error)
+      const unknown = isUnknownSession(error)
+      if (unknown || !pooled.client.alive || !pooled.client.hasSession(pooled.sessionId)) {
+        this.dropPool(poolKey, pooled)
+        if (unknown) void this.forgetSession(poolKey)
+        return
+      }
+      pooled.failures += 1
+      if (error instanceof AcpError && error.code === ACP_REQUEST_CANCELLED) {
+        // A stopped turn is normal; the agent already ended it, so the session
+        // is intact and the next prompt picks up the same conversation.
+        pooled.failures = 0
+        this.log("debug", `kept ACP session ${pooled.sessionId} after a cancelled turn`)
+        return
+      }
+      if (pooled.failures >= MAX_TURN_FAILURES) {
+        this.log("warn", `dropping ACP session ${pooled.sessionId} after ${pooled.failures} failed turns: ${message}`)
+        this.dropPool(poolKey, pooled)
+        // A session that failed this many times in a row should not be restored
+        // into the same state on the next turn.
+        void this.forgetSession(poolKey)
+        return
+      }
+      // Ask the agent to end whatever it is still running so the queued or next
+      // prompt enters the same context at a clean boundary.
+      pooled.client.cancelTurn(pooled.sessionId)
+      this.log("debug", `keeping ACP session ${pooled.sessionId} after a failed turn: ${message}`)
     })
     return run
   }
 
+  /** Drop a pooled session on our side, leaving its stored id unless callers forget it. */
+  private dropPool(poolKey: string, pooled: PooledSession) {
+    pooled.broken = true
+    if (this.pools.get(poolKey) === pooled) this.pools.delete(poolKey)
+    pooled.mcpRelease?.()
+    void pooled.client.closeSession(pooled.sessionId).catch(() => {})
+  }
   /**
    * Compact the agent's own context for an OpenCode session with the agent's
    * `/compact` command. Only an existing pooled session is compacted; opening
@@ -696,6 +841,12 @@ export class AcpServerManager {
     }
     await Promise.allSettled([...this.servers.values()].map((state) => state.client?.stop()))
   }
+}
+
+function isUnknownSession(error: unknown) {
+  if (!(error instanceof AcpError)) return false
+  if (error.code === ACP_UNKNOWN_SESSION) return true
+  return /unknown (acp )?session|session .*not found|session .*does not exist/i.test(error.message)
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {

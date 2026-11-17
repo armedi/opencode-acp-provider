@@ -1,5 +1,5 @@
 import { Model, Plugin, Provider } from "@opencode/plugin"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -8,6 +8,7 @@ import {
   type AcpCompactResult,
   type AcpServerConfig,
   type AcpServerState,
+  type AcpSessionStore,
 } from "./server-manager.ts"
 import { createShim, historyLimits, recentConversation, type ChatMessage } from "./shim.ts"
 import { createAcpLanguageModel } from "./language-model.ts"
@@ -74,6 +75,11 @@ const RETRY_DELAYS = [2_000, 5_000, 15_000, 30_000, 60_000]
 
 function providerIDFor(id: string) {
   return `acp-${id.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "server"}`
+}
+
+/** Storage key for one pooled ACP session; the manager's key is an opaque tuple. */
+function storedSessionKey(poolKey: string) {
+  return `acp-session/${createHash("sha256").update(poolKey).digest("hex")}`
 }
 
 interface LocalService {
@@ -176,10 +182,29 @@ export default Plugin.define({
       log("warn", `OpenCode MCP servers disabled: ${error instanceof Error ? error.message : String(error)}`)
     }
 
+    // A plugin reload or a crashed agent starts a new process with no in-memory
+    // sessions. Persist which ACP session belongs to each OpenCode session so
+    // the next process can resume it instead of losing the conversation.
+    const sessionStore: AcpSessionStore | undefined = ctx.storage
+      ? {
+          async get(key) {
+            const value = await ctx.storage.get(storedSessionKey(key))
+            return typeof value === "string" && value ? value : undefined
+          },
+          async set(key, sessionId) {
+            await ctx.storage.set(storedSessionKey(key), sessionId)
+          },
+          async delete(key) {
+            await ctx.storage.remove(storedSessionKey(key))
+          },
+        }
+      : undefined
+
     const manager = new AcpServerManager({
       servers,
       defaultCwd: ctx.location.directory,
       log,
+      sessions: sessionStore,
       mcp:
         mcp || openCodeMcp
           ? {

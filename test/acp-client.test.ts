@@ -7,13 +7,14 @@ import { AcpClient } from "../src/acp-client.ts"
 
 const agent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url))
 
-function client(options: { promptTimeoutMs?: number; requestTimeoutMs?: number } = {}) {
+function client(options: { promptTimeoutMs?: number; requestTimeoutMs?: number; agentArgs?: string[] } = {}) {
   return new AcpClient({
     command: process.execPath,
-    args: [agent],
+    args: [agent, ...(options.agentArgs ?? [])],
     cwd: tmpdir(),
     autoApprove: true,
-    ...options,
+    promptTimeoutMs: options.promptTimeoutMs,
+    requestTimeoutMs: options.requestTimeoutMs,
   })
 }
 
@@ -88,5 +89,43 @@ test("keeps fs writes inside the session directory", async () => {
     await acp.stop()
     await rm(root, { recursive: true, force: true })
     await rm(outside, { recursive: true, force: true })
+  }
+})
+
+test("restores a session in a fresh agent process", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "acp-restore-"))
+  const sessionsFile = join(dir, "sessions.json")
+  const first = client({ agentArgs: ["--sessions-file", sessionsFile] })
+  let sessionId = ""
+  try {
+    const session = await first.newSession(dir)
+    sessionId = session.sessionId
+    expect(first.canRestoreSessions).toBe(true)
+    expect((await first.prompt(sessionId, "hello")).text).toBe("got:hello")
+  } finally {
+    await first.stop()
+  }
+
+  const second = client({ agentArgs: ["--sessions-file", sessionsFile] })
+  try {
+    expect(await second.restoreSession(sessionId, { cwd: dir })).toBe("resumed")
+    expect(second.hasSession(sessionId)).toBe(true)
+    expect((await second.prompt(sessionId, "again")).text).toBe("got:again")
+    await expect(second.restoreSession("sess-999", { cwd: dir })).rejects.toThrow("unknown session")
+  } finally {
+    await second.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("does not offer session restore when the agent cannot do it", async () => {
+  const acp = client({ agentArgs: ["--no-restore"] })
+  try {
+    const handshake = await acp.start()
+    expect(handshake.agentCapabilities.loadSession).toBeUndefined()
+    expect(acp.canRestoreSessions).toBe(false)
+    expect(await acp.restoreSession("sess-1", { cwd: tmpdir() })).toBeUndefined()
+  } finally {
+    await acp.stop()
   }
 })
