@@ -54,7 +54,7 @@ test("maps local and remote servers to the ACP shape", async () => {
   const source = await createOpenCodeMcpSource(fake.ctx, fake.log)
   try {
     expect(source.servers(agent)).toEqual([
-      { name: "github", command: "npx", args: ["-y", "server-github"], env: [{ name: "TOKEN", value: "t" }] },
+      { type: "stdio", name: "github", command: "npx", args: ["-y", "server-github"], env: [{ name: "TOKEN", value: "t" }] },
       { type: "http", name: "linear", url: "https://mcp.linear.app/sse", headers: [{ name: "Authorization", value: "Bearer x" }] },
     ])
     expect(fake.logs).toEqual([])

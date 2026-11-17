@@ -46,6 +46,7 @@ export interface SteeringResult {
 /** MCP servers the agent should connect to for a session (ACP `session/new`). */
 export type AcpMcpServer =
   | {
+      type: "stdio"
       name: string
       command: string
       args: string[]

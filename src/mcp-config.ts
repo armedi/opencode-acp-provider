@@ -96,7 +96,10 @@ export async function createOpenCodeMcpSource(ctx: Ctx, log: LogFn): Promise<Ope
             )
           }
           const env = pairs(config.environment)
-          servers.push({ name, command, args, ...(env.length ? { env } : {}) })
+          // Codex ACP's stdio variant requires the ACP transport tag. Other ACP
+          // agents accept the standard untagged v1 form too, but the tagged
+          // shape survives v1/v2 adapters that normalize by transport.
+          servers.push({ type: "stdio", name, command, args, ...(env.length ? { env } : {}) })
           continue
         }
         if (config.oauth) {
