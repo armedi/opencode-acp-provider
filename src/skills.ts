@@ -4,6 +4,7 @@ import { basename, dirname, join, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { Plugin } from "@opencode/plugin"
 import type { LogFn } from "./server-manager.ts"
+import { isCmdCommand } from "./agent-command.ts"
 
 /** Agent Skills IDs are portable only as lowercase kebab-case. */
 const SKILL_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
@@ -134,22 +135,6 @@ export function applyCmdSkillFlag(command: string | string[], directory: string,
   }
   if (!hasOption(argv, "--skill")) argv.push("--skill", directory)
   return argv
-}
-
-/** True when the command starts Command Code. */
-export function isCmdCommand(command: string | string[]) {
-  return ["cmd", "cmdc", "commandcode"].includes(executableName(command))
-}
-
-/**
- * The executable a launch command runs, without its directory or a script
- * suffix, so a Windows shim and the bare name compare the same way.
- */
-export function executableName(command: string | string[]) {
-  const argv = Array.isArray(command) ? command : [command]
-  return basename(argv[0] ?? "")
-    .toLowerCase()
-    .replace(/\.(?:exe|cmd|bat|js|mjs|cjs)$/, "")
 }
 
 function hasOption(argv: string[], name: string, value?: string) {

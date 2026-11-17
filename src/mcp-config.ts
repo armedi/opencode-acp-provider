@@ -1,7 +1,7 @@
 import type { Mcp, Plugin } from "@opencode/plugin"
 import type { AcpMcpServer } from "./acp-client.ts"
 import type { AcpServerConfig, LogFn } from "./server-manager.ts"
-import { executableName, isCmdCommand } from "./skills.ts"
+import { executableName, isCmdCommand } from "./agent-command.ts"
 
 type Ctx = Plugin.Context
 type ServerConfig = Mcp.ServerConfig

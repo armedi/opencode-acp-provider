@@ -492,6 +492,7 @@ Files:
 
 - `src/index.ts` — plugin entry, provider registration.
 - `src/acp-client.ts` — ACP JSON-RPC client over stdio.
+- `src/agent-command.ts` — reads an agent launch command: which executable it runs.
 - `src/server-manager.ts` — agents, credentials, model discovery, session pooling.
 - `src/skills.ts` — mirrors OpenCode's skills into the agents' native skill trees.
 - `src/shim.ts` — OpenAI-compatible HTTP shim.

@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { AcpClient, AcpError, type AcpMcpServer, type SessionUpdate, type PermissionHandler } from "./acp-client.ts"
-import { applyCmdSkillFlag, isCmdCommand } from "./skills.ts"
+import { applyCmdSkillFlag } from "./skills.ts"
+import { isCmdCommand } from "./agent-command.ts"
 
 const execFileAsync = promisify(execFile)
 
