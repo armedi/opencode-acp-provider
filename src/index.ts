@@ -183,9 +183,9 @@ export default Plugin.define({
       mcp:
         mcp || openCodeMcp
           ? {
-              servers: (sessionKey) => {
+              servers: (sessionKey, agent) => {
                 const lease = mcp?.issue(sessionKey)
-                const configured = openCodeMcp?.servers() ?? []
+                const configured = openCodeMcp?.servers(agent) ?? []
                 // Let the plugin's own bridge win a name collision with a
                 // configured server, since that is the one agents rely on.
                 const taken = new Set(lease?.servers.map((server) => server.name) ?? [])

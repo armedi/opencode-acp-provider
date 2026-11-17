@@ -81,7 +81,8 @@ export interface McpLease {
 }
 
 export interface McpProvider {
-  servers: (sessionKey: string) => McpLease
+  /** `agent` is the server whose ACP session is being opened. */
+  servers: (sessionKey: string, agent: AcpServerConfig) => McpLease
 }
 
 const DEFAULT_CREDENTIAL_ENV: Record<string, string> = {
@@ -511,8 +512,9 @@ export class AcpServerManager {
         }
         const sessionStartedAt = Date.now()
         this.evictForCapacity()
-        const lease = this.mcp?.servers(input.key!)
-        let session
+        const lease = this.mcp?.servers(input.key!, state.config)
+        let session: { sessionId: string } | undefined
+        let reused = false
         try {
           session = await client.newSession(cwd, {
             model,

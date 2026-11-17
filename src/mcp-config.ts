@@ -1,13 +1,13 @@
 import type { Mcp, Plugin } from "@opencode/plugin"
 import type { AcpMcpServer } from "./acp-client.ts"
-import type { LogFn } from "./server-manager.ts"
+import type { AcpServerConfig, LogFn } from "./server-manager.ts"
 
 type Ctx = Plugin.Context
 type ServerConfig = Mcp.ServerConfig
 
 export interface OpenCodeMcpSource {
   /** Servers to add to an ACP `session/new`, read from the current config. */
-  servers: () => AcpMcpServer[]
+  servers: (agent: AcpServerConfig) => AcpMcpServer[]
   close: () => Promise<void>
 }
 
@@ -41,7 +41,7 @@ export async function createOpenCodeMcpSource(ctx: Ctx, log: LogFn): Promise<Ope
   }
 
   return {
-    servers() {
+    servers(_agent) {
       const servers: AcpMcpServer[] = []
       for (const [name, config] of configs) {
         if (config.disabled) continue
