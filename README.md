@@ -29,6 +29,8 @@ For a server named `cmd`:
 - Reused ACP sessions per OpenCode session, so the agent keeps its context between turns, across a
   failed or cancelled turn, and across a plugin reload or agent restart when the agent can restore
   sessions.
+- Title generation and other auxiliary model requests use disposable ACP sessions, so their
+  instructions never enter the chat agent's conversation.
 - Mid-turn steering: a message you send while the agent is working reaches the running turn through
   `_session/steering` when the agent supports it, and interrupts the turn to land next when it does
   not (see [Steering](#steering)).

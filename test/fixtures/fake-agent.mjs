@@ -6,6 +6,7 @@ import { readFileSync, writeFileSync } from "node:fs"
 
 let nextSession = 1
 const sessionDirectories = new Map()
+const sessionPrompts = new Map()
 const configOptions = [
   {
     id: "model",
@@ -214,6 +215,17 @@ function handle(message) {
         .filter((block) => block?.type === "text")
         .map((block) => block.text)
         .join("\n")
+
+      if (process.argv.includes("--echo-history")) {
+        const prompts = sessionPrompts.get(sessionId) ?? []
+        prompts.push(text)
+        sessionPrompts.set(sessionId, prompts)
+        update(sessionId, {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: JSON.stringify({ sessionId, prompts }) },
+        })
+        return send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
+      }
 
       if (/\bfail\b/i.test(text)) {
         return send({

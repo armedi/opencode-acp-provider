@@ -464,6 +464,15 @@ export default Plugin.define({
       // agent runs itself come back as provider-executed parts, so the session
       // shows the real shell/read/edit card without routing the tool.
       const acpProviderIDs = new Set(providerIDs.values())
+      // Auxiliary calls share the OpenCode session id, but must not write to
+      // the ACP agent's conversation. Carry the typed request kind to the shim
+      // through both the AI SDK and OpenAI-compatible provider routes.
+      registrations.push(
+        await ctx.session.hook("model.request", (event) => {
+          if (!acpProviderIDs.has(event.model.providerID)) return
+          event.headers["x-acp-request-kind"] = event.kind
+        }),
+      )
       if (nativeToolParts) {
         registrations.push(
           await ctx.aisdk.hook("sdk", (evt) => {

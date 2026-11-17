@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import { createServer, type Server } from "node:http"
 import { createAcpLanguageModel } from "../src/language-model.ts"
-import type { AcpServerManager } from "../src/server-manager.ts"
+import { AcpServerManager } from "../src/server-manager.ts"
 import { createShim } from "../src/shim.ts"
 
 async function startStreamServer(
@@ -103,6 +103,54 @@ test("turns an ACP turn into AI SDK v3 stream parts", async () => {
     expect(finish.finishReason.unified).toBe("stop")
   } finally {
     await shim.close()
+  }
+})
+
+test("auxiliary requests keep their instructions and never enter the chat's ACP history", async () => {
+  const manager = new AcpServerManager({
+    servers: [{
+      id: "fake",
+      command: [process.execPath, new URL("./fixtures/fake-agent.mjs", import.meta.url).pathname, "--echo-history"],
+      autoApprove: true,
+    }],
+    defaultCwd: process.cwd(),
+  })
+  const shim = await createShim({
+    manager,
+    resolveModel: () => ({ server: "fake", model: "fast" }),
+  })
+  const model = createAcpLanguageModel({ server: "fake", model: "fast", url: shim.url })
+  const generate = async (text: string, kind?: string) => {
+    const result = await model.doGenerate({
+      headers: {
+        "x-opencode-session-id": "ses_isolation",
+        ...(kind ? { "x-acp-request-kind": kind } : {}),
+      },
+      prompt: [
+        { role: "system", content: "Return only a short title." },
+        { role: "user", content: text },
+      ],
+    })
+    return JSON.parse(result.content.filter((part) => part.type === "text").map((part) => part.text).join(""))
+  }
+  try {
+    const first = await generate("Help me debug.", "primary")
+    expect(first.prompts).toEqual(["Help me debug."])
+    const auxiliarySessions = new Set<string>()
+    for (const kind of ["title", "generate", "compaction"]) {
+      const result = await generate(`Auxiliary ${kind}.`, kind)
+      expect(result.sessionId).not.toBe(first.sessionId)
+      expect(result.prompts).toEqual([`System instructions:\nReturn only a short title.\n\n---\n\nAuxiliary ${kind}.`])
+      auxiliarySessions.add(result.sessionId)
+    }
+    expect(auxiliarySessions.size).toBe(3)
+    // Missing kind keeps older clients' normal chat-session reuse.
+    const next = await generate("Continue debugging.")
+    expect(next.sessionId).toBe(first.sessionId)
+    expect(next.prompts).toEqual(["Help me debug.", "Continue debugging."])
+  } finally {
+    await shim.close()
+    await manager.stop()
   }
 })
 

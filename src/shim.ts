@@ -299,15 +299,19 @@ export async function createShim(options: ShimOptions) {
     const id = `chatcmpl-${randomUUID()}`
     const created = Math.floor(Date.now() / 1000)
 
-    const key = sessionKey(req, body)
-    if (!key && !loggedOneOff) {
+    // OpenCode's title/generate/compaction calls carry the same session id as
+    // chat. They need disposable ACP sessions, not another turn in its history.
+    const kind = req.headers["x-acp-request-kind"]
+    const auxiliary = kind === "title" || kind === "generate" || kind === "compaction"
+    const key = auxiliary ? undefined : sessionKey(req, body)
+    if (!key && !auxiliary && !loggedOneOff) {
       loggedOneOff = true
       log("warn", "no OpenCode session header on the shim request; ACP sessions will not be reused and MCP tools are unavailable")
     }
     // The AI SDK provider asks for structured tool events so OpenCode can
     // render native tool cards; the OpenAI-compatible route keeps inline lines.
     const structuredTools = req.headers["x-acp-tool-events"] === "1"
-    const fresh = buildPrompt(messages, options.includeSystem === true, limits)
+    const fresh = buildPrompt(messages, auxiliary || options.includeSystem === true, limits)
     if (!fresh.trim()) {
       res.writeHead(400, { "content-type": "application/json" })
       res.end(JSON.stringify({ error: { message: "Empty prompt", type: "invalid_request_error" } }))
