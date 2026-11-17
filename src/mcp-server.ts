@@ -551,7 +551,7 @@ async function buildInstructions(
     .join(", ")
   const lines = [
     "You are running as an ACP agent inside OpenCode: the user works in OpenCode's interface, so OpenCode's commands and settings are the ones available to them, not your client's.",
-    "OpenCode MCP server `opencode`. Tool names are plain (`question`, `subagent`, `session_get`, …) but every client adds its own MCP prefix, for example `mcp__opencode__question`, `opencode.question`, or `mcp.opencode.question`; exec/code-mode scripts call `tools.mcp__opencode__question`. Match the form your own tool list shows.",
+    "OpenCode MCP server `opencode`. Tool names are plain (`question`, `subagent`, `session_get`, …) but every client adds its own MCP prefix, for example `mcp__opencode__question`, `opencode.question`, or `mcp.opencode.question`. Match the form your own tool list shows.",
     `Available tools: ${listed}.`,
   ]
   if (names.has("question")) {
@@ -567,7 +567,7 @@ async function buildInstructions(
     )
   }
   lines.push(
-    "If a tool above seems missing it may just be deferred: look it up under the `opencode` MCP namespace, using whatever prefix your client lists (for example in ALL_TOOLS or your client's tool search), before concluding it is unavailable.",
+    "If a tool above seems missing it may just be deferred: look it up under the `opencode` MCP namespace using your client's tool search before concluding it is unavailable.",
   )
   return lines.join("\n")
 }
