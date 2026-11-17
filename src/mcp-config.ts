@@ -60,10 +60,8 @@ function oauthHint(agent: AcpServerConfig, name: string, url: string): OauthHint
  */
 export async function createOpenCodeMcpSource(ctx: Ctx, log: LogFn): Promise<OpenCodeMcpSource> {
   let configs: ReadonlyArray<readonly [string, ServerConfig]> = []
-  let captured = false
   const registration = await ctx.mcp.transform((editor) => {
     configs = editor.list()
-    captured = true
   })
   // A registry read replays the registered transforms, so this also captures the
   // configuration for plugin setups that read nothing else.

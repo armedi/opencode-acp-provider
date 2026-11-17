@@ -4,13 +4,13 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { fileURLToPath } from "node:url"
 import type { Plugin } from "@opencode/plugin"
 import type { AcpMcpServer } from "./acp-client.ts"
-import type { LogFn } from "./server-manager.ts"
+import type { LogFn, McpLease } from "./server-manager.ts"
 
 type Ctx = Plugin.Context
 
 const MCP_PROTOCOL_VERSION = "2025-06-18"
 /** ACP server name of this plugin's bridge. */
-export const MCP_SERVER_NAME = "opencode"
+const MCP_SERVER_NAME = "opencode"
 const MAX_BODY_BYTES = 4 * 1024 * 1024
 const MAX_CONTEXT_CHARS = 60_000
 const TOKEN_IDLE_MS = 2 * 60 * 60_000
@@ -79,11 +79,6 @@ export interface McpServerOptions {
   /** Runtime that can execute a JavaScript file, e.g. "node" or "bun". */
   runtime?: string
   version?: string
-}
-
-export interface McpLease {
-  servers: AcpMcpServer[]
-  release: () => void
 }
 
 export interface McpServerHandle {

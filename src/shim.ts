@@ -578,5 +578,3 @@ function readBody(req: IncomingMessage, maxBytes: number) {
     })
   })
 }
-
-export type { ServerResponse }

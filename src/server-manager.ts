@@ -158,7 +158,7 @@ interface PooledSession {
   mcpRelease?: () => void
 }
 
-export interface AcpRunResult {
+interface AcpRunResult {
   stopReason: string
   text: string
 }

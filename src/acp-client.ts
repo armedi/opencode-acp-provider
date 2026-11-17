@@ -35,7 +35,7 @@ export interface PromptResult {
  * codex-acp and claude-agent-acp. `promptRequired` means the agent had no turn
  * that could take the message and left it with the client.
  */
-export type SteeringOutcome = "injected" | "startedNewTurn" | "promptRequired" | "failed"
+type SteeringOutcome = "injected" | "startedNewTurn" | "promptRequired" | "failed"
 
 export interface SteeringResult {
   outcome: SteeringOutcome

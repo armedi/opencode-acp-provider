@@ -126,7 +126,7 @@ export async function createCommandBridge(options: CommandBridgeOptions): Promis
   // this plugin is still starting up, so that event is likely already on its way
   // and a subscription created afterwards would miss it.
   const controller = new AbortController()
-  const watching = (async () => {
+  void (async () => {
     try {
       for await (const _ of ctx.event.subscribe({ types: ["skill.updated"], signal: controller.signal })) {
         if (closed) break
@@ -138,7 +138,6 @@ export async function createCommandBridge(options: CommandBridgeOptions): Promis
   })()
 
   await rebuild()
-  void watching
 
   // Skill discovery can finish before this plugin subscribes, in which case no
   // event ever arrives and the palette keeps commands the filter would drop.
