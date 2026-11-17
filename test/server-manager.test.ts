@@ -20,30 +20,23 @@ afterEach(async () => {
 
 function manager(
   options: {
-    models?: string[]
-    effort?: string
     defaultCwd?: string
     additionalDirectories?: string[]
-    skills?: boolean
+    agentArgs?: string[]
   } = {},
 ) {
-  const logs: string[] = []
   const instance = new AcpServerManager({
     servers: [
       {
         id: "fake",
-        command: [process.execPath, agent],
-        models: options.models,
-        effort: options.effort,
+        command: [process.execPath, agent, ...(options.agentArgs ?? [])],
         autoApprove: true,
-        skills: options.skills,
       },
     ],
     defaultCwd: options.defaultCwd ?? tmpdir(),
     additionalDirectories: options.additionalDirectories,
-    log: (level, message) => logs.push(`${level}: ${message}`),
   })
-  return { instance, logs }
+  return { instance }
 }
 
 test("discovers models and reuses a pooled session", async () => {
@@ -151,6 +144,45 @@ test("a failed turn refuses the turns queued behind it", async () => {
     const [firstError, secondError] = await errors
     expect(firstError).toBe("scripted failure")
     expect(secondError).toContain("no longer usable")
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("compacts the session's own ACP session with the agent's /compact", async () => {
+  const { instance } = manager()
+  try {
+    await instance.initialize()
+    await instance.run({ server: "fake", prompt: "first", key: "ses_compact", sessionKey: "ses_compact" })
+    // sess-1 is the discovery session initialize() opens and closes; sess-2 holds the turn.
+    expect(await instance.compact({ server: "fake", key: "ses_compact" })).toEqual({
+      status: "compacted",
+      text: "Compacted sess-2.",
+    })
+    const next = await instance.run({ server: "fake", prompt: { fresh: "f", reused: "r" }, key: "ses_compact" })
+    expect(next.text).toBe("got:r")
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("never prompts /compact when the agent does not offer it", async () => {
+  const { instance } = manager({ agentArgs: ["--no-commands"] })
+  try {
+    await instance.initialize()
+    await instance.run({ server: "fake", prompt: "first", key: "ses_plain", sessionKey: "ses_plain" })
+    expect(await instance.compact({ server: "fake", key: "ses_plain" })).toEqual({ status: "unsupported" })
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("does not open an ACP session just to compact it", async () => {
+  const { instance } = manager()
+  try {
+    await instance.initialize()
+    // Opening a session here would let the agent answer /compact and report "compacted".
+    expect(await instance.compact({ server: "fake", key: "ses_none" })).toEqual({ status: "no-session" })
   } finally {
     await instance.stop()
   }

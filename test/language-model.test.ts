@@ -33,36 +33,53 @@ async function readAll(stream: ReadableStream<any>) {
   }
 }
 
-test("translates shim SSE into AI SDK v3 stream parts", async () => {
-  const frames = [
-    { choices: [{ delta: { reasoning_content: "think " } }] },
-    { choices: [{ delta: { content: "hello" } }] },
-    {
-      choices: [
-        {
-          delta: {
-            _acp_tool: { id: "call-1", name: "shell", title: "ls", input: { command: "ls" }, done: false },
-          },
-        },
-      ],
-    },
-    {
-      choices: [
-        { delta: { _acp_tool: { id: "call-1", name: "shell", done: true, isError: false, output: "out" } } },
-      ],
-    },
-    { choices: [{ delta: {}, finish_reason: "stop" }] },
-  ]
+type RunInput = {
+  key?: string
+  model?: string
+  effort?: string
+  prompt?: unknown
+  onUpdate?: (update: Record<string, unknown>) => void
+}
 
-  const { server, url, requests } = await startStreamServer((_req, res) => {
-    res.writeHead(200, { "content-type": "text/event-stream" })
-    for (const frame of frames) res.write(`data: ${JSON.stringify(frame)}\n\n`)
-    res.write("data: [DONE]\n\n")
-    res.end()
+/** The real shim in front of a scripted manager, so tests cover the shim's wire format and its parser together. */
+async function shimWith(run: (input: RunInput) => Promise<{ stopReason: string; text: string }>) {
+  const calls: RunInput[] = []
+  const shim = await createShim({
+    manager: {
+      list: [{ config: { id: "fake" }, models: [{ id: "model-a", name: "Model A" }] }],
+      run: (input: RunInput) => {
+        calls.push(input)
+        return run(input)
+      },
+    } as unknown as AcpServerManager,
+    resolveModel: (modelID) => (modelID === "fake::model-a" ? { server: "fake", model: "model-a" } : undefined),
+    token: "tok",
   })
+  const model = createAcpLanguageModel({ server: "fake", model: "model-a", url: shim.url, token: "tok" }) as any
+  return { shim, model, calls }
+}
 
+test("turns an ACP turn into AI SDK v3 stream parts", async () => {
+  const { shim, model, calls } = await shimWith(async (input) => {
+    input.onUpdate?.({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "think " } })
+    input.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } })
+    input.onUpdate?.({
+      sessionUpdate: "tool_call",
+      toolCallId: "call-1",
+      title: "ls",
+      kind: "execute",
+      status: "in_progress",
+      rawInput: { command: "ls" },
+    })
+    input.onUpdate?.({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call-1",
+      status: "completed",
+      rawOutput: { stdout: "out" },
+    })
+    return { stopReason: "end_turn", text: "hello" }
+  })
   try {
-    const model = createAcpLanguageModel({ server: "fake", model: "model-a", url, token: "tok" }) as any
     const { stream } = await model.doStream({
       prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
       headers: { "x-opencode-session-id": "ses_x" },
@@ -70,104 +87,55 @@ test("translates shim SSE into AI SDK v3 stream parts", async () => {
     })
     const parts = await readAll(stream)
 
-    expect(requests[0].headers.authorization).toBe("Bearer tok")
-    expect(requests[0].headers["x-acp-tool-events"]).toBe("1")
-    expect(requests[0].headers["x-opencode-session-id"]).toBe("ses_x")
-    expect(requests[0].body.model).toBe("fake::model-a")
-    expect(requests[0].body.reasoning_effort).toBe("high")
-    expect(requests[0].body.messages).toEqual([{ role: "user", content: "hi" }])
+    expect(calls[0]).toMatchObject({ key: "ses_x", model: "model-a", effort: "high" })
 
     expect(parts[0]).toEqual({ type: "stream-start", warnings: [] })
-    expect(parts).toContainEqual({ type: "reasoning-start", id: "reasoning-0" })
     expect(parts).toContainEqual({ type: "reasoning-delta", id: "reasoning-0", delta: "think " })
-    expect(parts).toContainEqual({ type: "text-start", id: "text-0" })
     expect(parts).toContainEqual({ type: "text-delta", id: "text-0", delta: "hello" })
-    expect(parts).toContainEqual({
-      type: "tool-input-start",
-      id: "call-1",
-      toolName: "shell",
-      providerExecuted: true,
-    })
-    expect(parts).toContainEqual({
-      type: "tool-call",
-      toolCallId: "call-1",
-      toolName: "shell",
-      input: JSON.stringify({ command: "ls" }),
-      providerExecuted: true,
-      dynamic: true,
-    })
-    expect(parts).toContainEqual({
-      type: "tool-result",
-      toolCallId: "call-1",
-      toolName: "shell",
-      result: "out",
-      isError: false,
-      dynamic: true,
-    })
+    const call = parts.find((part) => part.type === "tool-call")
+    expect(call).toMatchObject({ toolCallId: "call-1", toolName: "shell", providerExecuted: true })
+    expect(JSON.parse(call.input).command).toBe("ls")
+    const result = parts.find((part) => part.type === "tool-result")
+    expect(result).toMatchObject({ toolCallId: "call-1", toolName: "shell", isError: false })
+    expect(String(result.result)).toContain("out")
     const finish = parts.at(-1)
     expect(finish.type).toBe("finish")
     expect(finish.finishReason.unified).toBe("stop")
   } finally {
-    await new Promise<void>((resolve) => server.close(() => resolve()))
+    await shim.close()
   }
 })
 
-async function finishUsage(usage: Record<string, number>) {
-  const shim = await createShim({
-    manager: {
-      list: [{ config: { id: "fake" }, models: [{ id: "model-a", name: "Model A" }] }],
-      run: async (input: { onUpdate?: (update: Record<string, unknown>) => void }) => {
-        // Codex reports a session-cumulative total here; it is not this turn's input.
-        input.onUpdate?.({ sessionUpdate: "usage_update", used: 41_541, size: 475_000 })
-        input.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "two" } })
-        return { stopReason: "end_turn", text: "two", usage }
-      },
-    } as unknown as AcpServerManager,
-    resolveModel: (modelID) => (modelID === "fake::model-a" ? { server: "fake", model: "model-a" } : undefined),
-    token: "tok",
+test("never reports usage, because no ACP number is right for both context and spend", async () => {
+  // OpenCode reads a step's tokens as both context size and spend. An ACP turn
+  // spans many model calls, so the agent's context reading (here codex-acp's
+  // session running total) must not become token counts.
+  const { shim, model } = await shimWith(async (input) => {
+    input.onUpdate?.({ sessionUpdate: "usage_update", used: 41_541, size: 475_000 })
+    input.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "two" } })
+    return { stopReason: "end_turn", text: "two" }
   })
   try {
-    const model = createAcpLanguageModel({ server: "fake", model: "model-a", url: shim.url, token: "tok" }) as any
+    const raw = await fetch(`${shim.url}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer tok" },
+      body: JSON.stringify({ model: "fake::model-a", messages: [{ role: "user", content: "hi" }] }),
+    })
+    expect((await raw.json()).usage).toBeUndefined()
+
     const { stream } = await model.doStream({
       prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
       headers: { "x-opencode-session-id": "ses_usage" },
     })
     const finish = (await readAll(stream)).at(-1)
     expect(finish.type).toBe("finish")
-    return finish.usage
+    expect(finish.usage).toEqual({
+      inputTokens: { total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
+      outputTokens: { total: undefined, text: undefined, reasoning: undefined },
+    })
   } finally {
     await shim.close()
   }
-}
-
-test("reports the turn's tokens when the agent counts cache reads inside input", async () => {
-  // codex-acp's PromptResponse.usage for a second turn.
-  const usage = await finishUsage({
-    inputTokens: 22_801,
-    outputTokens: 5,
-    thoughtTokens: 0,
-    cachedReadTokens: 18_560,
-    totalTokens: 22_806,
-  })
-  expect(usage).toEqual({
-    inputTokens: { total: 22_801, noCache: 4_241, cacheRead: 18_560, cacheWrite: 0 },
-    outputTokens: { total: 5, text: 5, reasoning: 0 },
-  })
-})
-
-test("reports the turn's tokens when the agent counts cache beside input", async () => {
-  // claude-agent-acp follows Anthropic: input_tokens excludes cache reads and writes.
-  const usage = await finishUsage({
-    inputTokens: 12,
-    outputTokens: 300,
-    cachedReadTokens: 40_000,
-    cachedWriteTokens: 2_000,
-    totalTokens: 42_312,
-  })
-  expect(usage).toEqual({
-    inputTokens: { total: 42_012, noCache: 12, cacheRead: 40_000, cacheWrite: 2_000 },
-    outputTokens: { total: 300, text: 300, reasoning: 0 },
-  })
 })
 
 test("cancelling the stream does not throw from the controller", async () => {

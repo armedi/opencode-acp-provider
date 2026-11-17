@@ -78,33 +78,3 @@ test("keys the session by x-opencode-session-id, not the affinity header", async
     await shim.close()
   }
 })
-
-test("streams structured tool events when asked", async () => {
-  const { shim } = await start({
-    run: async (input) => {
-      input.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hi there" } })
-      input.onUpdate?.({
-        sessionUpdate: "tool_call",
-        toolCallId: "call-1",
-        title: "ls",
-        kind: "execute",
-        status: "completed",
-        rawInput: { command: "ls" },
-      })
-      return { stopReason: "end_turn", text: "hi there" }
-    },
-  })
-  try {
-    const response = await chat(
-      shim.url,
-      { model: "fake::model-a", stream: true, messages: [{ role: "user", content: "hi" }] },
-      { "x-acp-tool-events": "1", "x-opencode-session-id": "ses_stream" },
-    )
-    const text = await response.text()
-    expect(text).toContain("hi there")
-    expect(text).toContain("_acp_tool")
-    expect(text).toContain("[DONE]")
-  } finally {
-    await shim.close()
-  }
-})

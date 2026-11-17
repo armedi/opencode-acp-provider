@@ -59,7 +59,7 @@ export function createAcpLanguageModel(options: AcpLanguageModelOptions) {
       const { stream } = await this.doStream(call)
       const content: any[] = []
       let finishReason = "stop"
-      let usage: any = emptyUsage()
+      let usage: any = unknownUsage()
       for await (const part of readAll(stream)) {
         if (part.type === "text-delta") content.push({ type: "text", text: part.delta })
         else if (part.type === "reasoning-delta") content.push({ type: "reasoning", text: part.delta })
@@ -160,10 +160,15 @@ function toMessages(prompt: PromptMessage[] | undefined) {
   return messages
 }
 
-function emptyUsage() {
+/**
+ * Usage is never reported. OpenCode reads a step's tokens both as context size
+ * and as spend, and an ACP turn spans many model calls, so no number the agent
+ * gives is right for both. Unknown counts beat wrong ones.
+ */
+function unknownUsage() {
   return {
-    inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
-    outputTokens: { total: 0, text: 0, reasoning: 0 },
+    inputTokens: { total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
+    outputTokens: { total: undefined, text: undefined, reasoning: undefined },
   }
 }
 
@@ -187,7 +192,7 @@ function translate(body: ReadableStream<Uint8Array>, log?: Log) {
   let textSeq = 0
   let reasoningSeq = 0
   let reason = "stop"
-  let usage = emptyUsage()
+  const usage = unknownUsage()
   const tools = new Map<string, ToolProgress>()
   const reader = body.getReader()
   const decoder = new TextDecoder()
@@ -285,18 +290,6 @@ function translate(body: ReadableStream<Uint8Array>, log?: Log) {
       }
       if (delta._acp_tool) handleTool(delta._acp_tool)
     }
-    const handleUsage = (value: Record<string, any>) => {
-      const count = (n: unknown) => (typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 0)
-      const input = count(value.prompt_tokens)
-      const cacheRead = Math.min(count(value.prompt_tokens_details?.cached_tokens), input)
-      const cacheWrite = Math.min(count(value.prompt_tokens_details?.cache_write_tokens), input - cacheRead)
-      const output = count(value.completion_tokens)
-      const reasoning = Math.min(count(value.completion_tokens_details?.reasoning_tokens), output)
-      usage = {
-        inputTokens: { total: input, noCache: input - cacheRead - cacheWrite, cacheRead, cacheWrite },
-        outputTokens: { total: output, text: output - reasoning, reasoning },
-      }
-    }
     let failed = false
     let failure: unknown
     try {
@@ -320,7 +313,6 @@ function translate(body: ReadableStream<Uint8Array>, log?: Log) {
           }
           const choice = frame?.choices?.[0]
           if (choice?.delta) handleDelta(choice.delta)
-          if (frame?.usage && typeof frame.usage === "object") handleUsage(frame.usage)
           if (typeof choice?.finish_reason === "string" && choice.finish_reason) reason = choice.finish_reason
         }
       }

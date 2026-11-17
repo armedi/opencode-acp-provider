@@ -25,42 +25,9 @@ export interface SessionUpdate {
   [key: string]: unknown
 }
 
-/**
- * ACP `PromptResponse.usage` (draft): the tokens the finished turn consumed,
- * summed over every model call in it. Agents disagree on whether
- * `inputTokens` includes cached tokens; `totalTokens` tells them apart.
- */
-export interface AcpTurnUsage {
-  inputTokens: number
-  outputTokens: number
-  totalTokens?: number
-  thoughtTokens?: number | null
-  cachedReadTokens?: number | null
-  cachedWriteTokens?: number | null
-}
-
-function turnUsage(result: any): AcpTurnUsage | undefined {
-  // Command Code reports session-cumulative `usage` and this turn alone in
-  // `_meta.usage`. Its totals show input includes cache reads, so the total
-  // here is input + output.
-  const own = result?._meta?.usage
-  if (own && typeof own === "object" && typeof own.inputTokens === "number") {
-    const output = typeof own.outputTokens === "number" ? own.outputTokens : 0
-    return {
-      inputTokens: own.inputTokens,
-      outputTokens: output,
-      cachedReadTokens: own.cacheReadTokens,
-      cachedWriteTokens: own.cacheWriteTokens,
-      totalTokens: own.inputTokens + output,
-    }
-  }
-  return result?.usage && typeof result.usage === "object" ? (result.usage as AcpTurnUsage) : undefined
-}
-
 export interface PromptResult {
   stopReason: string
   text: string
-  usage?: AcpTurnUsage
 }
 
 /** MCP servers the agent should connect to for a session (ACP `session/new`). */
@@ -233,6 +200,8 @@ export class AcpClient {
   private nextID = 1
   private pending = new Map<number | string, Pending>()
   private sessions = new Map<string, SessionState>()
+  /** Slash commands each session advertised in `available_commands_update`. */
+  private commands = new Map<string, Set<string>>()
   private started?: Promise<AgentHandshake>
   private handshake?: AgentHandshake
   private closed = false
@@ -413,6 +382,18 @@ export class AcpClient {
     const sessionId = message.params?.sessionId
     const update = message.params?.update as SessionUpdate | undefined
     if (!sessionId || !update) return
+    // Kept outside `sessions`: the list can arrive before `session/new` resolves.
+    if (update.sessionUpdate === "available_commands_update" && Array.isArray(update.availableCommands)) {
+      const names = update.availableCommands
+        .map((command: { name?: unknown }) => command?.name)
+        .filter((name): name is string => typeof name === "string")
+      this.commands.set(sessionId, new Set(names))
+    } else if (update.sessionUpdate === "usage_update") {
+      this.log(
+        "debug",
+        `ACP context for ${sessionId}: ${update.used ?? "?"}/${update.size ?? "?"} tokens, cost ${JSON.stringify(update.cost ?? null)}`,
+      )
+    }
     this.sessions.get(sessionId)?.onUpdate?.(update)
   }
 
@@ -699,8 +680,15 @@ export class AcpClient {
           },
         },
       )
-      const usage = turnUsage(result)
-      return { stopReason: result?.stopReason ?? "end_turn", text, ...(usage ? { usage } : {}) }
+      // Usage stays in the debug log: no ACP number is right for both of the
+      // ways OpenCode reads a step's tokens (context size and spend).
+      if (result?.usage || result?._meta?.usage) {
+        this.log(
+          "debug",
+          `ACP turn usage for ${sessionId}: ${JSON.stringify(result.usage ?? null)} turn=${JSON.stringify(result._meta?.usage ?? null)}`,
+        )
+      }
+      return { stopReason: result?.stopReason ?? "end_turn", text }
     } finally {
       if (this.sessions.get(sessionId)?.onUpdate === onUpdate) {
         const current = this.sessions.get(sessionId)
@@ -712,8 +700,14 @@ export class AcpClient {
     }
   }
 
+  /** Whether the agent advertised this slash command for the session. */
+  hasCommand(sessionId: string, name: string) {
+    return this.commands.get(sessionId)?.has(name) === true
+  }
+
   async closeSession(sessionId: string) {
     this.sessions.delete(sessionId)
+    this.commands.delete(sessionId)
     if (this.handshake?.agentCapabilities?.sessionCapabilities?.close === false) {
       // The agent has no close method; dropping our side is all we can do.
       this.log("debug", `dropping ACP session ${sessionId} (agent does not support session/close)`)

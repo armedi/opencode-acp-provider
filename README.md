@@ -310,7 +310,7 @@ Plugin options:
 | `includeSystem` | Include OpenCode's system message in the ACP prompt. Defaults to `false`; the ACP agent uses its own instructions. |
 | `localTitles` | Answer session-title requests locally instead of spending an ACP turn. Defaults to `true`. |
 | `historyTurns` | Turns of history replayed into a brand new ACP session. Defaults to `16`. |
-| `historyChars` | Characters of history replayed into a brand new ACP session. Defaults to `8192`. Compaction requests are exempt and receive the full transcript. |
+| `historyChars` | Characters of history replayed into a brand new ACP session. Defaults to `8192`. The same cap applies to the recent conversation a `/compact` summary keeps. |
 | `maxSessions` | Most reused ACP sessions kept alive per location. Defaults to `32`; the least recently used idle session is closed when the cap is reached. |
 | `sessionIdleMs` | Idle time before a reused session is closed. Defaults to `1800000` (30 minutes). Set `0` to disable the sweep. |
 | `allowPathsOutsideCwd` | Allow the agent's `fs/read_text_file` and `fs/write_text_file` calls outside the session directory. Defaults to `false`. |
@@ -429,15 +429,23 @@ those models reach an ACP agent through the builtin `subagent` tool (see
   tools" list, which names the bridge tools once `tools/list` succeeds.
 - The provider does not know per-token pricing, so models are registered with an empty cost list
   (pricing unknown, not free).
-- Token counts come from the turn's `PromptResponse.usage`, summed over every model call in the
-  turn, with cache reads and writes split out. Codex counts cache reads inside `inputTokens` and
-  Claude counts them beside it; `totalTokens` tells the two apart. Command Code's top-level `usage`
-  is session-cumulative, so its per-turn `_meta.usage` is used instead. `usage_update.used` is
-  ignored: it is context occupancy, and codex-acp reports a session-cumulative total there.
-- ACP models advertise an unknown context window (`0`), so OpenCode never auto-compacts them. The
-  agent keeps the conversation in its reused ACP session and compacts it itself; an OpenCode
-  summary would cost a full turn and never be read. Manual `/compact` still works but has the same
-  problem.
+- No token usage is reported to OpenCode; unknown beats wrong. OpenCode reads a step's tokens both
+  as context size (context ring, context tab, auto-compaction) and as spend (session totals,
+  `stats`). Only one model call's usage fits both, and an ACP turn spans many model calls that the
+  agents do not report one by one. The turn's sum overstates context; the agent's context reading
+  understates spend and has no cache split. Agents also disagree on the numbers: codex-acp's
+  `usage_update.used` is a session running total, Command Code's top-level `PromptResponse.usage`
+  is session-cumulative (its turn is in `_meta.usage`), and Claude Code's cost on a subscription is
+  the API-equivalent price. With `logLevel: "debug"`, each turn's raw usage and every
+  `usage_update` (context size, window, cost) go to the debug log.
+- ACP models advertise an unknown context window (`0`), so OpenCode never auto-compacts them.
+  Each agent keeps the conversation in its reused ACP session and compacts it on its own.
+- A manual `/compact` on an ACP model never runs OpenCode's summary turn, which would cost a full
+  prompt that the agent never reads. A `compaction` hook sends the agent's own `/compact` to the
+  session's open ACP session instead, when the agent advertises that command (Command Code and
+  Claude Code do; Codex does not). It never opens a session just to compact it. The stored summary
+  says what happened and keeps the recent conversation, capped by `historyTurns` and
+  `historyChars`, so a new ACP session can still replay it.
 
 ## Develop
 

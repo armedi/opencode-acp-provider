@@ -3,14 +3,31 @@ import { randomUUID } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import { AcpServerManager, type AcpServerConfig, type AcpServerState } from "./server-manager.ts"
-import { createShim } from "./shim.ts"
+import {
+  AcpServerManager,
+  type AcpCompactResult,
+  type AcpServerConfig,
+  type AcpServerState,
+} from "./server-manager.ts"
+import { createShim, historyLimits, recentConversation, type ChatMessage } from "./shim.ts"
 import { createAcpLanguageModel } from "./language-model.ts"
 import { createMcpServer } from "./mcp-server.ts"
 import { createSkillMirror } from "./skills.ts"
 import { debugLog } from "./debug.ts"
 
 type LogLevel = "debug" | "info" | "warn" | "error"
+
+/** What a compaction did, in the agent's own words where it gave any. */
+function compactionOutcome(agent: string, result: AcpCompactResult) {
+  if (result.status === "no-session") return `${agent} has no open session for this conversation, so nothing was compacted.`
+  if (result.status === "unsupported")
+    return `${agent} can't compact on request. It compacts its own context when it fills up, so nothing was compacted.`
+  const sizes = result.tokens
+    ? ` from ${result.tokens.before.toLocaleString("en-US")} to ${result.tokens.after.toLocaleString("en-US")} tokens`
+    : ""
+  const said = result.text ? `\n\n${agent}: ${result.text}` : ""
+  return `${agent} ran its own /compact${sizes}.${said}`
+}
 
 interface AcpPluginOptions {
   servers?: AcpServerConfig[]
@@ -379,6 +396,31 @@ export default Plugin.define({
           }),
         )
       }
+
+      // The agent holds the conversation in its reused ACP session, so an
+      // OpenCode summary turn would cost a full prompt and never be read.
+      // Compaction goes to the agent's own /compact instead, and the summary
+      // keeps the recent conversation for a new ACP session to replay.
+      const limits = historyLimits(options)
+      registrations.push(
+        await ctx.session.hook("compaction", async (evt) => {
+          const server = [...providerIDs].find(([, providerID]) => providerID === evt.model.providerID)?.[0]
+          const state = server ? manager.get(server) : undefined
+          if (!server || !state) return
+          const agent = (state.config.name ?? state.config.id).replace(/\s*\(ACP\)$/, "")
+          let outcome: string
+          try {
+            const result = await manager.compact({ server, key: evt.sessionID })
+            outcome = compactionOutcome(agent, result)
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            log("warn", `ACP /compact failed for ${server}: ${message}`)
+            outcome = `${agent} could not compact its context: ${message}`
+          }
+          const recent = recentConversation(evt.messages as ChatMessage[], limits)
+          evt.result = { summary: recent ? `${outcome}\n\nRecent conversation:\n\n${recent}` : outcome }
+        }),
+      )
 
       log("info", `registered ${registered.size} ACP provider(s) in ${Date.now() - setupStartedAt}ms`)
       return cleanup

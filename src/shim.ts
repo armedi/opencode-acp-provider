@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { randomUUID } from "node:crypto"
 import type { AcpServerManager } from "./server-manager.ts"
-import type { AcpTurnUsage, SessionUpdate } from "./acp-client.ts"
+import type { SessionUpdate } from "./acp-client.ts"
 import { applyToolUpdate, type AcpToolState } from "./acp-tools.ts"
 
 export interface ShimOptions {
@@ -27,7 +27,7 @@ export interface ShimOptions {
   toolCallDisplay?: "off" | "inline"
 }
 
-interface ChatMessage {
+export interface ChatMessage {
   role: string
   content?: string | Array<{ type?: string; text?: string }>
 }
@@ -40,7 +40,6 @@ interface HistoryLimits {
 const DEFAULT_HISTORY_TURNS = 16
 const DEFAULT_HISTORY_CHARS = 8_192
 const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024
-const COMPACTION_LIMITS: HistoryLimits = { turns: 10_000, chars: 4_000_000 }
 
 class BodyTooLargeError extends Error {}
 
@@ -53,22 +52,39 @@ function textOf(message: ChatMessage): string {
     .join("\n")
 }
 
-function buildPrompt(messages: ChatMessage[], includeSystem: boolean, limits: HistoryLimits) {
-  const system = messages.filter((message) => message.role === "system").map(textOf).filter(Boolean)
-  const turns = messages.filter(
-    (message) => (message.role === "user" || message.role === "assistant") && textOf(message).trim(),
-  )
-  const last = turns.pop()
+function conversationTurns(messages: ChatMessage[]) {
+  return messages.filter((message) => (message.role === "user" || message.role === "assistant") && textOf(message).trim())
+}
+
+/** User and assistant turns as plain text, capped to the newest `limits.turns` and `limits.chars`. */
+function historyText(turns: ChatMessage[], limits: HistoryLimits) {
   const history = limits.turns > 0 && limits.chars > 0 ? turns.slice(-limits.turns) : []
-  let historyText = history
+  const text = history
     .map((message) => `${message.role === "assistant" ? "Assistant" : "User"}: ${textOf(message)}`)
     .join("\n\n")
-  if (historyText.length > limits.chars) {
-    historyText = `[...earlier history omitted...]\n\n${historyText.slice(-limits.chars)}`
+  return text.length > limits.chars ? `[...earlier history omitted...]\n\n${text.slice(-limits.chars)}` : text
+}
+
+export function historyLimits(options: { historyTurns?: number; historyChars?: number }): HistoryLimits {
+  return {
+    turns: Math.max(0, options.historyTurns ?? DEFAULT_HISTORY_TURNS),
+    chars: Math.max(0, options.historyChars ?? DEFAULT_HISTORY_CHARS),
   }
+}
+
+/** The recent conversation a brand new ACP session would be given, as plain text. */
+export function recentConversation(messages: ChatMessage[], limits: HistoryLimits) {
+  return historyText(conversationTurns(messages), limits)
+}
+
+function buildPrompt(messages: ChatMessage[], includeSystem: boolean, limits: HistoryLimits) {
+  const system = messages.filter((message) => message.role === "system").map(textOf).filter(Boolean)
+  const turns = conversationTurns(messages)
+  const last = turns.pop()
+  const history = historyText(turns, limits)
   const parts: string[] = []
   if (includeSystem && system.length) parts.push(`System instructions:\n${system.join("\n\n")}`)
-  if (history.length) parts.push(`Conversation so far:\n\n${historyText}`)
+  if (history) parts.push(`Conversation so far:\n\n${history}`)
   parts.push(last ? textOf(last) : "")
   return parts.filter(Boolean).join("\n\n---\n\n")
 }
@@ -117,15 +133,6 @@ function isTitleRequest(messages: ChatMessage[]) {
   return typeof system?.content === "string" && /name conversations|conversation title/i.test(system.content)
 }
 
-/** Compaction asks for a summary of the whole transcript and must not be truncated. */
-function isCompactionRequest(messages: ChatMessage[]) {
-  return messages.some((message) =>
-    /summarize the conversation above into a structured summary/i.test(textOf(message)),
-  )
-}
-
-
-
 function deriveTitle(messages: ChatMessage[]) {
   const last = messages[messages.length - 1]
   const raw = textOf(last ?? { role: "", content: "" })
@@ -139,38 +146,6 @@ function finishReason(stopReason: string) {
   if (stopReason === "max_tokens" || stopReason === "max_turn_requests") return "length"
   if (stopReason === "refusal") return "content_filter"
   return "stop"
-}
-
-/**
- * Chat-completions `usage` for an ACP turn. `prompt_tokens` includes cached
- * tokens and `completion_tokens` includes reasoning, as in OpenAI's API;
- * `cache_write_tokens` carries Anthropic-style cache writes.
- *
- * Codex counts cache reads inside `inputTokens` (total = input + output);
- * Claude counts them beside it (total = input + output + cache), so the total
- * decides which convention a report uses.
- */
-function completionUsage(usage: AcpTurnUsage | undefined) {
-  if (!usage) return undefined
-  const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0)
-  const input = count(usage.inputTokens)
-  const output = count(usage.outputTokens)
-  const thought = count(usage.thoughtTokens)
-  const cacheRead = count(usage.cachedReadTokens)
-  const cacheWrite = count(usage.cachedWriteTokens)
-  const total = typeof usage.totalTokens === "number" ? usage.totalTokens : undefined
-  const cached = cacheRead + cacheWrite
-  const cacheBeside = cached > 0 && (total === undefined ? cached > input : total >= input + output + cached)
-  const prompt = input + (cacheBeside ? cached : 0)
-  const thoughtBeside = thought > 0 && total !== undefined && total >= prompt + output + thought
-  const completion = output + (thoughtBeside ? thought : 0)
-  return {
-    prompt_tokens: prompt,
-    completion_tokens: completion,
-    total_tokens: prompt + completion,
-    prompt_tokens_details: { cached_tokens: cacheRead, cache_write_tokens: cacheWrite },
-    completion_tokens_details: { reasoning_tokens: Math.min(thought, completion) },
-  }
 }
 
 interface ToolCallState {
@@ -219,10 +194,7 @@ function truncate(text: string, max: number) {
 export async function createShim(options: ShimOptions) {
   const { manager, log = () => {} } = options
   const debug = options.debugEnabled === true
-  const limits: HistoryLimits = {
-    turns: Math.max(0, options.historyTurns ?? DEFAULT_HISTORY_TURNS),
-    chars: Math.max(0, options.historyChars ?? DEFAULT_HISTORY_CHARS),
-  }
+  const limits = historyLimits(options)
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES
   const localTitles = options.localTitles !== false
   const toolCallDisplay = options.toolCallDisplay !== "off"
@@ -383,10 +355,7 @@ export async function createShim(options: ShimOptions) {
     // The AI SDK provider asks for structured tool events so OpenCode can
     // render native tool cards; the OpenAI-compatible route keeps inline lines.
     const structuredTools = req.headers["x-acp-tool-events"] === "1"
-    // A compaction request needs the full transcript; truncating it would
-    // produce a summary of the wrong slice of the conversation.
-    const promptLimits = isCompactionRequest(messages) ? COMPACTION_LIMITS : limits
-    const fresh = buildPrompt(messages, options.includeSystem === true, promptLimits)
+    const fresh = buildPrompt(messages, options.includeSystem === true, limits)
     if (!fresh.trim()) {
       res.writeHead(400, { "content-type": "application/json" })
       res.end(JSON.stringify({ error: { message: "Empty prompt", type: "invalid_request_error" } }))
@@ -402,7 +371,7 @@ export async function createShim(options: ShimOptions) {
       if (!res.writableEnded) controller.abort()
     })
 
-    const writeChunk = (delta: Record<string, unknown>, reason: string | null = null, usage?: unknown) => {
+    const writeChunk = (delta: Record<string, unknown>, reason: string | null = null) => {
       if (!stream || res.destroyed || res.writableEnded) return
       res.write(
         `data: ${JSON.stringify({
@@ -411,7 +380,6 @@ export async function createShim(options: ShimOptions) {
           created,
           model: modelID,
           choices: [{ index: 0, delta, finish_reason: reason }],
-          ...(usage ? { usage } : {}),
         })}\n\n`,
       )
     }
@@ -510,11 +478,8 @@ export async function createShim(options: ShimOptions) {
       }
 
       const reason = finishReason(result.stopReason)
-      // Only the turn's own accounting is billed usage. `usage_update.used` is
-      // context occupancy (and session-cumulative in codex-acp), never input.
-      const usage = completionUsage(result.usage)
       if (stream) {
-        writeChunk({}, reason, usage)
+        writeChunk({}, reason)
         if (!res.destroyed && !res.writableEnded) {
           res.write("data: [DONE]\n\n")
           res.end()
@@ -535,7 +500,6 @@ export async function createShim(options: ShimOptions) {
                 finish_reason: reason,
               },
             ],
-            ...(usage ? { usage } : {}),
           }),
         )
       }

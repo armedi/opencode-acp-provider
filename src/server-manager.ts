@@ -1,12 +1,6 @@
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
-import {
-  AcpClient,
-  type AcpMcpServer,
-  type PermissionHandler,
-  type PromptResult,
-  type SessionUpdate,
-} from "./acp-client.ts"
+import { AcpClient, type AcpMcpServer, type SessionUpdate, type PermissionHandler } from "./acp-client.ts"
 import { applyCmdSkillFlag, isCmdCommand } from "./skills.ts"
 
 const execFileAsync = promisify(execFile)
@@ -133,7 +127,18 @@ interface PooledSession {
   mcpRelease?: () => void
 }
 
-export type AcpRunResult = PromptResult
+export interface AcpRunResult {
+  stopReason: string
+  text: string
+}
+
+export type AcpCompactResult =
+  /** `text` is what the agent said; `tokens` is its context size before and after, when it reports them. */
+  | { status: "compacted"; text: string; tokens?: { before: number; after: number } }
+  /** The agent has no `/compact` command; it manages its context on its own. */
+  | { status: "unsupported" }
+  /** No live ACP session holds this conversation, so there is nothing to compact. */
+  | { status: "no-session" }
 
 const DEFAULT_MAX_SESSIONS = 32
 const DEFAULT_SESSION_IDLE_MS = 30 * 60_000
@@ -585,6 +590,44 @@ export class AcpServerManager {
       void pooled.client.closeSession(pooled.sessionId).catch(() => {})
     })
     return run
+  }
+
+  /**
+   * Compact the agent's own context for an OpenCode session with the agent's
+   * `/compact` command. Only an existing pooled session is compacted; opening
+   * one would compact nothing. The command waits behind any running turn.
+   */
+  async compact(input: { server: string; key: string }): Promise<AcpCompactResult> {
+    const prefix = `${input.server}\u0000${input.key}\u0000`
+    const pooled = [...this.pools.entries()]
+      .filter(([poolKey, entry]) => poolKey.startsWith(prefix) && !entry.broken)
+      .map(([, entry]) => entry)
+      .sort((left, right) => right.lastUsed - left.lastUsed)[0]
+    if (!pooled) return { status: "no-session" }
+    if (!pooled.client.hasCommand(pooled.sessionId, "compact")) return { status: "unsupported" }
+
+    let tokens: { before: number; after: number } | undefined
+    pooled.pending += 1
+    const run = pooled.queue.then(() => {
+      if (pooled.broken) throw new Error(`ACP session ${pooled.sessionId} is no longer usable`)
+      return pooled.client.prompt(pooled.sessionId, "/compact", {
+        onUpdate: (update) => {
+          // Claude Code reports a compaction as a tool call with its context size before and after.
+          const output = update.rawOutput as { preTokens?: unknown; postTokens?: unknown } | undefined
+          if (typeof output?.preTokens === "number" && typeof output.postTokens === "number") {
+            tokens = { before: output.preTokens, after: output.postTokens }
+          }
+        },
+      })
+    })
+    pooled.queue = run.catch(() => {})
+    try {
+      const result = await run
+      return { status: "compacted", text: result.text.trim(), ...(tokens ? { tokens } : {}) }
+    } finally {
+      pooled.pending = Math.max(0, pooled.pending - 1)
+      pooled.lastUsed = Date.now()
+    }
   }
 
   private permissionHandler(server: string, sessionKey: string | undefined): PermissionHandler | undefined {

@@ -77,11 +77,18 @@ function handle(message) {
     case "session/new": {
       const sessionId = `sess-${nextSession++}`
       sessionDirectories.set(sessionId, message.params?.additionalDirectories ?? [])
-      return send({
+      send({
         jsonrpc: "2.0",
         id: message.id,
         result: { sessionId, configOptions },
       })
+      if (!process.argv.includes("--no-commands")) {
+        update(sessionId, {
+          sessionUpdate: "available_commands_update",
+          availableCommands: [{ name: "compact", description: "Summarize the conversation so far" }],
+        })
+      }
+      return
     }
     case "session/set_config_option": {
       const value = message.params?.value
@@ -165,17 +172,9 @@ function handle(message) {
         })()
         return
       }
-      if (/\bsession totals\b/i.test(text)) {
-        // Command Code's second turn: `usage` is session-cumulative, `_meta.usage` is this turn.
-        return send({
-          jsonrpc: "2.0",
-          id: message.id,
-          result: {
-            stopReason: "end_turn",
-            usage: { totalTokens: 33659, inputTokens: 33653, outputTokens: 6, cachedReadTokens: 19328, cachedWriteTokens: 0 },
-            _meta: { usage: { inputTokens: 16833, outputTokens: 3, cacheReadTokens: 16768, cacheWriteTokens: 0 } },
-          },
-        })
+      if (text === "/compact") {
+        update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `Compacted ${sessionId}.` } })
+        return send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
       }
       if (/\bdirectories\b/i.test(text)) {
         const directories = sessionDirectories.get(sessionId) ?? []
@@ -226,8 +225,7 @@ function handle(message) {
       update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: reply } })
       update(sessionId, { sessionUpdate: "usage_update", used: 12, size: 200 })
 
-      const usage = { inputTokens: 10, outputTokens: 2, cachedReadTokens: 8, totalTokens: 12 }
-      setTimeout(() => send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn", usage } }), 5)
+      setTimeout(() => send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } }), 5)
       return
     }
     default:
