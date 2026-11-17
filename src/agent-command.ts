@@ -13,5 +13,8 @@ export function executableName(command: string | string[]) {
 
 /** True when the command starts Command Code. */
 export function isCmdCommand(command: string | string[]) {
-  return ["cmd", "cmdc", "commandcode"].includes(executableName(command))
+  const executable = executableName(command)
+  if (["cmd", "cmdc", "commandcode", "command-code"].includes(executable)) return true
+  if (!["node", "bun"].includes(executable) || !Array.isArray(command)) return false
+  return /\/command-code\/dist\/(?:index|cli)\.mjs$/.test((command[1] ?? "").replace(/\\/g, "/"))
 }

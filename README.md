@@ -392,16 +392,22 @@ error.
    before the response starts is retried, and closing the shim lets a turn that is already streaming
    finish first, so a plugin reload does not surface as `ECONNRESET` mid-turn.
 4. **Sessions** are keyed by OpenCode's `x-opencode-session-id` header (falling back to
-   `x-opencode-session`), model, and reasoning effort, created once and reused, with prompts
-   serialized per session. The reuse decision is made inside the pool, so a retry after a failed turn
-   cannot replay the wrong prompt. A failed or cancelled turn keeps the ACP session: the agent is
-   asked to end the turn, and the next prompt continues the same context. Only a dead process or a
-   session the agent no longer knows ends it. Session ids are also stored in OpenCode's plugin
-   storage, so a new agent process reattaches with `session/resume` (or `session/load`) instead of
-   starting over. Reused sessions receive only the newest user turn; a fresh session receives a short
-   transcript (last 16 turns, capped at 8k characters by default) so a restarted agent still sees the
-   conversation without replaying an unbounded history. Idle sessions are closed after 30 minutes and
-   the pool is capped at 32.
+   `x-opencode-session`) and working directory, created once and reused, with prompts serialized per
+   session. Model and reasoning effort are settings on that session, not part of its key: a turn that
+   asks for a different value changes the existing session before its prompt, so switching variants
+   keeps the agent's context. The change and the prompt share the session queue, so concurrent turns
+   cannot change each other's model. A turn that asks for the provider default opens a fresh session
+   when the previous turn had an explicit value, since many agents cannot reset a live selection. The
+   same fallback applies when an agent refuses a live change; history is then replayed into the new
+   session. The reuse decision is made inside the pool, so a retry after a failed turn cannot replay
+   the wrong prompt. A failed or cancelled turn keeps the ACP session: the agent is asked to end the
+   turn, and the next prompt continues the same context. Only a dead process or a session the agent no
+   longer knows ends it. Session ids are also stored in OpenCode's plugin storage, so a new agent
+   process reattaches with `session/resume` (or `session/load`) instead of starting over. Reused
+   sessions receive only the newest user turn; a fresh session receives a short transcript (last 16
+   turns, capped at 8k characters by default) so a restarted agent still sees the conversation without
+   replaying an unbounded history. Idle sessions are closed after 30 minutes and the pool is capped at
+   32.
 5. **Titles** use OpenCode's default title behavior rather than a plugin-specific path.
 6. **Recovery** is automatic: if an agent process exits, the next turn restarts it and resumes the
    stored sessions. Every handshake, control call, and turn has a timeout, retries are bounded by
@@ -456,10 +462,29 @@ Press `<leader>k` (Ctrl+X then K by default) to show or hide them.
 
 ### Latency
 
-Turn time is dominated by the ACP agent's own model latency and tool loop, not the plugin. The plugin
-keeps fixed overhead to a few tens of milliseconds by reusing the ACP session and not replaying
-conversation history into a session that already has it. If replies are slow, try `"effort": "low"`
-or `"off"` on the server, or a faster model tier exposed by the agent.
+A first request can still wait for its own agent to initialize. Later turns reuse its ACP session
+and send only the new message, without replaying conversation history. Model generation and tool
+work can also take time; use `"effort": "low"` or `"off"`, or a faster model tier, if appropriate.
+
+Control requests taking at least a second and turns taking at least five seconds produce timing
+warnings. The turn warning includes time to first text and first thought, without logging prompt
+content. Use these to distinguish cold agent startup from a slow model response.
+
+To measure the complete request path, run:
+
+```sh
+python3 scripts/latency.py acp-cmd/deepseek/deepseek-v4.1-flash 3
+```
+
+This creates diagnostic sessions with and without automatic titles. It reports admission and
+end-to-idle times, and excludes empty replies and ACP errors from successful latency statistics.
+Model latency varies, so compare successful runs on the same machine and model.
+
+If an agent repeatedly exits with native signals such as `SIGSEGV` or `SIGBUS`, retries can dominate
+the wait. Check its runtime outside OpenCode too. For Command Code, a launch such as
+`["bun", "/absolute/path/to/node_modules/command-code/dist/index.mjs", "acp"]` is recognized by the
+plugin and retains skill injection. `mcpRuntime: "bun"` also avoids starting Node for each stdio
+bridge. These are runtime workarounds, not substitutes for fixing the crashing agent/runtime.
 
 ACP models are registered with `capabilities.tools: false`: the ACP agent uses *its own* tools, which
 is the point of delegating to it. OpenCode's built-in tools remain available to normal models, and

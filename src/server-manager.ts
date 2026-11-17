@@ -57,6 +57,7 @@ export interface AcpServerState {
   client?: AcpClient
   models: AcpModelInfo[]
   defaultModel?: string
+  modelConfigID?: string
   /** Reasoning effort levels advertised by the agent, excluding the implicit default. */
   efforts: string[]
   effortConfigID?: string
@@ -139,13 +140,20 @@ function normalizeCommand(command: string | string[]): { command: string; args: 
   return { command: command.trim(), args: [] }
 }
 
+interface AcpSelection {
+  model?: string
+  effort?: string
+}
+
 interface PooledSession {
   server: string
   key: string
   sessionId: string
   client: AcpClient
-  model?: string
-  effort?: string
+  /** Undefined after a refused/uncertain config write; never assume it applied. */
+  selection?: AcpSelection
+  history: "fresh" | "retained"
+  mcpServers?: AcpMcpServer[]
   cwd: string
   queue: Promise<unknown>
   lastUsed: number
@@ -205,7 +213,7 @@ export class AcpServerManager {
   private log: LogFn
   private defaultCwd: string
   private pools = new Map<string, PooledSession>()
-  private negotiating = new Map<string, Promise<{ pooled: PooledSession; reused: boolean }>>()
+  private negotiating = new Map<string, Promise<PooledSession>>()
   private preparing = new Map<string, Promise<void>>()
   /** Keys whose ACP turn is still being negotiated, before a prompt is in flight. */
   private starting = new Map<string, number>()
@@ -308,8 +316,8 @@ export class AcpServerManager {
     return state && !state.config.disabled ? state : undefined
   }
 
-  private poolKey(server: string, key: string, model: string | undefined, effort: string | undefined, cwd: string) {
-    return `${server}\u0000${key}\u0000${model ?? ""}\u0000${cwd}\u0000${effort ?? ""}`
+  private poolKey(server: string, key: string, cwd: string) {
+    return `${server}\u0000${key}\u0000${cwd}`
   }
 
   private async storedSession(poolKey: string) {
@@ -379,12 +387,61 @@ export class AcpServerManager {
       this.log("warn", `ACP server "${state.config.id}" does not support effort "${effort}" (available: ${state.efforts.join(", ")})`)
       return
     }
-    await client
-      .setEffort(sessionId, effort, state.effortConfigID)
-      .then(() => this.log("info", `ACP effort set to ${effort}`))
-      .catch((error) =>
-        this.log("warn", `could not set effort "${effort}": ${error instanceof Error ? error.message : String(error)}`),
-      )
+    await client.setEffort(sessionId, effort, state.effortConfigID)
+    this.log("debug", `ACP effort set to ${effort}`)
+  }
+
+  /** Called only inside the conversation's queue, before its next prompt. */
+  private async select(
+    state: AcpServerState,
+    pooled: PooledSession,
+    selection: AcpSelection,
+    poolKey: string,
+  ) {
+    const previous = pooled.selection
+    if (previous && previous.model === selection.model && previous.effort === selection.effort) return
+    pooled.selection = undefined
+    const resetDefault =
+      (!selection.model && previous?.model !== undefined) ||
+      (!selection.effort && previous?.effort !== undefined)
+    if (previous && !resetDefault) {
+      try {
+        const modelChanged = previous.model !== selection.model
+        if (modelChanged && selection.model) {
+          await pooled.client.setModel(pooled.sessionId, selection.model, state.modelConfigID)
+        }
+        if (modelChanged || previous.effort !== selection.effort) {
+          await this.applyEffort(state, pooled.client, pooled.sessionId, selection.effort)
+        }
+        pooled.selection = selection
+        return
+      } catch (error) {
+        if (!(error instanceof AcpError) || ![-32601, -32602].includes(error.code)) throw error
+        this.log("debug", `ACP session refused a selection change; replaying in a fresh session: ${error.message}`)
+      }
+    }
+
+    // Some agents cannot change a live selection or reset to the provider default.
+    // Keep the conversation queue/lease, but replay history into a new ACP session.
+    const session = await pooled.client.newSession(pooled.cwd, {
+      model: selection.model,
+      mcpServers: pooled.mcpServers,
+      meta: state.config.meta,
+      additionalDirectories: this.sessionDirectories(state.config),
+    })
+    try {
+      if (state.config.mode) await pooled.client.setMode(session.sessionId, state.config.mode).catch(() => {})
+      await this.applyEffort(state, pooled.client, session.sessionId, selection.effort)
+    } catch (error) {
+      await pooled.client.closeSession(session.sessionId).catch(() => {})
+      throw error
+    }
+    const oldSession = pooled.sessionId
+    pooled.sessionId = session.sessionId
+    pooled.history = "fresh"
+    pooled.selection = selection
+    await this.rememberSession(poolKey, session.sessionId)
+    await pooled.client.closeSession(oldSession).catch(() => {})
   }
 
   /** Start every enabled agent, read its model inventory, and keep it ready. */
@@ -514,6 +571,7 @@ export class AcpServerManager {
       }
       state.models = models
       state.defaultModel = session.currentModel
+      state.modelConfigID = session.configOptions.find((option) => option.category === "model")?.id
       state.efforts = (session.efforts ?? []).filter((value) => value !== "default")
       state.effortConfigID = session.effort?.configId
       state.defaultEffort = session.effort?.currentValue
@@ -628,14 +686,14 @@ export class AcpServerManager {
         }
       }
 
-      const poolKey = this.poolKey(input.server, input.key, model, effort, cwd)
+      const poolKey = this.poolKey(input.server, input.key, cwd)
       let negotiating = this.negotiating.get(poolKey)
       if (!negotiating) {
         negotiating = (async () => {
           const existing = this.pools.get(poolKey)
           if (existing) {
             this.log("debug", `reusing ACP session ${existing.sessionId} for key ${input.key!.slice(0, 24)}`)
-            return { pooled: existing, reused: true }
+            return existing
           }
           const sessionStartedAt = Date.now()
           this.evictForCapacity()
@@ -646,7 +704,10 @@ export class AcpServerManager {
             // A plugin reload or an agent crash leaves a fresh process with no
             // sessions. Reattach to the one this OpenCode session had instead of
             // starting over and losing the conversation.
-            const stored = await this.storedSession(poolKey)
+            // Migrate the previously variant-keyed store without losing an
+            // existing conversation on the first run after upgrading.
+            const legacyKey = `${input.server}\u0000${input.key}\u0000${model ?? ""}\u0000${cwd}\u0000${effort ?? ""}`
+            const stored = (await this.storedSession(poolKey)) ?? (await this.storedSession(legacyKey))
             if (stored) {
               const restored = await client
                 .restoreSession(stored, {
@@ -668,6 +729,7 @@ export class AcpServerManager {
               if (restored) {
                 session = { sessionId: stored }
                 reused = true
+                await this.rememberSession(poolKey, stored)
                 this.log(
                   "debug",
                   `restored ACP session ${stored} (${restored}) for key ${input.key!.slice(0, 24)}`,
@@ -684,18 +746,12 @@ export class AcpServerManager {
               await this.rememberSession(poolKey, session.sessionId)
             }
             if (mode) await client.setMode(session.sessionId, mode).catch(() => {})
-            await this.applyEffort(state, client, session.sessionId, effort)
             // A restored session keeps its old model, so put the requested one back.
             if (reused && model) {
-              await client.setModel(session.sessionId, model).catch((error) => {
-                this.log(
-                  "warn",
-                  `could not set model "${model}" on restored ACP session: ${
-                    error instanceof Error ? error.message : String(error)
-                  }`,
-                )
-              })
+              await client.setModel(session.sessionId, model, state.modelConfigID)
             }
+            // Set effort after model: changing models can reset it.
+            await this.applyEffort(state, client, session.sessionId, effort)
           } catch (error) {
             lease?.release()
             if (session) await client.closeSession(session.sessionId).catch(() => {})
@@ -706,8 +762,9 @@ export class AcpServerManager {
             key: input.key!,
             sessionId: session.sessionId,
             client,
-            model,
-            effort,
+            selection: { model, effort },
+            history: reused ? "retained" : "fresh",
+            mcpServers: lease?.servers,
             cwd,
             queue: Promise.resolve(),
             lastUsed: Date.now(),
@@ -722,25 +779,32 @@ export class AcpServerManager {
             "debug",
             `opened ACP session ${session.sessionId} for key ${input.key!.slice(0, 24)} in ${Date.now() - sessionStartedAt}ms`,
           )
-          return { pooled: created, reused }
+          return created
         })()
         this.negotiating.set(poolKey, negotiating)
         negotiating.finally(() => this.negotiating.delete(poolKey)).catch(() => {})
       }
-      const { pooled, reused } = await negotiating
+      const pooled = await negotiating
       if (pooled.broken || this.pools.get(poolKey) !== pooled) {
         throw new Error(`ACP session for key ${input.key.slice(0, 24)} was closed after an earlier turn failed`)
       }
 
-      const prompt =
-        typeof input.prompt === "string" ? input.prompt : reused ? input.prompt.reused : input.prompt.fresh
       pooled.lastUsed = Date.now()
       pooled.pending += 1
-      const run = pooled.queue.then(() => {
+      const run = pooled.queue.then(async () => {
         if (pooled.broken) throw new Error(`ACP session ${pooled.sessionId} is no longer usable`)
+        if (input.signal?.aborted) return { stopReason: "cancelled", text: "" }
+        await this.select(state, pooled, { model, effort }, poolKey)
+        if (pooled.broken) throw new Error(`ACP session ${pooled.sessionId} is no longer usable`)
+        if (input.signal?.aborted) return { stopReason: "cancelled", text: "" }
+        const prompt =
+          typeof input.prompt === "string"
+            ? input.prompt
+            : pooled.history === "retained" ? input.prompt.reused : input.prompt.fresh
         pooled.active += 1
         started = true
         finishStarting()
+        pooled.history = "retained"
         const turn = pooled.client
           .prompt(pooled.sessionId, prompt, {
             onUpdate: input.onUpdate,

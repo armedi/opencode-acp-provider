@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -106,6 +106,68 @@ test("passes additionalDirectories to fresh and pooled sessions", async () => {
       sessionKey: "ses_dirs",
     })
     expect(pooled.text).toBe("directories:/tmp/opencode-skills")
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("model and effort changes preserve history and serialize settings with their prompts", async () => {
+  const dir = await cwd()
+  const rpcLog = join(dir, "rpc.jsonl")
+  const { instance } = manager({
+    defaultCwd: dir,
+    agentArgs: ["--echo-history", "--model-option-id", "engine", "--rpc-log", rpcLog],
+  })
+  const turn = async (model: string, effort: string | undefined, text: string) =>
+    JSON.parse(
+      (
+        await instance.run({
+          server: "fake",
+          key: "ses_selection",
+          model,
+          effort,
+          prompt: { fresh: `history replay: ${text}`, reused: text },
+        })
+      ).text,
+    )
+  try {
+    const first = await turn("fast", "high", "first")
+    const [second, third] = await Promise.all([
+      turn("slow", "low", "second"),
+      turn("fast", "high", "third"),
+    ])
+    const fourth = await turn("fast", undefined, "fourth")
+    const fifth = await turn("fast", undefined, "fifth")
+    expect(second).toMatchObject({ sessionId: first.sessionId, model: "slow", effort: "low" })
+    expect(third).toMatchObject({ sessionId: first.sessionId, model: "fast", effort: "high" })
+    expect(fourth).toMatchObject({ sessionId: first.sessionId, model: "fast", effort: "medium" })
+    expect(fifth.prompts).toEqual(["history replay: first", "second", "third", "fourth", "fifth"])
+    const requests = (await readFile(rpcLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line))
+    const lastPrompt = requests.findLastIndex((request) => request.method === "session/prompt")
+    expect(requests[lastPrompt - 1].method).toBe("session/prompt")
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("an agent refusing live selection changes gets a fresh session with replayed history", async () => {
+  const { instance } = manager({ agentArgs: ["--echo-history", "--no-live-switch"] })
+  try {
+    const first = JSON.parse((await instance.run({
+      server: "fake", key: "ses_switch_fallback", model: "fast", effort: "high", prompt: "first",
+    })).text)
+    const second = JSON.parse((await instance.run({
+      server: "fake", key: "ses_switch_fallback", model: "slow", effort: "low",
+      prompt: { fresh: "first plus second", reused: "second" },
+    })).text)
+    expect(second.sessionId).not.toBe(first.sessionId)
+    expect(second).toMatchObject({ model: "slow", effort: "low", prompts: ["first plus second"] })
+    const third = JSON.parse((await instance.run({
+      server: "fake", key: "ses_switch_fallback", model: "slow", effort: "low",
+      prompt: { fresh: "should not replay", reused: "third" },
+    })).text)
+    expect(third.sessionId).toBe(second.sessionId)
+    expect(third.prompts).toEqual(["first plus second", "third"])
   } finally {
     await instance.stop()
   }

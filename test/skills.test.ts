@@ -106,6 +106,12 @@ test("leaves shared agent skills where the agents already load them", async () =
 })
 
 test("adds the skills root to cmd without overriding an explicit choice", () => {
+  const runtimeCommand = ["bun", "/node_modules/command-code/dist/index.mjs", "acp"]
+  expect(applyCmdSkillFlag(runtimeCommand, "/tmp/skills", "/mod.ts")).toEqual([
+    ...runtimeCommand, "--mod", "/mod.ts", "--skill", "/tmp/skills",
+  ])
+  const otherRuntimeCommand = ["bun", "/other/dist/index.mjs", "acp"]
+  expect(applyCmdSkillFlag(otherRuntimeCommand, "/tmp/skills", "/mod.ts")).toEqual(otherRuntimeCommand)
   expect(applyCmdSkillFlag(["cmd", "acp"], "/tmp/skills", "/mod.ts")).toEqual([
     "cmd",
     "acp",

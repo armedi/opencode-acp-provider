@@ -529,11 +529,9 @@ export default Plugin.define({
         log,
       })
       registrations.push(
-        await ctx.session.hook("prompt", (event) => {
-          // Admission happens after this hook returns, so the steer runs on its
-          // own: it waits for the queued row to appear before dropping it.
-          void steer(event)
-        }),
+        // Check for an existing turn before admission can start this prompt's
+        // own turn. Only inbox cleanup may outlive the admission hook.
+        await ctx.session.hook("prompt", steer),
       )
 
       log("info", `registered ${registered.size} ACP provider(s) in ${Date.now() - setupStartedAt}ms`)

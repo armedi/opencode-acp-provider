@@ -200,7 +200,11 @@ export function createSteering(options: SteeringOptions) {
         if (result.status !== "unavailable") log("debug", `steering fell back to ${result.status} for ${event.sessionID}`)
         return
       }
-      await dropAdmitted(inbox, event.messageID, options.admitTimeoutMs ?? DEFAULT_ADMIT_TIMEOUT_MS, log)
+      // The prompt hook must return before this row can be admitted. Keep only
+      // cleanup in the background, not the decision whether this is a steer.
+      void dropAdmitted(inbox, event.messageID, options.admitTimeoutMs ?? DEFAULT_ADMIT_TIMEOUT_MS, log).catch((error) => {
+        log("warn", `steered message cleanup failed: ${error instanceof Error ? error.message : String(error)}`)
+      })
     } catch (error) {
       // A steer must never break the prompt it belongs to.
       log("warn", `steering failed: ${error instanceof Error ? error.message : String(error)}`)

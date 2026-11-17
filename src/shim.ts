@@ -362,7 +362,7 @@ export async function createShim(options: ShimOptions) {
     let chunks = 0
     let firstChunkAt: number | undefined
     let firstThoughtAt: number | undefined
-    const startedAt = Date.now()
+    const startedAt = Math.round(performance.now())
     const toolCalls = new Map<string, ToolCallState>()
     const acpTools = new Map<string, AcpToolState>()
     try {
@@ -378,7 +378,7 @@ export async function createShim(options: ShimOptions) {
           if (update.sessionUpdate === "agent_thought_chunk" && update.content?.type === "text") {
             chunks += 1
             if (!firstThoughtAt) {
-              firstThoughtAt = Date.now()
+              firstThoughtAt = Math.round(performance.now())
               if (debug) log("debug", `first ACP thought chunk after ${firstThoughtAt - startedAt}ms`)
             }
             const text = update.content.text ?? ""
@@ -387,7 +387,7 @@ export async function createShim(options: ShimOptions) {
           } else if (update.sessionUpdate === "agent_message_chunk" && update.content?.type === "text") {
             chunks += 1
             if (!firstChunkAt) {
-              firstChunkAt = Date.now()
+              firstChunkAt = Math.round(performance.now())
               if (debug) log("debug", `first ACP text chunk after ${firstChunkAt - startedAt}ms`)
             }
             const text = update.content.text ?? ""
@@ -426,10 +426,11 @@ export async function createShim(options: ShimOptions) {
         emitted = result.text
         writeChunk({ content: result.text })
       }
-      if (debug) {
+      const elapsed = Math.round(performance.now()) - startedAt
+      if (debug || elapsed >= 5_000) {
         log(
-          "debug",
-          `ACP turn finished for ${target.server}/${target.model}: ${result.stopReason} in ${Date.now() - startedAt}ms (${chunks} chunks, ${reasoning.length} reasoning chars, ${emitted.length} text chars)`,
+          elapsed >= 5_000 ? "warn" : "debug",
+          `ACP turn finished for ${target.server}/${target.model} key=${key ?? "-"} kind=${kind ?? "primary"}: ${result.stopReason} in ${elapsed}ms (first text ${firstChunkAt ? firstChunkAt - startedAt : "-"}ms, first thought ${firstThoughtAt ? firstThoughtAt - startedAt : "-"}ms, ${chunks} chunks, ${reasoning.length} reasoning chars, ${emitted.length} text chars)`,
         )
       }
 

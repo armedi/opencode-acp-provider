@@ -83,10 +83,12 @@ test("drops the queued message once the agent has taken it", async () => {
   const calls: SteerInput[] = []
   const steer = steering({ service: api.service, calls })
 
-  const running = steer(promptEvent())
   // Admission happens after the prompt hook returns.
-  setTimeout(() => api.admit("msg_1"), 100)
-  await running
+  await steer(promptEvent())
+  api.admit("msg_1")
+  for (let attempt = 0; attempt < 50 && api.deleted.length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
 
   expect(calls).toEqual([{ key: "ses_1", text: "change of plan", inPlace: true, plain: true }])
   expect(api.deleted).toEqual(["msg_1"])

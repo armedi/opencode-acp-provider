@@ -192,6 +192,7 @@ type Pending = { resolve: (value: any) => void; reject: (reason: Error) => void;
 
 interface SessionState {
   cwd: string
+  configOptions: AcpConfigOption[]
   onUpdate?: (update: SessionUpdate) => void
   requestPermission?: PermissionHandler
 }
@@ -528,6 +529,7 @@ export class AcpClient {
 
   request(method: string, params?: unknown, options: RequestOptions = {}) {
     const id = this.nextID++
+    const startedAt = performance.now()
     return new Promise<any>((resolveValue, rejectValue) => {
       let timer: ReturnType<typeof setTimeout> | undefined
       let graceTimer: ReturnType<typeof setTimeout> | undefined
@@ -538,6 +540,11 @@ export class AcpClient {
         if (graceTimer) clearTimeout(graceTimer)
         if (abortListener) options.signal?.removeEventListener("abort", abortListener)
         this.pending.delete(id)
+        const elapsed = Math.round(performance.now() - startedAt)
+        this.log(
+          method !== "session/prompt" && elapsed >= 1_000 ? "warn" : "debug",
+          `ACP request ${method} settled in ${elapsed}ms`,
+        )
       }
       const succeed = (value: any) => {
         cleanup()
@@ -632,7 +639,7 @@ export class AcpClient {
       }))
     const effort = readEffortConfig(configOptions)
 
-    this.sessions.set(sessionId, { cwd })
+    this.sessions.set(sessionId, { cwd, configOptions })
 
     try {
       if (options.model && modelOption && options.model !== modelOption.currentValue) {
@@ -680,7 +687,7 @@ export class AcpClient {
     const load = capabilities?.loadSession === true
     if (!resume && !load) return undefined
     const timeout = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
-    await this.request(
+    const result = await this.request(
       resume ? "session/resume" : "session/load",
       {
         sessionId,
@@ -692,7 +699,7 @@ export class AcpClient {
       // Replaying a long conversation through session/load is not a control call.
       { timeout: resume ? timeout : Math.max(60_000, timeout) },
     )
-    this.sessions.set(sessionId, { cwd: options.cwd })
+    this.sessions.set(sessionId, { cwd: options.cwd, configOptions: result.configOptions ?? [] })
     return resume ? "resumed" : "loaded"
   }
 
@@ -706,21 +713,41 @@ export class AcpClient {
     return Boolean(this.child) && !this.closed && !this.disposed
   }
 
+  configOption(sessionId: string, category: string) {
+    return this.sessions.get(sessionId)?.configOptions.find((option) => option.category === category)
+  }
+
   async setModel(sessionId: string, modelId: string, configId = "model") {
-    return this.setConfigOption(sessionId, configId, modelId)
+    return this.setConfigOption(sessionId, this.configOption(sessionId, "model")?.id ?? configId, modelId)
   }
   /** Set the agent's reasoning effort for a session. */
   async setEffort(sessionId: string, effort: string, configId = "effort") {
-    return this.setConfigOption(sessionId, configId, effort)
+    return this.setConfigOption(sessionId, this.configOption(sessionId, "thought_level")?.id ?? configId, effort)
   }
 
   /** Set any agent-advertised session config option, e.g. "model" or "effort". */
   async setConfigOption(sessionId: string, configId: string, value: string) {
-    return this.request(
+    const session = this.sessions.get(sessionId)
+    const option = session?.configOptions.find((option) => option.id === configId)
+    if (option?.currentValue === value) return
+    const result = await this.request(
       "session/set_config_option",
       { sessionId, configId, value },
       { timeout: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS },
     )
+    if (session) {
+      session.configOptions = Array.isArray(result.configOptions)
+        ? result.configOptions
+        : session.configOptions.map((current) => {
+            if (current.id === configId) return { ...current, currentValue: value }
+            // A model switch can reset effort; do not retain an unconfirmed value.
+            if (option?.category === "model" && current.category === "thought_level") {
+              return { ...current, currentValue: undefined }
+            }
+            return current
+          })
+    }
+    return result
   }
 
   async setMode(sessionId: string, modeId: string) {

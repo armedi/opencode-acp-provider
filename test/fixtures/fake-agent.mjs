@@ -2,11 +2,12 @@
 // Scripted ACP agent used by the tests. Speaks newline-delimited JSON-RPC on
 // stdio and implements just enough of the protocol for the client.
 
-import { readFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs"
 
 let nextSession = 1
 const sessionDirectories = new Map()
 const sessionPrompts = new Map()
+const sessionSelections = new Map()
 const configOptions = [
   {
     id: "model",
@@ -85,8 +86,20 @@ function update(sessionId, payload) {
   send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: payload } })
 }
 
+function optionsFor(sessionId) {
+  const selection = sessionSelections.get(sessionId) ?? { model: "fast", effort: "medium" }
+  return configOptions.map((option) => ({
+    ...option,
+    id: option.category === "model" ? argument("--model-option-id") ?? option.id : option.id,
+    currentValue: option.category === "model" ? selection.model : selection.effort,
+  }))
+}
+
 function handle(message) {
   if (!message || typeof message !== "object") return
+  if (message.method && message.id !== undefined && argument("--rpc-log")) {
+    appendFileSync(argument("--rpc-log"), `${JSON.stringify({ method: message.method, params: message.params })}\n`)
+  }
   if (!message.method) {
     // A reply to an agent-initiated client request.
     const callback = replies.get(message.id)
@@ -163,12 +176,13 @@ function handle(message) {
     }
     case "session/new": {
       const sessionId = `sess-${nextSession++}`
+      sessionSelections.set(sessionId, { model: "fast", effort: "medium" })
       sessionDirectories.set(sessionId, message.params?.additionalDirectories ?? [])
       rememberSession(sessionId)
       send({
         jsonrpc: "2.0",
         id: message.id,
-        result: { sessionId, configOptions },
+        result: { sessionId, configOptions: optionsFor(sessionId) },
       })
       if (!process.argv.includes("--no-commands")) {
         update(sessionId, {
@@ -189,22 +203,45 @@ function handle(message) {
         })
       }
       sessionDirectories.set(sessionId, message.params?.additionalDirectories ?? [])
+      sessionSelections.set(sessionId, { model: "fast", effort: "medium" })
       // Never hand out an id this process already restored.
       const suffix = Number(sessionId.slice("sess-".length))
       if (Number.isFinite(suffix) && suffix >= nextSession) nextSession = suffix + 1
       return send({ jsonrpc: "2.0", id: message.id, result: {} })
     }
     case "session/set_config_option": {
+      const sessionId = message.params?.sessionId
+      const modelOption = argument("--model-option-id") ?? "model"
+      if (
+        (process.argv.includes("--no-live-switch") && sessionPrompts.has(sessionId)) ||
+        runningTurns.has(sessionId)
+      ) {
+        return send({
+          jsonrpc: "2.0", id: message.id,
+          error: { code: -32602, message: "session cannot change config now" },
+        })
+      }
       const value = message.params?.value
       const accepted = ["fast", "slow"].includes(value) || String(value).startsWith("extra-")
-      if (message.params?.configId === "model" && !accepted) {
+      if (message.params?.configId === modelOption && !accepted) {
         return send({
           jsonrpc: "2.0",
           id: message.id,
           error: { code: -32602, message: `unknown model: ${value}` },
         })
       }
-      return send({ jsonrpc: "2.0", id: message.id, result: {} })
+      const selection = sessionSelections.get(sessionId) ?? { model: "fast", effort: "medium" }
+      if (message.params?.configId === modelOption) {
+        selection.model = value
+        // Model changes may reset reasoning effort.
+        selection.effort = "medium"
+      } else if (message.params?.configId === "effort") selection.effort = value
+      else return send({
+        jsonrpc: "2.0", id: message.id,
+        error: { code: -32602, message: "unknown config option" },
+      })
+      sessionSelections.set(sessionId, selection)
+      return send({ jsonrpc: "2.0", id: message.id, result: { configOptions: optionsFor(sessionId) } })
     }
     case "session/set_mode":
     case "session/close":
@@ -222,9 +259,14 @@ function handle(message) {
         sessionPrompts.set(sessionId, prompts)
         update(sessionId, {
           sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: JSON.stringify({ sessionId, prompts }) },
+          content: { type: "text", text: JSON.stringify({ sessionId, prompts, ...sessionSelections.get(sessionId) }) },
         })
-        return send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
+        runningTurns.set(sessionId, { id: message.id, text })
+        setTimeout(() => {
+          runningTurns.delete(sessionId)
+          send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
+        }, 10)
+        return
       }
 
       if (/\bfail\b/i.test(text)) {
