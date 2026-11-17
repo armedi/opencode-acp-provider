@@ -25,6 +25,11 @@ export interface ShimOptions {
   debugEnabled?: boolean
   /** Show ACP tool calls in the answer stream. Defaults to "inline". */
   toolCallDisplay?: "off" | "inline"
+  /**
+   * How long `close()` waits for requests that are still streaming before it
+   * drops their connections. Defaults to 30 minutes, matching one ACP turn.
+   */
+  drainTimeoutMs?: number
 }
 
 export interface ChatMessage {
@@ -40,6 +45,7 @@ interface HistoryLimits {
 const DEFAULT_HISTORY_TURNS = 16
 const DEFAULT_HISTORY_CHARS = 8_192
 const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024
+const DEFAULT_DRAIN_TIMEOUT_MS = 30 * 60_000
 
 class BodyTooLargeError extends Error {}
 
@@ -523,26 +529,39 @@ export async function createShim(options: ShimOptions) {
     }
   }
 
+  const inflight = new Set<Promise<void>>()
   const server = createServer((req, res) => {
-    void handleRequest(req, res).catch((error) => {
-      log("error", `shim request failed: ${error instanceof Error ? error.message : String(error)}`)
-      if (res.destroyed) return
-      if (!res.headersSent) {
-        try {
-          res.writeHead(500, { "content-type": "application/json" })
-        } catch {
-          // the connection was closed
+    const work = (async () => {
+      try {
+        await handleRequest(req, res)
+      } catch (error) {
+        log("error", `shim request failed: ${error instanceof Error ? error.message : String(error)}`)
+        if (res.destroyed) return
+        if (!res.headersSent) {
+          try {
+            res.writeHead(500, { "content-type": "application/json" })
+          } catch {
+            // the connection was closed
+          }
+        }
+        if (!res.writableEnded) {
+          try {
+            res.end()
+          } catch {
+            // the connection was closed
+          }
         }
       }
-      if (!res.writableEnded) {
-        try {
-          res.end()
-        } catch {
-          // the connection was closed
-        }
-      }
-    })
+    })()
+    inflight.add(work)
+    void work.finally(() => inflight.delete(work))
   })
+
+  // Bun keeps shim connections alive and reuses them across turns. Node's
+  // default 5s idle timeout closes a socket just as Bun picks it up again,
+  // which surfaces as an ECONNRESET in the middle of a turn. A local server
+  // does not need an idle timeout: `close()` drops the sockets it owns.
+  server.keepAliveTimeout = 0
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject)
@@ -551,14 +570,37 @@ export async function createShim(options: ShimOptions) {
   const address = server.address()
   const port = typeof address === "object" && address ? address.port : 0
   log("info", `ACP provider shim listening on http://127.0.0.1:${port}/v1`)
+  const drainTimeoutMs = options.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS
 
   return {
     url: `http://127.0.0.1:${port}/v1`,
+    /**
+     * A plugin reload disposes this instance while a turn may still be
+     * streaming. Destroying that connection is what the client reports as
+     * ECONNRESET, so stop accepting new requests, let the running turn finish,
+     * and only then drop the sockets.
+     */
     async close() {
-      await new Promise<void>((resolve) => {
+      const drained = new Promise<void>((resolve) => {
         server.close(() => resolve())
-        server.closeAllConnections?.()
+        server.closeIdleConnections?.()
       })
+      const deadline = Date.now() + Math.max(0, drainTimeoutMs)
+      while (inflight.size) {
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) break
+        let timer: ReturnType<typeof setTimeout> | undefined
+        await Promise.race([
+          Promise.allSettled([...inflight]),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, remaining)
+            timer.unref?.()
+          }),
+        ])
+        if (timer) clearTimeout(timer)
+      }
+      server.closeAllConnections?.()
+      await drained
     },
   }
 }

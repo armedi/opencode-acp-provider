@@ -359,6 +359,8 @@ export default Plugin.define({
         maxBodyBytes: options.maxBodyBytes,
         debugEnabled,
         log,
+        // A turn can run for as long as an ACP prompt is allowed to.
+        drainTimeoutMs: options.promptTimeoutMs,
       })
     } catch (error) {
       await manager.stop().catch(() => {})
@@ -373,13 +375,17 @@ export default Plugin.define({
       for (const timer of retryTimers) clearTimeout(timer)
       retryTimers.clear()
       for (const registration of registrations) await registration.dispose().catch(() => {})
-      // Close the shim first so a late request cannot start an agent while the
-      // manager is shutting down.
-      await shim.close().catch(() => {})
-      await manager.stop().catch(() => {})
-      await skills?.close().catch(() => {})
-      await mcp?.close().catch(() => {})
-      await openCodeMcp?.close().catch(() => {})
+      // A turn may still be streaming. Tearing down its connection here is what
+      // OpenCode reports as ECONNRESET, so let the shim drain first. Do not
+      // await it: a reload must stay responsive, and a shutdown does not need
+      // to wait for the old turn either.
+      void (async () => {
+        await shim.close().catch(() => {})
+        await manager.stop().catch(() => {})
+        await skills?.close().catch(() => {})
+        await mcp?.close().catch(() => {})
+        await openCodeMcp?.close().catch(() => {})
+      })()
     }
 
     try {

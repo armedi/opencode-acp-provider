@@ -168,3 +168,35 @@ test("cancelling the stream does not throw from the controller", async () => {
     process.off("unhandledRejection", listener)
   }
 })
+
+test("retries when the shim connection is reset before the response starts", async () => {
+  let attempts = 0
+  const { server, url } = await startStreamServer((_req, res) => {
+    attempts += 1
+    if (attempts === 1) {
+      // The shim was closing or the socket was reused; nothing was answered.
+      res.socket?.destroy()
+      return
+    }
+    res.writeHead(200, { "content-type": "text/event-stream" })
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "second try" } }] })}\n\n`)
+    res.write("data: [DONE]\n\n")
+    res.end()
+  })
+
+  try {
+    const model = createAcpLanguageModel({ server: "fake", model: "model-a", url }) as any
+    const { stream } = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    })
+    const parts = await readAll(stream)
+    expect(attempts).toBe(2)
+    expect(parts).toContainEqual({ type: "text-delta", id: "text-0", delta: "second try" })
+    expect(parts.at(-1).type).toBe("finish")
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve())
+      server.closeAllConnections?.()
+    })
+  }
+})

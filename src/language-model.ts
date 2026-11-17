@@ -31,23 +31,27 @@ export function createAcpLanguageModel(options: AcpLanguageModelOptions) {
         "debug",
         `acp language model ${options.server}/${options.model} session=${sessionID ?? "-"} messages=${call.prompt?.length ?? 0}`,
       )
-      const response = await fetch(`${options.url}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          // Ask the shim for structured tool events instead of inline markers.
-          "x-acp-tool-events": "1",
-          ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
-          ...(sessionID ? { "x-opencode-session-id": sessionID } : {}),
+      const response = await post(
+        `${options.url}/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            // Ask the shim for structured tool events instead of inline markers.
+            "x-acp-tool-events": "1",
+            ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
+            ...(sessionID ? { "x-opencode-session-id": sessionID } : {}),
+          },
+          body: JSON.stringify({
+            model: `${options.server}::${options.model}`,
+            stream: true,
+            messages: toMessages(call.prompt),
+            reasoning_effort: effortOf(call.providerOptions),
+          }),
+          signal: call.abortSignal ?? undefined,
         },
-        body: JSON.stringify({
-          model: `${options.server}::${options.model}`,
-          stream: true,
-          messages: toMessages(call.prompt),
-          reasoning_effort: effortOf(call.providerOptions),
-        }),
-        signal: call.abortSignal ?? undefined,
-      })
+        options.log,
+      )
       if (!response.ok || !response.body) {
         const detail = await response.text().catch(() => "")
         throw new Error(`ACP shim responded ${response.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`)
@@ -102,10 +106,66 @@ interface CallOptions {
   providerOptions?: Record<string, unknown>
   abortSignal?: AbortSignal
 }
-
 interface PromptMessage {
   role: string
   content: string | Array<{ type?: string; text?: string }>
+}
+
+/** Transport failures worth one more attempt before the model call fails. */
+const RETRYABLE_TRANSPORT = /ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|other side closed|fetch failed/i
+const RETRY_DELAYS_MS = [150, 600]
+
+function failureText(error: unknown, depth = 0): string {
+  if (!error || depth > 4) return ""
+  if (typeof error === "string") return error
+  if (error instanceof Error) {
+    return `${error.name}: ${error.message} ${failureText((error as { cause?: unknown }).cause, depth + 1)}`
+  }
+  return String(error)
+}
+
+function sleep(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup()
+      reject(signal?.reason ?? new Error("aborted"))
+    }
+    const cleanup = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener("abort", onAbort)
+    }
+    const done = () => {
+      cleanup()
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    timer.unref?.()
+    if (signal?.aborted) {
+      onAbort()
+      return
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
+/**
+ * POST to the shim, retrying a connection that died before the response
+ * started. A reset on a reused keep-alive socket is transient: the shim never
+ * saw the turn, so asking again cannot duplicate it. Once headers arrive the
+ * caller owns the stream, so a mid-stream reset is left to OpenCode's retry.
+ */
+async function post(url: string, init: RequestInit, log?: Log) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetch(url, init)
+    } catch (error) {
+      const detail = failureText(error)
+      const retryable = !init.signal?.aborted && RETRYABLE_TRANSPORT.test(detail) && attempt < RETRY_DELAYS_MS.length
+      if (!retryable) throw error
+      log?.("warn", `acp shim request failed (${detail.slice(0, 200)}); retrying`)
+      await sleep(RETRY_DELAYS_MS[attempt], init.signal ?? undefined)
+    }
+  }
 }
 
 function header(headers: Record<string, string> | undefined, name: string) {

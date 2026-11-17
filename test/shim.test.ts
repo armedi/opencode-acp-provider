@@ -19,6 +19,7 @@ function fakeManager(run: (input: RunInput) => Promise<{ stopReason: string; tex
 
 async function start(options: {
   run?: (input: RunInput) => Promise<{ stopReason: string; text: string }>
+  drainTimeoutMs?: number
 } = {}) {
   const calls: RunInput[] = []
   const shim = await createShim({
@@ -29,6 +30,7 @@ async function start(options: {
     resolveModel: (modelID) =>
       modelID === "fake::model-a" ? { server: "fake", model: "model-a" } : undefined,
     token: TOKEN,
+    drainTimeoutMs: options.drainTimeoutMs,
   })
   return { shim, calls }
 }
@@ -77,4 +79,44 @@ test("keys the session by x-opencode-session-id, not the affinity header", async
   } finally {
     await shim.close()
   }
+})
+
+test("close lets an in-flight turn finish instead of resetting it", async () => {
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => (release = resolve))
+  const { shim } = await start({
+    run: async (input) => {
+      await gate
+      input.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "done" } })
+      return { stopReason: "end_turn", text: "done" }
+    },
+  })
+  const response = await chat(shim.url, {
+    model: "fake::model-a",
+    stream: true,
+    messages: [{ role: "user", content: "hi" }],
+  })
+  expect(response.status).toBe(200)
+  // The turn is streaming now; disposing the plugin must not cut it off.
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  const closed = shim.close()
+  release()
+  const body = await response.text()
+  await closed
+  expect(body).toContain('"content":"done"')
+  expect(body).toContain("[DONE]")
+})
+
+test("close stops waiting after its drain timeout", async () => {
+  const { shim } = await start({ run: () => new Promise(() => {}), drainTimeoutMs: 50 })
+  const response = await chat(shim.url, {
+    model: "fake::model-a",
+    stream: true,
+    messages: [{ role: "user", content: "hi" }],
+  })
+  expect(response.status).toBe(200)
+  const reader = response.body!.getReader()
+  await reader.read()
+  await shim.close()
+  await reader.cancel().catch(() => {})
 })
