@@ -6,10 +6,10 @@ import type { AcpServerManager, LogFn } from "./server-manager.ts"
  * OpenCode parks it in the session inbox and delivers it at the next step
  * boundary. An ACP turn is a single step no matter how many tools the agent
  * runs, so without help the message waits for the whole turn. An agent that
- * advertises `_session/steering` takes it mid-turn instead; the queued copy is
- * then dropped so it is not delivered twice. Agents without the extension are
- * interrupted, and OpenCode's normal step boundary delivers the message as a
- * prompt that resumes the same ACP session.
+ * advertises `_session/steering` takes a plain message mid-turn instead; the
+ * queued copy is then dropped so it is not delivered twice. Every other case is
+ * interrupted: the turn ends and OpenCode's normal step boundary delivers the
+ * message, with any attachments or expanded skills, as its own prompt.
  */
 
 /** Local HTTP API of the OpenCode server hosting this plugin. */
@@ -39,10 +39,14 @@ export interface SteeringOptions {
   log: LogFn
   /** How long to wait for OpenCode to admit the message. Defaults to 5s. */
   admitTimeoutMs?: number
+  /** How long to wait for a starting ACP turn to register. Defaults to 1.5s. */
+  startTimeoutMs?: number
 }
 
 const DEFAULT_ADMIT_TIMEOUT_MS = 5_000
+const DEFAULT_START_TIMEOUT_MS = 1_500
 const INBOX_POLL_MS = 50
+const START_POLL_MS = 25
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => {
@@ -55,6 +59,45 @@ function basicAuth(password: string) {
   return `Basic ${Buffer.from(`opencode:${password}`, "utf8").toString("base64")}`
 }
 
+function serviceHeaders(service: LocalService, directory: string) {
+  return {
+    authorization: basicAuth(service.password),
+    "x-opencode-directory": encodeURIComponent(directory),
+  }
+}
+
+/**
+ * Whether OpenCode is already executing this session. A steer is admitted while
+ * a turn is running, so this stays true even before the next prompt reaches the
+ * ACP shim; the first prompt of a turn is admitted before its execution starts.
+ */
+async function sessionRunning(service: LocalService, directory: string, sessionID: string) {
+  const base = service.url.replace(/\/+$/, "")
+  try {
+    const response = await fetch(`${base}/api/session/active`, { headers: serviceHeaders(service, directory) })
+    if (!response.ok) return false
+    const body = (await response.json()) as { data?: unknown }
+    const active = body?.data
+    return Boolean(active && typeof active === "object" && sessionID in (active as Record<string, unknown>))
+  } catch {
+    return false
+  }
+}
+
+/** Wait for the ACP turn of an already-running session to become steerable. */
+async function waitForTurn(
+  manager: Pick<AcpServerManager, "running">,
+  sessionID: string,
+  timeoutMs: number,
+) {
+  const deadline = Date.now() + timeoutMs
+  while (!manager.running(sessionID)) {
+    if (Date.now() >= deadline) return false
+    await sleep(START_POLL_MS)
+  }
+  return true
+}
+
 /**
  * The inbox route for one session, or undefined when the local API is not
  * reachable. Steering in place without a way to drop the queued copy would
@@ -63,10 +106,7 @@ function basicAuth(password: string) {
 async function openInbox(service: LocalService, directory: string, sessionID: string) {
   const base = service.url.replace(/\/+$/, "")
   const endpoint = `${base}/api/session/${encodeURIComponent(sessionID)}/inbox`
-  const headers = {
-    authorization: basicAuth(service.password),
-    "x-opencode-directory": encodeURIComponent(directory),
-  }
+  const headers = serviceHeaders(service, directory)
 
   const list = async (): Promise<Set<string> | undefined> => {
     try {
@@ -130,18 +170,32 @@ export function createSteering(options: SteeringOptions) {
       if (event.delivery !== "steer") return
       const text = typeof event.prompt?.text === "string" ? event.prompt.text.trim() : ""
       // Attachments and skill expansions are materialized after this hook, so
-      // only a plain message can be handed to the agent in place. Anything else
-      // keeps OpenCode's normal delivery, which carries the full prompt.
-      if (!text || event.prompt.files?.length || event.prompt.skills?.length) return
-      // Ordinary prompts also arrive as "steer"; only a running ACP turn has
-      // anything to steer, and checking that first keeps this hook off the
-      // common path.
-      if (!options.manager.running(event.sessionID)) return
-
+      // they cannot be handed to the agent as text. They still interrupt the
+      // turn below; only an empty message with nothing attached is a no-op.
+      const plain = !event.prompt.files?.length && !event.prompt.skills?.length
+      if (!text && plain) return
       const service = await options.localService()
+      if (!options.manager.running(event.sessionID)) {
+        // Ordinary prompts also arrive as "steer". This hook runs while the
+        // message is admitted: if OpenCode is already executing the session,
+        // the message is a steer whose ACP prompt may not have reached the shim
+        // yet, so give that turn a moment to register.
+        if (!service || !(await sessionRunning(service, options.directory, event.sessionID))) return
+        const timeout = options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS
+        if (!(await waitForTurn(options.manager, event.sessionID, timeout))) {
+          log("debug", `session ${event.sessionID} is running but no ACP turn registered within ${timeout}ms`)
+          return
+        }
+      }
+
       const inbox = service ? await openInbox(service, options.directory, event.sessionID) : undefined
 
-      const result = await options.manager.steer({ key: event.sessionID, text, inPlace: inbox !== undefined })
+      const result = await options.manager.steer({
+        key: event.sessionID,
+        text,
+        inPlace: inbox !== undefined,
+        plain,
+      })
       if (result.status !== "steered" || !inbox) {
         if (result.status !== "unavailable") log("debug", `steering fell back to ${result.status} for ${event.sessionID}`)
         return

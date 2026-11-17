@@ -364,6 +364,34 @@ test("does not steer a session with no turn running", async () => {
   }
 })
 
+test("cancels a turn that is still starting when a message is steered", async () => {
+  const { instance } = manager({ agentArgs: ["--no-steering"] })
+  try {
+    await instance.initialize()
+    const turn = instance.run({ server: "fake", prompt: "steer-me", key: "ses_starting", sessionKey: "ses_starting" })
+    // No wait: the ACP session is still being negotiated, so no prompt exists yet.
+    expect(await instance.steer({ key: "ses_starting", text: "change of plan" })).toEqual({ status: "interrupted" })
+    expect(await turn).toEqual({ stopReason: "cancelled", text: "cancelled" })
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("interrupts instead of injecting a steer that carries attachments", async () => {
+  const { instance } = manager()
+  try {
+    await instance.initialize()
+    const turn = instance.run({ server: "fake", prompt: "steer-me", key: "ses_attached", sessionKey: "ses_attached" })
+    await running()
+    expect(await instance.steer({ key: "ses_attached", text: "change of plan", plain: false })).toEqual({
+      status: "interrupted",
+    })
+    expect(await turn).toEqual({ stopReason: "cancelled", text: "cancelled" })
+  } finally {
+    await instance.stop()
+  }
+})
+
 test("interrupts when the agent rejects the steer", async () => {
   const { instance } = manager()
   try {

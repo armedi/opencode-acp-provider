@@ -207,6 +207,10 @@ export class AcpServerManager {
   private pools = new Map<string, PooledSession>()
   private negotiating = new Map<string, Promise<{ pooled: PooledSession; reused: boolean }>>()
   private preparing = new Map<string, Promise<void>>()
+  /** Keys whose ACP turn is still being negotiated, before a prompt is in flight. */
+  private starting = new Map<string, number>()
+  /** Keys whose starting turn must be cancelled as soon as its prompt is sent. */
+  private startCancels = new Set<string>()
   private mcp?: McpProvider
   private sessions?: AcpSessionStore
   private sweeper?: ReturnType<typeof setInterval>
@@ -573,211 +577,244 @@ export class AcpServerManager {
     onUpdate?: (update: SessionUpdate) => void
   }): Promise<AcpRunResult> {
     if (input.signal?.aborted) return { stopReason: "cancelled", text: "" }
-    const state = this.get(input.server)
-    if (!state) throw new Error(`Unknown ACP server: ${input.server}`)
-    await this.prepare(state)
-    const client = state.client
-    if (!client) throw new Error(`ACP server "${input.server}" is not ready`)
-
-    const cwd = state.config.cwd ?? this.defaultCwd
-    const model = input.model ?? state.config.model ?? state.defaultModel
-    const mode = state.config.mode
-    const effort = this.resolveEffort(state, input.effort)
-    const onPermission = this.permissionHandler(input.server, input.sessionKey)
-
-    if (!input.key) {
-      const prompt = typeof input.prompt === "string" ? input.prompt : input.prompt.fresh
-      const session = await client.newSession(cwd, {
-        model,
-        meta: state.config.meta,
-        additionalDirectories: this.sessionDirectories(state.config),
-      })
-      try {
-        if (mode) await client.setMode(session.sessionId, mode).catch(() => {})
-        await this.applyEffort(state, client, session.sessionId, effort)
-        return await client.prompt(session.sessionId, prompt, {
-          onUpdate: input.onUpdate,
-          signal: input.signal,
-          requestPermission: onPermission,
-        })
-      } finally {
-        await client.closeSession(session.sessionId)
-      }
+    // Negotiating a cold or restored ACP session takes a moment. Mark the turn
+    // as starting before the first await so a steer that arrives in that window
+    // is not mistaken for an idle session.
+    const key = input.key
+    let starting = false
+    let started = false
+    if (key) {
+      starting = true
+      this.starting.set(key, (this.starting.get(key) ?? 0) + 1)
+    }
+    const finishStarting = () => {
+      if (!starting || !key) return
+      starting = false
+      const remaining = (this.starting.get(key) ?? 1) - 1
+      if (remaining > 0) this.starting.set(key, remaining)
+      else this.starting.delete(key)
     }
 
-    const poolKey = this.poolKey(input.server, input.key, model, effort, cwd)
-    let negotiating = this.negotiating.get(poolKey)
-    if (!negotiating) {
-      negotiating = (async () => {
-        const existing = this.pools.get(poolKey)
-        if (existing) {
-          this.log("debug", `reusing ACP session ${existing.sessionId} for key ${input.key!.slice(0, 24)}`)
-          return { pooled: existing, reused: true }
-        }
-        const sessionStartedAt = Date.now()
-        this.evictForCapacity()
-        const lease = this.mcp?.servers(input.key!, state.config)
-        let session: { sessionId: string } | undefined
-        let reused = false
+    try {
+      const state = this.get(input.server)
+      if (!state) throw new Error(`Unknown ACP server: ${input.server}`)
+      await this.prepare(state)
+      const client = state.client
+      if (!client) throw new Error(`ACP server "${input.server}" is not ready`)
+
+      const cwd = state.config.cwd ?? this.defaultCwd
+      const model = input.model ?? state.config.model ?? state.defaultModel
+      const mode = state.config.mode
+      const effort = this.resolveEffort(state, input.effort)
+      const onPermission = this.permissionHandler(input.server, input.sessionKey)
+
+      if (!input.key) {
+        const prompt = typeof input.prompt === "string" ? input.prompt : input.prompt.fresh
+        const session = await client.newSession(cwd, {
+          model,
+          meta: state.config.meta,
+          additionalDirectories: this.sessionDirectories(state.config),
+        })
         try {
-          // A plugin reload or an agent crash leaves a fresh process with no
-          // sessions. Reattach to the one this OpenCode session had instead of
-          // starting over and losing the conversation.
-          const stored = await this.storedSession(poolKey)
-          if (stored) {
-            const restored = await client
-              .restoreSession(stored, {
-                cwd,
+          if (mode) await client.setMode(session.sessionId, mode).catch(() => {})
+          await this.applyEffort(state, client, session.sessionId, effort)
+          return await client.prompt(session.sessionId, prompt, {
+            onUpdate: input.onUpdate,
+            signal: input.signal,
+            requestPermission: onPermission,
+          })
+        } finally {
+          await client.closeSession(session.sessionId)
+        }
+      }
+
+      const poolKey = this.poolKey(input.server, input.key, model, effort, cwd)
+      let negotiating = this.negotiating.get(poolKey)
+      if (!negotiating) {
+        negotiating = (async () => {
+          const existing = this.pools.get(poolKey)
+          if (existing) {
+            this.log("debug", `reusing ACP session ${existing.sessionId} for key ${input.key!.slice(0, 24)}`)
+            return { pooled: existing, reused: true }
+          }
+          const sessionStartedAt = Date.now()
+          this.evictForCapacity()
+          const lease = this.mcp?.servers(input.key!, state.config)
+          let session: { sessionId: string } | undefined
+          let reused = false
+          try {
+            // A plugin reload or an agent crash leaves a fresh process with no
+            // sessions. Reattach to the one this OpenCode session had instead of
+            // starting over and losing the conversation.
+            const stored = await this.storedSession(poolKey)
+            if (stored) {
+              const restored = await client
+                .restoreSession(stored, {
+                  cwd,
+                  mcpServers: lease?.servers,
+                  meta: state.config.meta,
+                  additionalDirectories: this.sessionDirectories(state.config),
+                })
+                .catch(async (error) => {
+                  this.log(
+                    "warn",
+                    `could not restore ACP session ${stored} for key ${input.key!.slice(0, 24)}: ${
+                      error instanceof Error ? error.message : String(error)
+                    }; starting a new one`,
+                  )
+                  await this.forgetSession(poolKey)
+                  return undefined
+                })
+              if (restored) {
+                session = { sessionId: stored }
+                reused = true
+                this.log(
+                  "debug",
+                  `restored ACP session ${stored} (${restored}) for key ${input.key!.slice(0, 24)}`,
+                )
+              }
+            }
+            if (!session) {
+              session = await client.newSession(cwd, {
+                model,
                 mcpServers: lease?.servers,
                 meta: state.config.meta,
                 additionalDirectories: this.sessionDirectories(state.config),
               })
-              .catch(async (error) => {
+              await this.rememberSession(poolKey, session.sessionId)
+            }
+            if (mode) await client.setMode(session.sessionId, mode).catch(() => {})
+            await this.applyEffort(state, client, session.sessionId, effort)
+            // A restored session keeps its old model, so put the requested one back.
+            if (reused && model) {
+              await client.setModel(session.sessionId, model).catch((error) => {
                 this.log(
                   "warn",
-                  `could not restore ACP session ${stored} for key ${input.key!.slice(0, 24)}: ${
+                  `could not set model "${model}" on restored ACP session: ${
                     error instanceof Error ? error.message : String(error)
-                  }; starting a new one`,
+                  }`,
                 )
-                await this.forgetSession(poolKey)
-                return undefined
               })
-            if (restored) {
-              session = { sessionId: stored }
-              reused = true
-              this.log(
-                "debug",
-                `restored ACP session ${stored} (${restored}) for key ${input.key!.slice(0, 24)}`,
-              )
             }
+          } catch (error) {
+            lease?.release()
+            if (session) await client.closeSession(session.sessionId).catch(() => {})
+            throw error
           }
-          if (!session) {
-            session = await client.newSession(cwd, {
-              model,
-              mcpServers: lease?.servers,
-              meta: state.config.meta,
-              additionalDirectories: this.sessionDirectories(state.config),
-            })
-            await this.rememberSession(poolKey, session.sessionId)
+          const created: PooledSession = {
+            server: input.server,
+            key: input.key!,
+            sessionId: session.sessionId,
+            client,
+            model,
+            effort,
+            cwd,
+            queue: Promise.resolve(),
+            lastUsed: Date.now(),
+            pending: 0,
+            active: 0,
+            failures: 0,
+            broken: false,
+            mcpRelease: lease?.release,
           }
-          if (mode) await client.setMode(session.sessionId, mode).catch(() => {})
-          await this.applyEffort(state, client, session.sessionId, effort)
-          // A restored session keeps its old model, so put the requested one back.
-          if (reused && model) {
-            await client.setModel(session.sessionId, model).catch((error) => {
-              this.log(
-                "warn",
-                `could not set model "${model}" on restored ACP session: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-              )
-            })
-          }
-        } catch (error) {
-          lease?.release()
-          if (session) await client.closeSession(session.sessionId).catch(() => {})
-          throw error
-        }
-        const created: PooledSession = {
-          server: input.server,
-          key: input.key!,
-          sessionId: session.sessionId,
-          client,
-          model,
-          effort,
-          cwd,
-          queue: Promise.resolve(),
-          lastUsed: Date.now(),
-          pending: 0,
-          active: 0,
-          failures: 0,
-          broken: false,
-          mcpRelease: lease?.release,
-        }
-        this.pools.set(poolKey, created)
-        this.log(
-          "debug",
-          `opened ACP session ${session.sessionId} for key ${input.key!.slice(0, 24)} in ${Date.now() - sessionStartedAt}ms`,
-        )
-        return { pooled: created, reused }
-      })()
-      this.negotiating.set(poolKey, negotiating)
-      negotiating.finally(() => this.negotiating.delete(poolKey)).catch(() => {})
-    }
-    const { pooled, reused } = await negotiating
-    if (pooled.broken || this.pools.get(poolKey) !== pooled) {
-      throw new Error(`ACP session for key ${input.key.slice(0, 24)} was closed after an earlier turn failed`)
-    }
+          this.pools.set(poolKey, created)
+          this.log(
+            "debug",
+            `opened ACP session ${session.sessionId} for key ${input.key!.slice(0, 24)} in ${Date.now() - sessionStartedAt}ms`,
+          )
+          return { pooled: created, reused }
+        })()
+        this.negotiating.set(poolKey, negotiating)
+        negotiating.finally(() => this.negotiating.delete(poolKey)).catch(() => {})
+      }
+      const { pooled, reused } = await negotiating
+      if (pooled.broken || this.pools.get(poolKey) !== pooled) {
+        throw new Error(`ACP session for key ${input.key.slice(0, 24)} was closed after an earlier turn failed`)
+      }
 
-    const prompt =
-      typeof input.prompt === "string" ? input.prompt : reused ? input.prompt.reused : input.prompt.fresh
-    pooled.lastUsed = Date.now()
-    pooled.pending += 1
-    const run = pooled.queue.then(() => {
-      if (pooled.broken) throw new Error(`ACP session ${pooled.sessionId} is no longer usable`)
-      pooled.active += 1
-      return pooled.client
-        .prompt(pooled.sessionId, prompt, {
-          onUpdate: input.onUpdate,
-          signal: input.signal,
-          requestPermission: onPermission,
-        })
-        .finally(() => {
-          pooled.active = Math.max(0, pooled.active - 1)
-        })
-    })
-    pooled.queue = run.catch(() => {})
-    const settled = run.then(
-      () => {},
-      () => {},
-    )
-    settled
-      .finally(() => {
-        pooled.pending = Math.max(0, pooled.pending - 1)
-        pooled.lastUsed = Date.now()
+      const prompt =
+        typeof input.prompt === "string" ? input.prompt : reused ? input.prompt.reused : input.prompt.fresh
+      pooled.lastUsed = Date.now()
+      pooled.pending += 1
+      const run = pooled.queue.then(() => {
+        if (pooled.broken) throw new Error(`ACP session ${pooled.sessionId} is no longer usable`)
+        pooled.active += 1
+        started = true
+        finishStarting()
+        const turn = pooled.client
+          .prompt(pooled.sessionId, prompt, {
+            onUpdate: input.onUpdate,
+            signal: input.signal,
+            requestPermission: onPermission,
+          })
+          .finally(() => {
+            pooled.active = Math.max(0, pooled.active - 1)
+          })
+        // `prompt` has already written the request, so the agent sees the cancel
+        // after the prompt it belongs to.
+        if (key && this.startCancels.delete(key)) {
+          pooled.client.cancelTurn(pooled.sessionId)
+          this.log("debug", `cancelled ACP session ${pooled.sessionId} for a steer that arrived while it was starting`)
+        }
+        return turn
       })
-      .catch(() => {})
-    run.then(
-      () => {
-        pooled.failures = 0
-      },
-      () => {},
-    ).catch(() => {})
-    run.catch((error: unknown) => {
-      // A failed turn does not necessarily invalidate the ACP session. The
-      // process dying or the agent forgetting the session does; everything else
-      // (cancel, timeout, reset) keeps the context, so a retry resumes the same
-      // conversation instead of starting a new one.
-      if (this.pools.get(poolKey) !== pooled) return
-      const message = error instanceof Error ? error.message : String(error)
-      const unknown = isUnknownSession(error)
-      if (unknown || !pooled.client.alive || !pooled.client.hasSession(pooled.sessionId)) {
-        this.dropPool(poolKey, pooled)
-        if (unknown) void this.forgetSession(poolKey)
-        return
-      }
-      pooled.failures += 1
-      if (error instanceof AcpError && error.code === ACP_REQUEST_CANCELLED) {
-        // A stopped turn is normal; the agent already ended it, so the session
-        // is intact and the next prompt picks up the same conversation.
-        pooled.failures = 0
-        this.log("debug", `kept ACP session ${pooled.sessionId} after a cancelled turn`)
-        return
-      }
-      if (pooled.failures >= MAX_TURN_FAILURES) {
-        this.log("warn", `dropping ACP session ${pooled.sessionId} after ${pooled.failures} failed turns: ${message}`)
-        this.dropPool(poolKey, pooled)
-        // A session that failed this many times in a row should not be restored
-        // into the same state on the next turn.
-        void this.forgetSession(poolKey)
-        return
-      }
-      // Ask the agent to end whatever it is still running so the queued or next
-      // prompt enters the same context at a clean boundary.
-      pooled.client.cancelTurn(pooled.sessionId)
-      this.log("debug", `keeping ACP session ${pooled.sessionId} after a failed turn: ${message}`)
-    })
-    return run
+      pooled.queue = run.catch(() => {})
+      const settled = run.then(
+        () => {},
+        () => {},
+      )
+      settled
+        .finally(() => {
+          pooled.pending = Math.max(0, pooled.pending - 1)
+          pooled.lastUsed = Date.now()
+        })
+        .catch(() => {})
+      run.then(
+        () => {
+          pooled.failures = 0
+        },
+        () => {},
+      ).catch(() => {})
+      run.catch((error: unknown) => {
+        // A failed turn does not necessarily invalidate the ACP session. The
+        // process dying or the agent forgetting the session does; everything else
+        // (cancel, timeout, reset) keeps the context, so a retry resumes the same
+        // conversation instead of starting a new one.
+        if (this.pools.get(poolKey) !== pooled) return
+        const message = error instanceof Error ? error.message : String(error)
+        const unknown = isUnknownSession(error)
+        if (unknown || !pooled.client.alive || !pooled.client.hasSession(pooled.sessionId)) {
+          this.dropPool(poolKey, pooled)
+          if (unknown) void this.forgetSession(poolKey)
+          return
+        }
+        pooled.failures += 1
+        if (error instanceof AcpError && error.code === ACP_REQUEST_CANCELLED) {
+          // A stopped turn is normal; the agent already ended it, so the session
+          // is intact and the next prompt picks up the same conversation.
+          pooled.failures = 0
+          this.log("debug", `kept ACP session ${pooled.sessionId} after a cancelled turn`)
+          return
+        }
+        if (pooled.failures >= MAX_TURN_FAILURES) {
+          this.log("warn", `dropping ACP session ${pooled.sessionId} after ${pooled.failures} failed turns: ${message}`)
+          this.dropPool(poolKey, pooled)
+          // A session that failed this many times in a row should not be restored
+          // into the same state on the next turn.
+          void this.forgetSession(poolKey)
+          return
+        }
+        // Ask the agent to end whatever it is still running so the queued or next
+        // prompt enters the same context at a clean boundary.
+        pooled.client.cancelTurn(pooled.sessionId)
+        this.log("debug", `keeping ACP session ${pooled.sessionId} after a failed turn: ${message}`)
+      })
+      return await run
+    } finally {
+      // A turn that never reached its prompt must not leave a cancel behind.
+      if (key && !started) this.startCancels.delete(key)
+      finishStarting()
+    }
   }
 
   /** Drop a pooled session on our side, leaving its stored id unless callers forget it. */
@@ -788,8 +825,13 @@ export class AcpServerManager {
     void pooled.client.closeSession(pooled.sessionId).catch(() => {})
   }
 
-  /** Whether an ACP turn is streaming for this OpenCode session right now. */
+  /**
+   * Whether an ACP turn is streaming for this OpenCode session right now.
+   * A turn still negotiating its ACP session counts too: a message sent in that
+   * window has to be steered even though no prompt is in flight yet.
+   */
   running(key: string) {
+    if (this.starting.has(key)) return true
     return [...this.pools.values()].some((entry) => entry.key === key && entry.active > 0 && !entry.broken)
   }
 
@@ -801,16 +843,35 @@ export class AcpServerManager {
    * twice. Every other agent is interrupted instead: the turn ends at its next
    * safe point and OpenCode delivers the queued message as its own prompt, which
    * resumes the same ACP session with its context intact.
+   *
+   * `plain` is false when the message carries files or expands skills. Those
+   * parts are not in `text`, so the turn is interrupted rather than injected:
+   * OpenCode then delivers the full message at the boundary.
    */
-  async steer(input: { key: string; text: string; inPlace?: boolean }): Promise<AcpSteerResult> {
+  async steer(input: {
+    key: string
+    text: string
+    inPlace?: boolean
+    plain?: boolean
+  }): Promise<AcpSteerResult> {
     const pooled = [...this.pools.values()]
       .filter((entry) => entry.key === input.key && entry.active > 0 && !entry.broken)
       .sort((left, right) => right.lastUsed - left.lastUsed)[0]
-    if (!pooled) return { status: "unavailable" }
+    if (!pooled) {
+      // The turn is still negotiating its ACP session. Cancel it as soon as the
+      // prompt starts so the message lands at the next boundary instead of
+      // waiting for the whole turn.
+      if (this.starting.has(input.key)) {
+        this.startCancels.add(input.key)
+        this.log("debug", `cancel requested for ACP turn ${input.key.slice(0, 24)} before its prompt started`)
+        return { status: "interrupted" }
+      }
+      return { status: "unavailable" }
+    }
 
     const client = pooled.client
     pooled.lastUsed = Date.now()
-    if (input.inPlace !== false && client.supportsSteering) {
+    if (input.inPlace !== false && input.plain !== false && client.supportsSteering) {
       try {
         const result = await client.steer(pooled.sessionId, input.text)
         if (result.outcome === "injected" || result.outcome === "startedNewTurn") {

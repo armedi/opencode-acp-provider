@@ -426,11 +426,15 @@ The plugin watches the prompt hook for those messages and asks the running ACP t
   as its own prompt at the step boundary, which resumes the same ACP session with the agent's
   context intact.
 
-A steer only applies to a plain text message: one that carries files, or that names skills whose
-content is expanded after the hook runs, keeps the normal delivery so the agent receives the full
-prompt. The in-place path needs the local server's HTTP API (`~/.local/state/opencode/service.json`,
-written by `serve --service`, which the CLI and desktop app use). If it is unavailable, the plugin
-falls back to the interrupt path rather than risk delivering the message twice.
+A steer that carries files, or names skills whose content is expanded after the hook runs, cannot be
+handed to the agent as text. It interrupts the turn instead, so OpenCode delivers the full message
+(attachments and expanded skills included) at the step boundary. The same applies to a steer that
+arrives while the ACP session is still being negotiated: the plugin marks the turn as starting and
+cancels it as soon as its prompt begins, rather than letting the message wait for the whole turn.
+
+The in-place path needs the local server's HTTP API (`~/.local/state/opencode/service.json`, written
+by `serve --service`, which the CLI and desktop app use). If it is unavailable, the plugin falls back
+to the interrupt path rather than risk delivering the message twice.
 
 ### Thinking blocks
 
