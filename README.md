@@ -39,6 +39,8 @@ For a server named `cmd`:
   questions (see [OpenCode tools inside ACP agents](#opencode-tools-inside-acp-agents)).
 - OpenCode's skills mirrored into each agent's own skill discovery, so agents load them with their
   native skill loader instead of a bridge tool (see [Skills](#skills)).
+- The agents' own slash commands in OpenCode's palette, namespaced by server (see
+  [Commands](#commands)).
 
 ## Install
 
@@ -287,6 +289,39 @@ OpenCode's per-agent `skill` permission checks: a skill that OpenCode would hide
 agent can still be visible to the ACP agent. Use `permissions` on the agent, `"skills": false`, or
 `autoinvoke: false` when that matters.
 
+## Commands
+
+Each ACP agent advertises its own slash commands through
+`session/update → available_commands_update`. The plugin registers them in OpenCode's command
+palette, namespaced by server id because commands belong to the agent rather than to one of its
+models:
+
+```text
+/claude:code-review   Review the current diff, or a PR number/branch/path target…
+/cmd:peek             Peek recap diagram: draw one for the last task now, or turn it on or off
+/codex:review         Review the current diff
+```
+
+Arguments are passed through verbatim: `/claude:code-review 123 --fix` sends `/code-review 123
+--fix` to the agent. ACP has no "run command" method — a slash command is prompt text the agent
+intercepts — so the plugin forwards the text as the turn's prompt.
+
+Commands are filtered and kept current:
+
+- **Skills are skipped.** Agents raise their own skills to slash commands, so forwarding them would
+  put a second copy of every OpenCode skill in the palette. A command is a skill when the agent marks
+  it (`cmd` uses a `skill:` prefix, codex a `$` sigil) or when its description matches a skill in
+  OpenCode's registry, ignoring the provenance suffix agents append (`(user)`, `(claude.ai sync)`).
+  The registry is read on every rebuild because OpenCode discovers skills in the background.
+- **The list is live.** The setup session supplies a first snapshot, and any later
+  `available_commands_update` from a pooled session replaces it. A `skill.updated` event rebuilds
+  the filter once skill discovery settles.
+- **A command only runs on its own agent.** Command lists are per location, not per model, so all
+  agents' commands are visible at once. Running one in a session that is on another provider fails
+  with a message naming the agent to switch to, rather than sending text an agent cannot handle.
+
+Set `"commands": false` in the plugin options to turn this off.
+
 ## Server options
 
 | Option | Type | Meaning |
@@ -326,6 +361,7 @@ Plugin options:
 | `promptTimeoutMs` | How long one ACP turn may run. Defaults to `1800000` (30 minutes); `0` disables the cap. |
 | `toolCallDisplay` | `inline` (default) shows finished ACP tool calls as transcript lines; `off` hides them. ACP agents run tools in their own harness, so these are not native OpenCode tool cards. |
 | `mcp` | Expose OpenCode tools to ACP agents through the MCP bridge. Defaults to `true`. |
+| `commands` | Register the agents' own slash commands as namespaced OpenCode commands. Defaults to `true`. See [Commands](#commands). |
 | `skills` | Mirror OpenCode's own skills into the agents' native skill discovery. Defaults to `true`; `false` disables it, and an array such as `["opencode"]` is an allowlist of skill IDs. |
 | `mcpTransport` | `stdio` (default) or `http`. Use `http` only for agents that accept injected HTTP MCP servers. |
 | `mcpRuntime` | Runtime that executes the stdio bridge, e.g. `bun`. Defaults to `node` resolved through `PATH`. |
@@ -443,6 +479,11 @@ those models reach an ACP agent through the builtin `subagent` tool (see
   claude-agent-acp do). Everything else is interrupted instead, so the message arrives at the next
   step boundary rather than mid-turn. In-place steering also needs the local server's HTTP API to
   drop the queued copy; without it the plugin interrupts instead of risking a duplicate.
+- A command list is per location, not per selected model, so every configured agent's commands are
+  visible at once. There is no hook to scope a command to a model; picking the wrong one fails the
+  run with a message naming the right agent. Filtering skills by description only removes commands
+  whose text matches a registered skill, so an agent's own bundled skill under a different
+  description survives unless the agent marks it (codex's `$`, cmd's `skill:`).
 - Plugin setup runs per OpenCode location, so each open location gets its own agent process and
   shim. Startup is bounded by `initTimeoutMs`, and a server that is not ready yet is retried in the
   background.
@@ -494,6 +535,7 @@ Files:
 - `src/agent-command.ts` — reads an agent launch command: which executable it runs.
 - `src/server-manager.ts` — agents, credentials, model discovery, session pooling.
 - `src/skills.ts` — mirrors OpenCode's skills into the agents' native skill trees.
+- `src/commands.ts` — exposes each agent's slash commands as namespaced OpenCode commands.
 - `src/shim.ts` — OpenAI-compatible HTTP shim.
 - `src/mcp-server.ts` — MCP endpoint, per-session tokens, tool wrappers.
 - `src/mcp-bridge.mjs` — stdio-to-HTTP bridge for ACP agents that need stdio MCP.

@@ -16,6 +16,7 @@ import { createMcpServer } from "./mcp-server.ts"
 import { createOpenCodeMcpSource } from "./mcp-config.ts"
 import { createSteering } from "./steering.ts"
 import { createSkillMirror } from "./skills.ts"
+import { createCommandBridge } from "./commands.ts"
 import { debugLog } from "./debug.ts"
 
 type LogLevel = "debug" | "info" | "warn" | "error"
@@ -62,6 +63,8 @@ interface AcpPluginOptions {
   toolCallDisplay?: "off" | "inline"
   /** Expose OpenCode tools to ACP agents through an MCP bridge. Defaults to true. */
   mcp?: boolean
+  /** Expose the agents' own slash commands as namespaced OpenCode commands. Defaults to true. */
+  commands?: boolean
   /** Make OpenCode's skills available to ACP agents through their own discovery. `false` disables it; an array is an allowlist of skill IDs. Defaults to true. */
   skills?: boolean | string[]
   /** MCP transport handed to ACP agents. Defaults to "stdio". */
@@ -199,11 +202,16 @@ export default Plugin.define({
         }
       : undefined
 
+    // Assigned once the agents are up and their skills are known, but the
+    // manager reports command updates from the first `session/new` onward.
+    let commandBridge: Awaited<ReturnType<typeof createCommandBridge>> | undefined
+
     const manager = new AcpServerManager({
       servers,
       defaultCwd: ctx.location.directory,
       log,
       sessions: sessionStore,
+      onCommands: (server) => void commandBridge?.sync(server),
       mcp:
         mcp || openCodeMcp
           ? {
@@ -403,6 +411,7 @@ export default Plugin.define({
       // await it: a reload must stay responsive, and a shutdown does not need
       // to wait for the old turn either.
       void (async () => {
+        await commandBridge?.close().catch(() => {})
         await shim.close().catch(() => {})
         await manager.stop().catch(() => {})
         await skills?.close().catch(() => {})
@@ -416,6 +425,25 @@ export default Plugin.define({
       // late cannot steal the id of one that already registered.
       for (const state of manager.list) providerIDForServer(state.config.id)
 
+      // Expose the agents' own slash commands. Created before the agents start
+      // so the first `available_commands_update` from each setup session is
+      // recorded instead of dropped, and so the `skill.updated` event that
+      // fires while they initialize is already being watched.
+      if (options.commands !== false) {
+        try {
+          const providerToServer = new Map([...providerIDs].map(([server, providerID]) => [providerID, server]))
+          commandBridge = await createCommandBridge({
+            ctx,
+            manager,
+            serverForProvider: (providerID) => providerToServer.get(providerID),
+            log,
+          })
+        } catch (error) {
+          commandBridge = undefined
+          log("warn", `ACP commands disabled: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+
       await manager.initialize()
 
       for (const state of manager.list) {
@@ -427,6 +455,10 @@ export default Plugin.define({
         log("warn", `deferring provider for ACP server "${state.config.id}": no models available yet`)
         scheduleRetry(state, 0)
       }
+
+      // Rebuild once the setup sessions have reported: the first build ran
+      // before them, and skill discovery may also have finished by now.
+      await commandBridge?.sync()
 
       // Supply the ACP language model to OpenCode's AI SDK layer. Tool calls the
       // agent runs itself come back as provider-executed parts, so the session

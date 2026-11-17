@@ -1,6 +1,13 @@
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
-import { AcpClient, AcpError, type AcpMcpServer, type SessionUpdate, type PermissionHandler } from "./acp-client.ts"
+import {
+  AcpClient,
+  AcpError,
+  type AcpCommand,
+  type AcpMcpServer,
+  type SessionUpdate,
+  type PermissionHandler,
+} from "./acp-client.ts"
 import { applyCmdSkillFlag } from "./skills.ts"
 import { isCmdCommand } from "./agent-command.ts"
 
@@ -58,6 +65,12 @@ export interface AcpServerState {
   /** False when retrying cannot help, e.g. a `models` allowlist that matches nothing. */
   retryable?: boolean
   initialized: boolean
+  /**
+   * Slash commands the agent has advertised. The setup session is closed after
+   * discovery, so this starts as a snapshot and is replaced whenever a live
+   * session advertises a newer list.
+   */
+  commands?: AcpCommand[]
 }
 
 export interface CredentialResolver {
@@ -178,6 +191,8 @@ const ACP_REQUEST_CANCELLED = -32800
 const ACP_UNKNOWN_SESSION = -32002
 /** Failed turns in a row before the pooled session is recycled. */
 const MAX_TURN_FAILURES = 3
+/** How long to wait for the command list an agent sends after `session/new`. */
+const COMMAND_SNAPSHOT_TIMEOUT_MS = 2_000
 const SWEEP_INTERVAL_MS = 60_000
 /** Do not evict a session that was created or used this recently, so a turn that is
  * between negotiation and its first `pending` increment cannot be closed under it. */
@@ -205,6 +220,7 @@ export class AcpServerManager {
   private additionalDirectories?: string[]
   private cmdSkillDir?: string
   private cmdSkillMod?: string
+  private onCommands?: (server: string) => void
   private disposed = false
 
   constructor(input: {
@@ -229,6 +245,8 @@ export class AcpServerManager {
     cmdSkillDir?: string
     /** Mod that registers the skills directory with `cmd acp`. */
     cmdSkillMod?: string
+    /** Called when a server's advertised command list changes. */
+    onCommands?: (server: string) => void
   }) {
     this.defaultCwd = input.defaultCwd
     this.resolver = input.resolveCredential ?? (async () => undefined)
@@ -246,6 +264,7 @@ export class AcpServerManager {
     this.additionalDirectories = input.additionalDirectories?.filter((directory) => directory.trim())
     this.cmdSkillDir = input.cmdSkillDir
     this.cmdSkillMod = input.cmdSkillMod
+    this.onCommands = input.onCommands
 
     for (const config of input.servers) {
       if (!config?.id || !config.command) continue
@@ -315,6 +334,19 @@ export class AcpServerManager {
     } catch {
       // a stale id only costs one failed resume
     }
+  }
+
+  /**
+   * Keep the newest command list the agent advertised. Agents send this during
+   * `session/new` and can replace it later in the life of a session, so the
+   * snapshot taken at setup goes stale; listeners are told so they can rebuild.
+   */
+  private recordCommands(state: AcpServerState, commands: AcpCommand[]) {
+    const previous = state.commands
+    if (previous && sameCommands(previous, commands)) return
+    state.commands = commands
+    this.log("debug", `ACP server "${state.config.id}" advertised ${commands.length} command(s)`)
+    this.onCommands?.(state.config.id)
   }
 
   /** Effort to apply for a run: explicit request, then server config, then agent default. */
@@ -442,6 +474,7 @@ export class AcpServerManager {
       allowPathsOutsideCwd: this.allowPathsOutsideCwd,
       maxFileBytes: this.maxFileBytes,
       onLog: (level, message) => this.log(level === "debug" ? "debug" : level, `[${config.id}] ${message}`),
+      onCommands: (_sessionId, commands) => this.recordCommands(state, commands),
       onExit: (error) => {
         this.log("warn", `ACP agent "${config.id}" exited; pooled sessions were dropped: ${error.message}`)
         void this.closePoolsFor(config.id)
@@ -482,6 +515,11 @@ export class AcpServerManager {
       state.defaultEffort = session.effort?.currentValue
       state.initialized = true
       state.error = undefined
+      // The command list arrives as a notification just after `session/new`, so
+      // wait for it before this discovery session is closed: once it is gone,
+      // the only way to learn the list is to open another session.
+      const commands = await client.waitForCommands(session.sessionId, COMMAND_SNAPSHOT_TIMEOUT_MS)
+      if (commands) this.recordCommands(state, commands)
       await client.closeSession(session.sessionId).catch(() => {})
       this.log(
         "info",
@@ -911,6 +949,15 @@ function isUnknownSession(error: unknown) {
   if (!(error instanceof AcpError)) return false
   if (error.code === ACP_UNKNOWN_SESSION) return true
   return /unknown (acp )?session|session .*not found|session .*does not exist/i.test(error.message)
+}
+
+/** Whether two advertised command lists are the same, so a rebuild can be skipped. */
+function sameCommands(left: AcpCommand[], right: AcpCommand[]) {
+  if (left.length !== right.length) return false
+  return left.every((command, index) => {
+    const other = right[index]
+    return command.name === other.name && command.description === other.description && command.hint === other.hint
+  })
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {

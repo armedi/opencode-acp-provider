@@ -78,6 +78,14 @@ export interface AcpEffortConfig {
   values: string[]
 }
 
+/** A slash command the agent advertised through `available_commands_update`. */
+export interface AcpCommand {
+  name: string
+  description?: string
+  /** Usage hint the agent shows for the command's arguments, e.g. "[interval] [prompt]". */
+  hint?: string
+}
+
 /** A permission request forwarded from the agent to the client. */
 export interface PermissionRequestInfo {
   title: string
@@ -152,6 +160,11 @@ export interface AcpClientOptions {
   /** Called when the agent process exits unexpectedly, so callers can drop stale sessions. */
   onExit?: (error: Error) => void
   /**
+   * Called with the full command list whenever the agent advertises one for a
+   * session. Agents send this during `session/new` and can replace it later.
+   */
+  onCommands?: (sessionId: string, commands: AcpCommand[]) => void
+  /**
    * Auto-approve real `session/request_permission` requests. Questions that an
    * agent encodes as permission requests are declined instead. Defaults to true.
    */
@@ -221,7 +234,9 @@ export class AcpClient {
   private pending = new Map<number | string, Pending>()
   private sessions = new Map<string, SessionState>()
   /** Slash commands each session advertised in `available_commands_update`. */
-  private commands = new Map<string, Set<string>>()
+  private commands = new Map<string, AcpCommand[]>()
+  /** Callers waiting for a session's first command list. */
+  private commandWaiters = new Map<string, (commands: AcpCommand[] | undefined) => void>()
   private started?: Promise<AgentHandshake>
   private handshake?: AgentHandshake
   private closed = false
@@ -407,10 +422,19 @@ export class AcpClient {
     if (!sessionId || !update) return
     // Kept outside `sessions`: the list can arrive before `session/new` resolves.
     if (update.sessionUpdate === "available_commands_update" && Array.isArray(update.availableCommands)) {
-      const names = update.availableCommands
-        .map((command: { name?: unknown }) => command?.name)
-        .filter((name): name is string => typeof name === "string")
-      this.commands.set(sessionId, new Set(names))
+      const commands: AcpCommand[] = []
+      for (const command of update.availableCommands as Array<{ name?: unknown; description?: unknown; input?: unknown }>) {
+        if (typeof command?.name !== "string" || !command.name) continue
+        const hint = (command.input as { hint?: unknown } | null | undefined)?.hint
+        commands.push({
+          name: command.name,
+          ...(typeof command.description === "string" && command.description ? { description: command.description } : {}),
+          ...(typeof hint === "string" && hint ? { hint } : {}),
+        })
+      }
+      this.commands.set(sessionId, commands)
+      this.commandWaiters.get(sessionId)?.(commands)
+      this.options.onCommands?.(sessionId, commands)
     } else if (update.sessionUpdate === "usage_update") {
       this.log(
         "debug",
@@ -811,12 +835,37 @@ export class AcpClient {
 
   /** Whether the agent advertised this slash command for the session. */
   hasCommand(sessionId: string, name: string) {
-    return this.commands.get(sessionId)?.has(name) === true
+    return this.commands.get(sessionId)?.some((command) => command.name === name) === true
+  }
+
+  /**
+   * Resolve once the agent advertised a command list for this session, so a
+   * caller that is about to close a discovery session does not race the
+   * notification, which arrives separately from the `session/new` result.
+   * Resolves `undefined` if nothing arrives in time.
+   */
+  waitForCommands(sessionId: string, timeoutMs: number): Promise<AcpCommand[] | undefined> {
+    const known = this.commands.get(sessionId)
+    if (known) return Promise.resolve(known)
+    return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const finish = (commands: AcpCommand[] | undefined) => {
+        if (timer) clearTimeout(timer)
+        this.commandWaiters.delete(sessionId)
+        resolve(commands)
+      }
+      this.commandWaiters.set(sessionId, finish)
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => finish(undefined), timeoutMs)
+        timer.unref?.()
+      }
+    })
   }
 
   async closeSession(sessionId: string) {
     this.sessions.delete(sessionId)
     this.commands.delete(sessionId)
+    this.commandWaiters.delete(sessionId)
     if (this.handshake?.agentCapabilities?.sessionCapabilities?.close === false) {
       // The agent has no close method; dropping our side is all we can do.
       this.log("debug", `dropping ACP session ${sessionId} (agent does not support session/close)`)
