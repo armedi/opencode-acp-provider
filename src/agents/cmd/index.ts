@@ -1,12 +1,12 @@
 import { fileURLToPath } from "node:url"
-import { isCmdCommand } from "./agent-command.ts"
+import { isCmdCommand } from "../../agent-command.ts"
 
-const companion = (name: string) => fileURLToPath(new URL(`../agents/cmd/${name}`, import.meta.url))
+const mod = (name: string) => fileURLToPath(new URL(`./mods/${name}`, import.meta.url))
 
 /** Hides cmd's native `agent`/`ask_user_question` tools so the MCP bridge's tools are used. */
-export const CMD_ORCHESTRATION_MOD = companion("no-native-orchestration.ts")
+export const CMD_ORCHESTRATION_MOD = mod("no-native-orchestration.ts")
 /** Registers OPENCODE_ACP_SKILL_DIR with cmd, because `cmd acp` ignores `--skill`. */
-export const CMD_SKILL_MOD = companion("opencode-skills.ts")
+export const CMD_SKILL_MOD = mod("opencode-skills.ts")
 
 export interface CmdLaunchOptions {
   /** Load the mod that hides cmd's native orchestration and question tools. */
@@ -18,7 +18,7 @@ export interface CmdLaunchOptions {
 /**
  * Add the plugin's companion mods to a `cmd ... acp` launch command.
  *
- * Every mod in `agents/cmd/` is loaded the same way: the plugin appends
+ * Every mod in `./mods/` is loaded the same way: the plugin appends
  * `--mod <path>` resolved from its own install location, so configs never hold
  * an absolute path into the package. A mod already listed with the same path is
  * not added twice, and `--safe-mode` (which disables all mods) is respected.

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { existsSync } from "node:fs"
-import { applyCmdMods, CMD_ORCHESTRATION_MOD, CMD_SKILL_MOD } from "../src/cmd-mods.ts"
+import { applyCmdMods, CMD_ORCHESTRATION_MOD, CMD_SKILL_MOD } from "../../src/agents/cmd/index.ts"
 
 const ORCH = CMD_ORCHESTRATION_MOD
 const SKILL = CMD_SKILL_MOD

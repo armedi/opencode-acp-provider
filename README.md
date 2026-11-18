@@ -218,7 +218,7 @@ Codex:
 Command Code has no equivalent setting key. Its docs mark the `agent` tool as always allowed, so a
 `permissions.deny` rule cannot block it. When the MCP bridge is enabled, the plugin appends
 `--mod <path>` for the companion mod
-[`agents/cmd/no-native-orchestration.ts`](agents/cmd/no-native-orchestration.ts) to any `cmd ... acp`
+[`src/agents/cmd/mods/no-native-orchestration.ts`](src/agents/cmd/mods/no-native-orchestration.ts) to any `cmd ... acp`
 command, resolving the path from its own install location. The mod removes the tools from the
 model's schema and refuses any call that still arrives. The server entry needs no `--mod`:
 
@@ -235,8 +235,8 @@ so other `cmd` mods keep their tools, commands, and hooks. Verify with a prompt 
 agent tool with subagent_type explore": the agent no
 longer sees that tool and should report it as unavailable rather than delegating.
 
-Companion files live under [`agents/`](agents/README.md), one directory per server id. Add a new
-directory there when another agent needs a file of its own.
+Agent-specific code and companion files live under [`src/agents/`](src/agents/README.md), one
+directory per agent. Add a new directory there when another agent needs customization.
 
 Transport defaults to stdio because ACP requires it and some adapters (notably `codex-acp`) drop
 injected HTTP servers. The stdio entry runs `mcp-bridge.mjs` with `node` from `PATH`; set
@@ -267,7 +267,7 @@ conventions.
 `cmd` ignores ACP `additionalDirectories`, and its `acp` subcommand accepts but does not apply the
 global `--skill` flag. The plugin therefore appends a companion mod, the same way it loads
 [`no-native-orchestration.ts`](#disabling-native-orchestration-tools)
-([`agents/cmd/opencode-skills.ts`](agents/cmd/opencode-skills.ts)), that registers the directory with
+([`src/agents/cmd/mods/opencode-skills.ts`](src/agents/cmd/mods/opencode-skills.ts)), that registers the directory with
 `cmd.addSkillsPath`, and also passes `--skill` for cmd builds that apply it. An explicit `--skill`,
 `--no-skills`, or `--safe-mode` in the server command wins. Set `"skills": false` on a server to opt
 out entirely.
@@ -542,7 +542,7 @@ Files:
 - `src/agent-command.ts` — reads an agent launch command: which executable it runs.
 - `src/server-manager.ts` — agents, credentials, model discovery, session pooling.
 - `src/skills.ts` — mirrors OpenCode's skills into the agents' native skill trees.
-- `src/cmd-mods.ts` — appends the `agents/cmd/` companion mods to `cmd acp` launch commands.
+- `src/agents/` — per-agent customization; `src/agents/cmd/` adds Command Code mods to `cmd acp`.
 - `src/commands.ts` — exposes each agent's slash commands as namespaced OpenCode commands.
 - `src/shim.ts` — OpenAI-compatible HTTP shim.
 - `src/prompt.ts` — bounds transcript replay before transport and builds the ACP prompt.

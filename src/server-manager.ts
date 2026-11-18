@@ -6,7 +6,7 @@ import {
   type SessionUpdate,
   type PermissionHandler,
 } from "./acp-client.ts"
-import { applyCmdMods } from "./cmd-mods.ts"
+import { applyCmdMods } from "./agents/cmd/index.ts"
 import { isCmdCommand } from "./agent-command.ts"
 
 export interface AcpServerConfig {
@@ -493,7 +493,7 @@ export class AcpServerManager {
     const { command, args } = normalizeCommand(this.commandFor(config))
     const env: Record<string, string> = { ...config.env }
     if (config.skills !== false && this.cmdSkillDir && isCmdCommand(config.command)) {
-      // Read by agents/cmd/opencode-skills.ts, which registers the directory
+      // Read by agents/cmd/mods/opencode-skills.ts, which registers the directory
       // because `cmd acp` does not apply the global `--skill` flag.
       env.OPENCODE_ACP_SKILL_DIR = this.cmdSkillDir
     }
