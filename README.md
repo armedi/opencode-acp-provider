@@ -380,8 +380,8 @@ error.
 
 ## How it works
 
-1. **Setup** spawns each agent, runs `initialize`, creates a throwaway session to read its model
-   inventory, then registers a provider and its models.
+1. **Setup** starts discovery in the background. For each agent, it runs `initialize`, creates a
+   throwaway session to read the model inventory, then registers that agent's provider and models.
 2. **Provider models** use `@opencode/ai/providers/openai-compatible` pointed at a loopback HTTP shim
    started by the plugin. Each model carries a `modelID` of `<server>::<acp-model>` so requests route
    to the right agent even when two agents expose the same model id. The agent's effort levels become
@@ -515,9 +515,9 @@ those models reach an ACP agent through the builtin `subagent` tool (see
   run with a message naming the right agent. Filtering skills by description only removes commands
   whose text matches a registered skill, so an agent's own bundled skill under a different
   description survives unless the agent marks it (codex's `$`, cmd's `skill:`).
-- Plugin setup runs per OpenCode location, so each open location gets its own agent process and
-  shim. Startup is bounded by `initTimeoutMs`, and a server that is not ready yet is retried in the
-  background.
+- Plugin setup runs per OpenCode location, so each open location gets its own agent processes and
+  shim. Agents start in parallel in the background. Each provider appears in the model picker
+  when its agent is ready. `initTimeoutMs` bounds each discovery attempt, not OpenCode startup.
 - The skills mirror is rebuilt when plugin setup runs. Skills installed or edited while OpenCode
   stays open reach the agent after a reload. Built-in skills with a virtual `skill://` path have no
   supporting files to copy; only their `SKILL.md` body is mirrored. Native discovery does not run

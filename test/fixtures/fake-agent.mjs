@@ -2,7 +2,7 @@
 // Scripted ACP agent used by the tests. Speaks newline-delimited JSON-RPC on
 // stdio and implements just enough of the protocol for the client.
 
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs"
 
 let nextSession = 1
 const sessionDirectories = new Map()
@@ -126,7 +126,12 @@ function handle(message) {
   if (message.id === undefined) return
 
   switch (message.method) {
-    case "initialize":
+    case "initialize": {
+      const gate = argument("--initialize-gate")
+      if (gate && !existsSync(gate)) {
+        setTimeout(() => handle(message), 10)
+        return
+      }
       return send({
         jsonrpc: "2.0",
         id: message.id,
@@ -141,6 +146,7 @@ function handle(message) {
           ...(steeringSupported ? { _meta: { steering: { supported: true } } } : {}),
         },
       })
+    }
     case "_session/steering": {
       const sessionId = message.params?.sessionId
       const text = (message.params?.prompt ?? [])

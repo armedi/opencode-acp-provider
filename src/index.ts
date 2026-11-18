@@ -285,7 +285,8 @@ export default Plugin.define({
       return id
     }
 
-    const registerProvider = async (state: AcpServerState, refresh = false) => {
+    const registerProvider = async (state: AcpServerState) => {
+      if (disposed) return false
       if (registered.has(state.config.id)) return true
       if (!state.models.length) return false
       const providerID = Provider.ID.make(providerIDForServer(state.config.id))
@@ -319,25 +320,28 @@ export default Plugin.define({
         cost: [],
       }))
 
-      registrations.push(
-        await ctx.provider.transform((editor) => {
-          editor.add({
-            info: {
-              ...Provider.Info.empty(providerID),
-              name: state.config.name ?? `${state.config.id} (ACP)`,
-              activation: "enabled",
-              // The AI SDK route lets the plugin supply the language model, so
-              // ACP tool calls can surface as native OpenCode tool parts.
-              package: nativeToolParts ? "aisdk:acp" : "@opencode/ai/providers/openai-compatible",
-              compatibility: { reasoningField: "reasoning_content" },
-              settings: { baseURL: shim.url, apiKey: shimToken },
-            },
-            models,
-          })
-        }),
-      )
+      const registration = await ctx.provider.transform((editor) => {
+        editor.add({
+          info: {
+            ...Provider.Info.empty(providerID),
+            name: state.config.name ?? `${state.config.id} (ACP)`,
+            activation: "enabled",
+            // The AI SDK route lets the plugin supply the language model, so
+            // ACP tool calls can surface as native OpenCode tool parts.
+            package: nativeToolParts ? "aisdk:acp" : "@opencode/ai/providers/openai-compatible",
+            compatibility: { reasoningField: "reasoning_content" },
+            settings: { baseURL: shim.url, apiKey: shimToken },
+          },
+          models,
+        })
+      })
+      // The plugin can unload while OpenCode is registering this provider.
+      if (disposed) {
+        await registration.dispose().catch(() => {})
+        return false
+      }
+      registrations.push(registration)
       registered.add(state.config.id)
-      if (refresh) await ctx.provider.reload().catch(() => {})
       return true
     }
 
@@ -350,12 +354,13 @@ export default Plugin.define({
           try {
             await manager.refresh(state)
             if (disposed) return
-            if (await registerProvider(state, true)) {
+            if (await registerProvider(state)) {
               log("info", `ACP server "${state.config.id}" registered after retry`)
               return
             }
             scheduleRetry(state, attempt + 1)
           } catch (error) {
+            if (disposed) return
             log(
               "warn",
               `ACP server "${state.config.id}" retry failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -444,22 +449,6 @@ export default Plugin.define({
         }
       }
 
-      await manager.initialize()
-
-      for (const state of manager.list) {
-        if (await registerProvider(state)) continue
-        if (state.retryable === false) {
-          log("error", `ACP server "${state.config.id}" cannot be registered: ${state.error ?? "no models available"}`)
-          continue
-        }
-        log("warn", `deferring provider for ACP server "${state.config.id}": no models available yet`)
-        scheduleRetry(state, 0)
-      }
-
-      // Rebuild once the setup sessions have reported: the first build ran
-      // before them, and skill discovery may also have finished by now.
-      await commandBridge?.sync()
-
       // Supply the ACP language model to OpenCode's AI SDK layer. Tool calls the
       // agent runs itself come back as provider-executed parts, so the session
       // shows the real shell/read/edit card without routing the tool.
@@ -534,7 +523,26 @@ export default Plugin.define({
         await ctx.session.hook("prompt", steer),
       )
 
-      log("info", `registered ${registered.size} ACP provider(s) in ${Date.now() - setupStartedAt}ms`)
+      // Hooks must be in place before models become selectable. Discovery then
+      // runs in parallel without holding up OpenCode or neighboring providers.
+      void manager.initialize(async (state) => {
+        try {
+          if (await registerProvider(state) || disposed) return
+          if (state.retryable === false) {
+            log("error", `ACP server "${state.config.id}" cannot be registered: ${state.error ?? "no models available"}`)
+            return
+          }
+          log("warn", `deferring provider for ACP server "${state.config.id}": no models available yet`)
+        } catch (error) {
+          if (disposed) return
+          log("warn", `could not register ACP server "${state.config.id}": ${error instanceof Error ? error.message : String(error)}`)
+        }
+        scheduleRetry(state, 0)
+      }).then(() => {
+        if (!disposed) log("info", `registered ${registered.size} ACP provider(s) in ${Date.now() - setupStartedAt}ms`)
+      }).catch((error) => {
+        if (!disposed) log("error", `ACP discovery failed: ${error instanceof Error ? error.message : String(error)}`)
+      })
       return cleanup
     } catch (error) {
       await cleanup()

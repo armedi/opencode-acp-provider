@@ -444,8 +444,8 @@ export class AcpServerManager {
     await pooled.client.closeSession(oldSession).catch(() => {})
   }
 
-  /** Start every enabled agent, read its model inventory, and keep it ready. */
-  async initialize() {
+  /** Discover enabled agents in parallel and report each result independently. */
+  async initialize(onSettled?: (state: AcpServerState) => Promise<void>) {
     if (this.disposed) return
     await Promise.all(
       this.list.map(async (state) => {
@@ -456,11 +456,13 @@ export class AcpServerManager {
             `ACP server "${state.config.id}" did not initialize within ${this.initTimeoutMs}ms`,
           )
         } catch (error) {
+          if (this.disposed) return
           state.error = error instanceof Error ? error.message : String(error)
           this.log("error", `ACP server "${state.config.id}" failed to initialize: ${state.error}`)
           // Do not stop the client here: a timed-out prepare may still finish.
           // It stops its own client on failure, and a success is still usable.
         }
+        if (!this.disposed) await onSettled?.(state)
       }),
     )
   }
