@@ -267,6 +267,7 @@ function handle(message) {
               kind: "execute",
               status: "pending",
               rawInput: { command: "ls" },
+              content: [{ type: "content", content: { type: "text", text: "ls -la" } }],
             },
             options: [
               { optionId: "allow_once", name: "Allow", kind: "allow_once" },
@@ -320,6 +321,23 @@ function handle(message) {
           content: { type: "text", text: `directories:${directories.join(",")}` },
         })
         return send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
+      }
+      if (text.startsWith("fs-probe ")) {
+        // fs-probe [["read"|"write", path], ...] -> "fs:ok,denied,..."
+        void (async () => {
+          const probes = JSON.parse(text.slice("fs-probe ".length))
+          const results = []
+          for (const [kind, path] of probes) {
+            const reply =
+              kind === "write"
+                ? await ask("fs/write_text_file", { sessionId, path, content: "probe" })
+                : await ask("fs/read_text_file", { sessionId, path })
+            results.push(reply.error ? "denied" : "ok")
+          }
+          update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `fs:${results.join(",")}` } })
+          send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
+        })()
+        return
       }
       if (/\bwrite files?\b/i.test(text)) {
         void (async () => {

@@ -4,6 +4,7 @@ import type { AcpServerManager } from "./server-manager.ts"
 import type { SessionUpdate } from "./acp-client.ts"
 import { applyToolUpdate, type AcpToolState } from "./acp-tools.ts"
 import { buildPrompts, historyLimits, isAuxiliaryRequest, type ChatMessage } from "./prompt.ts"
+import { BodyTooLargeError, readBody } from "./util.ts"
 
 export interface ShimOptions {
   manager: AcpServerManager
@@ -33,8 +34,6 @@ export interface ShimOptions {
 
 const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024
 const DEFAULT_DRAIN_TIMEOUT_MS = 30 * 60_000
-
-class BodyTooLargeError extends Error {}
 
 function sessionKey(req: IncomingMessage, body: any): string | undefined {
   // x-opencode-session-id is the session itself; x-opencode-session is the
@@ -464,30 +463,3 @@ export async function createShim(options: ShimOptions) {
   }
 }
 
-function readBody(req: IncomingMessage, maxBytes: number) {
-  return new Promise<string>((resolve, reject) => {
-    const chunks: Buffer[] = []
-    let size = 0
-    let finished = false
-    req.on("data", (chunk) => {
-      if (finished) return
-      size += chunk.length
-      if (size > maxBytes) {
-        finished = true
-        reject(new BodyTooLargeError(`Request body exceeds ${maxBytes} bytes`))
-        return
-      }
-      chunks.push(Buffer.from(chunk))
-    })
-    req.on("end", () => {
-      if (finished) return
-      finished = true
-      resolve(Buffer.concat(chunks).toString("utf8"))
-    })
-    req.on("error", (error) => {
-      if (finished) return
-      finished = true
-      reject(error)
-    })
-  })
-}

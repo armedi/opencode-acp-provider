@@ -1,18 +1,20 @@
 import { expect, test } from "bun:test"
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { AcpClient } from "../src/acp-client.ts"
 
 const agent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url))
 
-function client(options: { promptTimeoutMs?: number; requestTimeoutMs?: number; agentArgs?: string[] } = {}) {
+function client(
+  options: { promptTimeoutMs?: number; requestTimeoutMs?: number; agentArgs?: string[]; autoApprove?: boolean } = {},
+) {
   return new AcpClient({
     command: process.execPath,
     args: [agent, ...(options.agentArgs ?? [])],
     cwd: tmpdir(),
-    autoApprove: true,
+    autoApprove: options.autoApprove ?? true,
     promptTimeoutMs: options.promptTimeoutMs,
     requestTimeoutMs: options.requestTimeoutMs,
   })
@@ -60,6 +62,24 @@ test("still auto-approves ordinary permission requests", async () => {
     const session = await acp.newSession(tmpdir())
     const result = await acp.prompt(session.sessionId, "ask permission")
     expect(result.text).toBe("permission:allow_once")
+  } finally {
+    await acp.stop()
+  }
+})
+
+test("shows the tool call's text content in the permission prompt", async () => {
+  const acp = client({ autoApprove: false })
+  try {
+    const session = await acp.newSession(tmpdir())
+    const seen: Array<string | undefined> = []
+    const result = await acp.prompt(session.sessionId, "ask permission", {
+      requestPermission: async (info) => {
+        seen.push(info.detail)
+        return true
+      },
+    })
+    expect(result.text).toBe("permission:allow_once")
+    expect(seen).toEqual(["ls -la"])
   } finally {
     await acp.stop()
   }
@@ -113,5 +133,52 @@ test("keeps fs writes inside the session directory", async () => {
     await acp.stop()
     await rm(root, { recursive: true, force: true })
     await rm(outside, { recursive: true, force: true })
+  }
+})
+
+test("accepts absolute paths under a symlinked session directory", async () => {
+  const real = await realpath(await mkdtemp(join(tmpdir(), "acp-real-")))
+  const alias = join(await realpath(await mkdtemp(join(tmpdir(), "acp-alias-"))), "proj")
+  await symlink(real, alias)
+  await writeFile(join(real, "a.txt"), "a")
+  const acp = client()
+  try {
+    const session = await acp.newSession(alias)
+    const probes = [
+      ["read", join(alias, "a.txt")],
+      ["write", join(alias, "b.txt")],
+      ["read", join(real, "a.txt")],
+      ["read", "..env"],
+      ["read", "../escape.txt"],
+    ]
+    await writeFile(join(real, "..env"), "x")
+    const result = await acp.prompt(session.sessionId, `fs-probe ${JSON.stringify(probes)}`)
+    expect(result.text).toBe("fs:ok,ok,ok,ok,denied")
+    expect(await readFile(join(real, "b.txt"), "utf8")).toBe("probe")
+  } finally {
+    await acp.stop()
+    await rm(dirname(alias), { recursive: true, force: true })
+    await rm(real, { recursive: true, force: true })
+  }
+})
+
+test("lets reads, but not writes, reach the session's additional directories", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acp-root-"))
+  const extra = await mkdtemp(join(tmpdir(), "acp-extra-"))
+  await mkdir(join(extra, "skills"))
+  await writeFile(join(extra, "skills", "SKILL.md"), "skill")
+  const acp = client()
+  try {
+    const session = await acp.newSession(root, { additionalDirectories: [extra] })
+    const probes = [
+      ["read", join(extra, "skills", "SKILL.md")],
+      ["write", join(extra, "skills", "new.md")],
+    ]
+    const result = await acp.prompt(session.sessionId, `fs-probe ${JSON.stringify(probes)}`)
+    expect(result.text).toBe("fs:ok,denied")
+  } finally {
+    await acp.stop()
+    await rm(root, { recursive: true, force: true })
+    await rm(extra, { recursive: true, force: true })
   }
 })

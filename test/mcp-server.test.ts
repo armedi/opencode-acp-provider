@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { createMcpServer } from "../src/mcp-server.ts"
+import { createMcpServer, bridgeCommand } from "../src/mcp-server.ts"
 
 function context(overrides: Record<string, any> = {}) {
   return {
@@ -316,4 +316,14 @@ test("falls back to the builtin question tool when the form API is unavailable",
     await server.close()
     forms.stop(true)
   }
+})
+
+test("launches the stdio bridge without /usr/bin/env on Windows", () => {
+  expect(bridgeCommand(undefined, "/b.mjs", "linux")).toEqual({ command: "/usr/bin/env", args: ["node", "/b.mjs"] })
+  expect(bridgeCommand("/opt/node", "/b.mjs", "darwin")).toEqual({ command: "/opt/node", args: ["/b.mjs"] })
+  expect(bridgeCommand(undefined, "C:\\b.mjs", "win32")).toEqual({ command: "node", args: ["C:\\b.mjs"] })
+  expect(bridgeCommand("C:\\node\\node.exe", "C:\\b.mjs", "win32")).toEqual({
+    command: "C:\\node\\node.exe",
+    args: ["C:\\b.mjs"],
+  })
 })

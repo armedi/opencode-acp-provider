@@ -386,7 +386,7 @@ Plugin options:
 
 | Option | Meaning |
 | --- | --- |
-| `logLevel` | `debug`, `info` (default), `warn`, or `error`. Debug logs also go to `$ACP_PLUGIN_LOG` (default `/tmp/opencode-acp.log`), which is truncated at 10 MB. |
+| `logLevel` | `debug`, `info` (default), `warn`, or `error`. Debug logs also go to `$ACP_PLUGIN_LOG` (default `opencode-acp-<uid>.log` in the OS temp directory; an existing file that is a symlink or belongs to another user is refused), which is truncated at 10 MB. |
 | `includeSystem` | Include OpenCode's system message in the ACP prompt. Defaults to `false`; the ACP agent uses its own instructions. |
 | `historyTurns` | Turns of history replayed into a brand new ACP session. Defaults to `16`. |
 | `historyChars` | Characters of history replayed into a brand new ACP session. Defaults to `8192`. The same cap applies to the recent conversation a `/compact` summary keeps. |

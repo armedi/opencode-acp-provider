@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto"
 import { statSync } from "node:fs"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
+import { posix, win32 } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { Plugin } from "@opencode/plugin"
+import packageJson from "../package.json" with { type: "json" }
 import type { AcpMcpServer } from "./acp-client.ts"
 import type { LogFn, McpLease } from "./server-manager.ts"
+import { basicAuth, BodyTooLargeError, readBody, sleep } from "./util.ts"
 
 type Ctx = Plugin.Context
 
@@ -13,9 +16,8 @@ const MCP_PROTOCOL_VERSION = "2025-06-18"
 const MCP_SERVER_NAME = "opencode"
 const MAX_BODY_BYTES = 4 * 1024 * 1024
 const MAX_CONTEXT_CHARS = 60_000
-const TOKEN_IDLE_MS = 2 * 60 * 60_000
-const TOKEN_EVICT_MIN_IDLE_MS = 60_000
-const MAX_TOKENS = 256
+/** Live tokens above this suggest leases are not being released. */
+const TOKEN_WARN_THRESHOLD = 256
 
 const SUBAGENT_DESCRIPTION = [
   "Spawns an agent in a child session to work on the specified task.",
@@ -103,7 +105,6 @@ interface JsonRpcRequest {
 
 interface TokenEntry {
   sessionKey: string
-  lastUsed: number
 }
 
 const objectSchema = (properties: Record<string, unknown>, required: string[] = []) => ({
@@ -115,10 +116,26 @@ const objectSchema = (properties: Record<string, unknown>, required: string[] = 
 
 const stringSchema = (description?: string) => ({ type: "string", ...(description ? { description } : {}) })
 
+/**
+ * How to launch the stdio bridge. An absolute runtime runs directly; a bare
+ * name (default `node`) is looked up on PATH, through `/usr/bin/env` on POSIX
+ * and by the spawner itself on Windows, which has no `/usr/bin/env`.
+ */
+export function bridgeCommand(
+  runtime: string | undefined,
+  bridgePath: string,
+  platform: NodeJS.Platform = process.platform,
+): { command: string; args: string[] } {
+  const name = runtime?.trim() || "node"
+  const absolute = platform === "win32" ? win32.isAbsolute(name) : posix.isAbsolute(name)
+  if (absolute || platform === "win32") return { command: name, args: [bridgePath] }
+  return { command: "/usr/bin/env", args: [name, bridgePath] }
+}
+
 export async function createMcpServer(options: McpServerOptions): Promise<McpServerHandle> {
   const { ctx, log = () => {} } = options
   const transport = options.transport ?? "stdio"
-  const version = options.version ?? "0.5.0"
+  const version = options.version ?? packageJson.version
   const tokens = new Map<string, TokenEntry>()
   /** In-flight tool calls, so `notifications/cancelled` can abort them. */
   const inFlight = new Map<number | string, AbortController>()
@@ -164,13 +181,6 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
   const url = `http://127.0.0.1:${port}/mcp`
   log("info", `OpenCode MCP bridge listening on ${url} (${transport})`)
 
-  const sweeper = setInterval(() => {
-    const cutoff = Date.now() - TOKEN_IDLE_MS
-    for (const [token, entry] of tokens) {
-      if (entry.lastUsed < cutoff) tokens.delete(token)
-    }
-  }, 10 * 60_000)
-  sweeper.unref?.()
 
   function buildServers(token: string): AcpMcpServer[] {
     if (transport === "http") {
@@ -183,14 +193,13 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
         },
       ]
     }
-    const runtime = options.runtime ?? process.env.OPENCODE_MCP_NODE
-    const absolute = runtime?.startsWith("/")
+    const { command, args } = bridgeCommand(options.runtime ?? process.env.OPENCODE_MCP_NODE, bridgePath)
     return [
       {
         type: "stdio",
         name: MCP_SERVER_NAME,
-        command: absolute ? runtime! : "/usr/bin/env",
-        args: absolute ? [bridgePath] : [runtime ?? "node", bridgePath],
+        command,
+        args,
         env: [
           { name: "OPENCODE_MCP_URL", value: url },
           { name: "OPENCODE_MCP_TOKEN", value: token },
@@ -200,18 +209,15 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
   }
 
   function issue(sessionKey: string): McpLease {
-    if (tokens.size >= MAX_TOKENS) {
-      // Only drop a token that has not been used recently; evicting a live one
-      // would break the agent's MCP connection mid-session.
-      const cutoff = Date.now() - TOKEN_EVICT_MIN_IDLE_MS
-      const oldest = [...tokens.entries()]
-        .filter(([, entry]) => entry.lastUsed <= cutoff)
-        .sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0]
-      if (oldest) tokens.delete(oldest[0])
-      else log("warn", `MCP token cap reached (${MAX_TOKENS}); issuing an extra token`)
+    // A token lives exactly as long as its lease: the pooled ACP session keeps
+    // sending it until the session closes and releases it. Expiring it on idle
+    // time or a size cap would turn a quiet but live session's MCP calls into
+    // 401s, since the session never gets a new token.
+    if (tokens.size === TOKEN_WARN_THRESHOLD) {
+      log("warn", `${TOKEN_WARN_THRESHOLD} MCP tokens are live; ACP sessions may not be releasing them`)
     }
     const token = randomUUID()
-    tokens.set(token, { sessionKey, lastUsed: Date.now() })
+    tokens.set(token, { sessionKey })
     return {
       servers: buildServers(token),
       release: () => {
@@ -226,7 +232,6 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
     const token = header.slice(7).trim()
     const entry = tokens.get(token)
     if (!entry) return undefined
-    entry.lastUsed = Date.now()
     return { token, sessionKey: entry.sessionKey }
   }
 
@@ -251,7 +256,8 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
 
     const auth = resolveToken(req)
     if (req.method === "DELETE") {
-      if (auth) tokens.delete(auth.token)
+      // Ending an MCP session does not revoke the token: it belongs to the ACP
+      // session's lease, and the agent may reconnect with it.
       res.writeHead(204)
       res.end()
       return
@@ -276,9 +282,11 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
     let raw: string
     try {
       raw = await readBody(req, MAX_BODY_BYTES)
-    } catch {
-      res.writeHead(413, { "content-type": "application/json" })
-      res.end(JSON.stringify({ error: "Request body too large" }))
+    } catch (error) {
+      const tooLarge = error instanceof BodyTooLargeError
+      res.writeHead(tooLarge ? 413 : 400, { "content-type": "application/json" })
+      res.end(JSON.stringify({ error: tooLarge ? "Request body too large" : "Could not read request body" }))
+      if (tooLarge) req.destroy()
       return
     }
 
@@ -367,7 +375,9 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
         case "tools/call": {
           const name = String(message.params?.name ?? "")
           const args = message.params?.arguments ?? {}
-          const tools = await buildTools(ctx, sessionKey, options.localService, log)
+          // A call needs the handler, not the descriptions, so skip the agent
+          // lookup that only feeds the subagent description.
+          const tools = await buildTools(ctx, sessionKey, options.localService, log, { describe: false })
           const tool = tools.find((candidate) => candidate.name === name)
           if (!tool) return fail(-32602, `Unknown tool: ${name}`)
           const startedAt = Date.now()
@@ -400,7 +410,6 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
     url,
     issue,
     async close() {
-      clearInterval(sweeper)
       tokens.clear()
       for (const controller of inFlight.values()) controller.abort()
       inFlight.clear()
@@ -413,10 +422,6 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
 }
 
 class QuestionFormError extends Error {}
-
-function basicAuth(password: string) {
-  return `Basic ${Buffer.from(`opencode:${password}`, "utf8").toString("base64")}`
-}
 
 function questionFields(questions: any[]) {
   return questions.map((question, index) => ({
@@ -444,21 +449,6 @@ function answeredQuestions(questions: any[], answer: Record<string, unknown>) {
     .map((question, index) => `"${question?.question ?? ""}"="${answers[index].length ? answers[index].join(", ") : "Unanswered"}"`)
     .join(", ")}. You can now continue with the user's answers in mind.`
   return { output: { answers }, content: [{ type: "text" as const, text }], metadata: { answers } }
-}
-
-function delay(ms: number, signal: AbortSignal) {
-  return new Promise<void>((resolve, reject) => {
-    if (signal.aborted) return reject(signal.reason ?? new Error("aborted"))
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort)
-      resolve()
-    }, ms)
-    const onAbort = () => {
-      clearTimeout(timer)
-      reject(signal.reason ?? new Error("aborted"))
-    }
-    signal.addEventListener("abort", onAbort, { once: true })
-  })
 }
 
 /**
@@ -518,7 +508,7 @@ async function askViaForm(
       } else {
         log?.("warn", `question form poll returned ${response.status}`)
       }
-      await delay(300, signal)
+      await sleep(300, signal)
     }
   } catch (error) {
     await fetch(formEndpoint, {
@@ -537,7 +527,8 @@ async function buildInstructions(
   service?: { url: string; password: string } | (() => Promise<{ url: string; password: string } | undefined>),
   log?: LogFn,
 ) {
-  const tools = await buildTools(ctx, sessionKey, service, log)
+  // Only the names are used here.
+  const tools = await buildTools(ctx, sessionKey, service, log, { describe: false })
   if (!tools.length) return undefined
   const names = new Set(tools.map((tool) => tool.name))
   // Tools the model is most likely to need come first; some clients append this
@@ -575,6 +566,7 @@ async function buildTools(
   sessionKey: string,
   localService?: { url: string; password: string } | (() => Promise<{ url: string; password: string } | undefined>),
   log?: LogFn,
+  { describe = true }: { describe?: boolean } = {},
 ): Promise<McpTool[]> {
   const tools: McpTool[] = []
   const available = await ctx.tool.list().catch(() => [])
@@ -645,7 +637,7 @@ async function buildTools(
   if (subagent) {
     tools.push({
       name: "subagent",
-      description: await subagentDescription(ctx),
+      description: describe ? await subagentDescription(ctx) : SUBAGENT_DESCRIPTION,
       inputSchema: objectSchema(
         {
           agent: stringSchema(
@@ -954,31 +946,3 @@ function boundContext(messages: any[]) {
   return { messages: messages.slice(start), truncated: true, omittedMessages: start }
 }
 
-function readBody(req: IncomingMessage, maxBytes: number) {
-  return new Promise<string>((resolve, reject) => {
-    const chunks: Buffer[] = []
-    let size = 0
-    let settled = false
-    req.on("data", (chunk) => {
-      if (settled) return
-      size += chunk.length
-      if (size > maxBytes) {
-        settled = true
-        reject(new Error("Request body too large"))
-        req.destroy()
-        return
-      }
-      chunks.push(Buffer.from(chunk))
-    })
-    req.on("end", () => {
-      if (settled) return
-      settled = true
-      resolve(Buffer.concat(chunks).toString("utf8"))
-    })
-    req.on("error", (error) => {
-      if (settled) return
-      settled = true
-      reject(error)
-    })
-  })
-}

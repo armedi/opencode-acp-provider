@@ -1,6 +1,7 @@
 import type { Plugin } from "@opencode/plugin"
 import type { AcpCommand } from "./acp-client.ts"
 import type { AcpServerManager, LogFn } from "./server-manager.ts"
+import { agentName } from "./util.ts"
 
 /**
  * Exposes the slash commands an ACP agent advertises as OpenCode commands.
@@ -94,7 +95,7 @@ export async function createCommandBridge(options: CommandBridgeOptions): Promis
   }) => {
     const state = manager.get(input.server)
     if (!state) throw new Error(`ACP server "${input.server}" is no longer configured.`)
-    const agent = (state.config.name ?? state.config.id).replace(/\s*\(ACP\)$/, "")
+    const agent = agentName(state.config)
 
     const session = await ctx.session.get({ sessionID: input.sessionID })
     const providerID = session.model?.providerID

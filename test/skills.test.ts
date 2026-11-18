@@ -104,3 +104,45 @@ test("leaves shared agent skills where the agents already load them", async () =
     await mirror.close()
   }
 })
+
+test("picks up skills OpenCode discovers after the mirror is created", async () => {
+  let skills: unknown[] = []
+  let notify: (() => void) | undefined
+  const ctx = {
+    skill: { list: async () => ({ location: {}, data: skills }) },
+    event: {
+      async *subscribe({ signal }: { signal: AbortSignal }) {
+        while (!signal.aborted) {
+          await new Promise<void>((resolve) => {
+            notify = resolve
+            signal.addEventListener("abort", () => resolve(), { once: true })
+          })
+          if (!signal.aborted) yield { type: "skill.updated" }
+        }
+      },
+    },
+  } as any
+  const skill = (id: string) => ({ id, description: id, path: `skill://${id}/SKILL.md`, content: `# ${id}\n` })
+
+  const mirror = await createSkillMirror(ctx)
+  try {
+    expect(mirror.count).toBe(0)
+    expect(await exists(mirror.root)).toBe(true)
+
+    skills = [skill("late"), skill("gone")]
+    // Before the first settle re-check (250ms), so only the event can do it.
+    notify?.()
+    const deadline = Date.now() + 150
+    while (mirror.count < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5))
+    expect(mirror.count).toBe(2)
+    expect(await readFile(join(mirror.claudeDir, "late", "SKILL.md"), "utf8")).toContain("# late")
+
+    skills = [skill("late")]
+    await mirror.sync()
+    expect(mirror.count).toBe(1)
+    expect(await exists(join(mirror.agentsDir, "gone"))).toBe(false)
+  } finally {
+    await mirror.close()
+  }
+  expect(await exists(mirror.root)).toBe(false)
+})

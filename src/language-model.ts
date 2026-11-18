@@ -1,4 +1,5 @@
 import { boundedMessages, historyLimits, isAuxiliaryRequest, type ChatMessage } from "./prompt.ts"
+import { sleep } from "./util.ts"
 
 type Log = (level: "debug" | "info" | "warn" | "error", message: string) => void
 
@@ -127,30 +128,6 @@ function failureText(error: unknown, depth = 0): string {
     return `${error.name}: ${error.message} ${failureText((error as { cause?: unknown }).cause, depth + 1)}`
   }
   return String(error)
-}
-
-function sleep(ms: number, signal?: AbortSignal) {
-  return new Promise<void>((resolve, reject) => {
-    const onAbort = () => {
-      cleanup()
-      reject(signal?.reason ?? new Error("aborted"))
-    }
-    const cleanup = () => {
-      clearTimeout(timer)
-      signal?.removeEventListener("abort", onAbort)
-    }
-    const done = () => {
-      cleanup()
-      resolve()
-    }
-    const timer = setTimeout(done, ms)
-    timer.unref?.()
-    if (signal?.aborted) {
-      onAbort()
-      return
-    }
-    signal?.addEventListener("abort", onAbort, { once: true })
-  })
 }
 
 /**

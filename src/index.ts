@@ -20,6 +20,7 @@ import { createSkillMirror } from "./skills.ts"
 import { createCommandBridge } from "./commands.ts"
 import { effortLevels, readInventory, writeInventory, type AcpInventory } from "./inventory.ts"
 import { debugLog } from "./debug.ts"
+import { agentName } from "./util.ts"
 
 type LogLevel = "debug" | "info" | "warn" | "error"
 
@@ -151,11 +152,9 @@ export default Plugin.define({
     const skillsEnabled = options.skills !== false && skillFilter?.length !== 0
     if (skillsEnabled && servers.some((server) => server.skills !== false)) {
       try {
+        // Kept even when empty: OpenCode discovers skills in the background,
+        // and the mirror picks them up on `skill.updated`.
         skills = await createSkillMirror(ctx, { include: skillFilter, log })
-        if (!skills.count) {
-          await skills.close()
-          skills = undefined
-        }
       } catch (error) {
         log("warn", `OpenCode skills mirror disabled: ${error instanceof Error ? error.message : String(error)}`)
       }
@@ -170,7 +169,6 @@ export default Plugin.define({
           localService: () => readLocalService(),
           transport: options.mcpTransport === "http" ? "http" : "stdio",
           runtime: options.mcpRuntime,
-          version: "0.5.0",
         })
       } catch (error) {
         log("warn", `OpenCode MCP bridge disabled: ${error instanceof Error ? error.message : String(error)}`)
@@ -581,7 +579,7 @@ export default Plugin.define({
           const server = [...providerIDs].find(([, providerID]) => providerID === evt.model.providerID)?.[0]
           const state = server ? manager.get(server) : undefined
           if (!server || !state) return
-          const agent = (state.config.name ?? state.config.id).replace(/\s*\(ACP\)$/, "")
+          const agent = agentName(state.config)
           let outcome: string
           try {
             const result = await manager.compact({ server, key: evt.sessionID })

@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { createReadStream } from "node:fs"
 import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises"
-import { dirname, isAbsolute, relative, resolve } from "node:path"
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path"
 import { createInterface } from "node:readline"
 
 /**
@@ -177,6 +177,8 @@ type Pending = { resolve: (value: any) => void; reject: (reason: Error) => void;
 
 interface SessionState {
   cwd: string
+  /** Extra directories granted at session/new; readable through client fs. */
+  additionalDirectories?: string[]
   configOptions: AcpConfigOption[]
   onUpdate?: (update: SessionUpdate) => void
   requestPermission?: PermissionHandler
@@ -463,7 +465,7 @@ export class AcpClient {
         const info: PermissionRequestInfo = {
           title: params.toolCall?.title ?? allow?.optionId ?? "ACP tool",
           kind: params.toolCall?.kind,
-          detail: params.toolCall?.content?.[0]?.text,
+          detail: readToolCallText(params.toolCall?.content),
         }
         const handler = this.sessions.get(params.sessionId)?.requestPermission
         const approved =
@@ -632,7 +634,7 @@ export class AcpClient {
       }))
     const effort = readEffortConfig(configOptions)
 
-    this.sessions.set(sessionId, { cwd, configOptions })
+    this.sessions.set(sessionId, { cwd, additionalDirectories: options.additionalDirectories, configOptions })
 
     try {
       if (options.model && !modelOption) throw new AcpError("Agent does not expose an ACP model selector", -32602)
@@ -694,7 +696,11 @@ export class AcpClient {
       // Replaying a long conversation through session/load is not a control call.
       { timeout: resume ? timeout : Math.max(60_000, timeout) },
     )
-    this.sessions.set(sessionId, { cwd: options.cwd, configOptions: result.configOptions ?? [] })
+    this.sessions.set(sessionId, {
+      cwd: options.cwd,
+      additionalDirectories: options.additionalDirectories,
+      configOptions: result.configOptions ?? [],
+    })
     return resume ? "resumed" : "loaded"
   }
 
@@ -910,7 +916,7 @@ export class AcpClient {
   // ---- filesystem methods -------------------------------------------------
 
   private async readTextFile(params: { sessionId?: string; path?: string; line?: number; limit?: number }) {
-    const target = await this.resolveTarget(params.sessionId, String(params.path ?? ""))
+    const target = await this.resolveTarget(params.sessionId, String(params.path ?? ""), "read")
     if (!target) throw new AcpError("fs/read_text_file requires a path", -32602)
     const line = typeof params.line === "number" && params.line > 0 ? Math.floor(params.line) : undefined
     const limit = typeof params.limit === "number" && params.limit > 0 ? Math.floor(params.limit) : undefined
@@ -926,7 +932,7 @@ export class AcpClient {
   }
 
   private async writeTextFile(params: { sessionId?: string; path?: string; content?: string }) {
-    const target = await this.resolveTarget(params.sessionId, String(params.path ?? ""))
+    const target = await this.resolveTarget(params.sessionId, String(params.path ?? ""), "write")
     if (!target) throw new AcpError("fs/write_text_file requires a path", -32602)
     await mkdir(dirname(target), { recursive: true })
     await writeFile(target, params.content ?? "", "utf8")
@@ -936,27 +942,41 @@ export class AcpClient {
    * Resolve a path from the agent against the session directory and enforce the
    * sandbox. Returning the resolved path matters: checking one path and then
    * reading a relative one would touch the process cwd instead.
+   *
+   * Reads may also reach the session's additional directories (the skills
+   * mirror); writes stay inside the session cwd. A root is matched both as
+   * given and through its real path, because agents send absolute paths built
+   * from the cwd they were given, which may run through a symlink such as
+   * macOS `/var` -> `/private/var`.
    */
-  private async resolveTarget(sessionId: string | undefined, target: string): Promise<string> {
+  private async resolveTarget(sessionId: string | undefined, target: string, access: "read" | "write"): Promise<string> {
     const raw = target.trim()
     if (!raw) return ""
-    const root = sessionId ? this.sessions.get(sessionId)?.cwd : undefined
+    const session = sessionId ? this.sessions.get(sessionId) : undefined
+    const root = session?.cwd
     if (this.options.allowPathsOutsideCwd) {
       return resolve(root ?? process.cwd(), raw)
     }
     if (!root) {
       throw new AcpError("filesystem access requires a known session root", -32602)
     }
-    const resolvedRoot = await realpath(root).catch(() => resolve(root))
-    const resolvedTarget = resolve(resolvedRoot, raw)
-    if (!isInside(resolvedRoot, resolvedTarget)) {
+    const roots = access === "read" ? [root, ...(session?.additionalDirectories ?? [])] : [root]
+    const allowed = await Promise.all(
+      roots.map(async (entry) => {
+        const lexical = resolve(entry)
+        return { lexical, real: await realpath(lexical).catch(() => lexical) }
+      }),
+    )
+    const resolvedTarget = resolve(root, raw)
+    if (!allowed.some(({ lexical, real }) => isInside(lexical, resolvedTarget) || isInside(real, resolvedTarget))) {
       throw new AcpError(`Path is outside the session directory: ${target}`, -32602)
     }
-    // Refuse to follow a symlink out of the root. For a path that does not exist
-    // yet, check the deepest existing ancestor: a symlinked parent directory
-    // would otherwise let a write escape even though the file itself is new.
+    // Refuse to follow a symlink out of the roots. For a path that does not
+    // exist yet, check the deepest existing ancestor: a symlinked parent
+    // directory would otherwise let a write escape even though the file itself
+    // is new.
     const real = (await realpath(resolvedTarget).catch(() => undefined)) ?? (await realpathExistingAncestor(resolvedTarget))
-    if (real && !isInside(resolvedRoot, real)) {
+    if (real && !allowed.some((entry) => isInside(entry.real, real))) {
       throw new AcpError(`Path resolves outside the session directory: ${target}`, -32602)
     }
     return resolvedTarget
@@ -965,8 +985,36 @@ export class AcpClient {
 
 function isInside(root: string, target: string) {
   const rel = relative(root, target)
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))
+  if (rel === "") return true
+  // `..env` is a file inside the root; only a `..` segment escapes it.
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
 }
+
+/**
+ * The text of an ACP tool call's content, for the permission prompt. Content
+ * entries are `{ type: "content", content: { type: "text", text } }`; diffs
+ * carry `path` and `newText`.
+ */
+function readToolCallText(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined
+  const parts: string[] = []
+  for (const entry of content) {
+    if (!entry || typeof entry !== "object") continue
+    const item = entry as Record<string, any>
+    if (item.type === "content" && item.content?.type === "text" && typeof item.content.text === "string") {
+      parts.push(item.content.text)
+    } else if (item.type === "diff" && typeof item.path === "string") {
+      parts.push(typeof item.newText === "string" ? `${item.path}\n${item.newText}` : item.path)
+    } else if (typeof item.text === "string") {
+      parts.push(item.text)
+    }
+  }
+  const text = parts.join("\n").trim()
+  if (!text) return undefined
+  return text.length > MAX_PERMISSION_DETAIL ? `${text.slice(0, MAX_PERMISSION_DETAIL)}…` : text
+}
+
+const MAX_PERMISSION_DETAIL = 4_000
 
 /** Resolve the real path of the closest ancestor that exists. */
 async function realpathExistingAncestor(target: string): Promise<string | undefined> {

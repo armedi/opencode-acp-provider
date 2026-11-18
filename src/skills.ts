@@ -18,7 +18,10 @@ export interface SkillMirror {
   /** Locations a `--skill` flag can take (cmd). */
   agentsDir: string
   claudeDir: string
-  count: number
+  /** Skills mirrored by the latest sync. */
+  readonly count: number
+  /** Re-read OpenCode's skills and bring the mirror in line with them. */
+  sync: () => Promise<void>
   close: () => Promise<void>
 }
 
@@ -34,7 +37,16 @@ export interface SkillMirrorOptions {
   /** When set, only mirror these skill IDs. */
   include?: readonly string[]
   log?: LogFn
+  /**
+   * Follow `skill.updated` and re-check shortly after creation. OpenCode
+   * discovers skills in the background, so the first list is often partial.
+   * Defaults to true.
+   */
+  watch?: boolean
 }
+
+/** Delays for re-reading skills after setup, in case discovery finished before the subscription. */
+const SETTLE_DELAYS_MS = [250, 1_000, 3_000]
 
 /**
  * Copy OpenCode's own skills into a throwaway directory that ACP agents already
@@ -45,6 +57,9 @@ export interface SkillMirrorOptions {
  *
  * Supporting files are copied rather than symlinked so they stay inside the
  * additional directory the agent was granted.
+ *
+ * The mirror stays up even while it is empty: skills that OpenCode discovers
+ * later are added on `skill.updated`, and agents see them in their next session.
  */
 export async function createSkillMirror(
   ctx: Plugin.Context,
@@ -59,22 +74,28 @@ export async function createSkillMirror(
   await mkdir(claudeDir, { recursive: true })
 
   let count = 0
-  try {
+  let closed = false
+  let mirrored = new Set<string>()
+
+  const rebuild = async () => {
+    if (closed) return
     const { data } = await ctx.skill.list()
+    const next = new Set<string>()
     for (const skill of data as readonly MirrorableSkill[]) {
+      if (closed) return
       if (!mirrorable(skill)) continue
       const id = String(skill.id)
       if (include && !include.has(id)) continue
       const source = String(skill.path)
       const virtual = source.startsWith("skill://")
+      if (!virtual && sharedSource(source)) continue
       const sourceDirectory = !virtual && basename(source) === "SKILL.md" ? dirname(source) : undefined
 
-      const targets = [agentsDir, claudeDir]
-      if (!virtual && sharedSource(source)) continue
-
       try {
-        for (const target of targets) {
+        for (const target of [agentsDir, claudeDir]) {
           const destination = join(target, id)
+          // Start clean so files removed from the source do not linger.
+          await rm(destination, { recursive: true, force: true })
           if (sourceDirectory)
             await cp(sourceDirectory, destination, {
               recursive: true,
@@ -89,20 +110,77 @@ export async function createSkillMirror(
         log("warn", `could not mirror skill "${id}": ${error instanceof Error ? error.message : String(error)}`)
         continue
       }
-      count += 1
+      next.add(id)
     }
+    for (const id of mirrored) {
+      if (next.has(id)) continue
+      for (const target of [agentsDir, claudeDir]) {
+        await rm(join(target, id), { recursive: true, force: true }).catch(() => {})
+      }
+    }
+    if (next.size !== count) log("info", `Mirrored ${next.size} OpenCode skill(s) for ACP agents`)
+    mirrored = next
+    count = next.size
+  }
+
+  let queue: Promise<void> = Promise.resolve()
+  const sync = () => {
+    const run = queue.then(rebuild).catch((error) => {
+      log("warn", `could not refresh OpenCode skills mirror: ${error instanceof Error ? error.message : String(error)}`)
+    })
+    queue = run
+    return run
+  }
+
+  // Subscribe before the first read so a `skill.updated` fired meanwhile is not lost.
+  const controller = new AbortController()
+  const timers: ReturnType<typeof setTimeout>[] = []
+  if (options.watch !== false) {
+    const subscribe = ctx.event?.subscribe
+    if (typeof subscribe === "function") {
+      void (async () => {
+        try {
+          for await (const _ of ctx.event.subscribe({ types: ["skill.updated"], signal: controller.signal })) {
+            if (closed) break
+            await sync()
+          }
+        } catch {
+          // The stream ends on close; the mirror keeps its last state.
+        }
+      })()
+    }
+  }
+
+  try {
+    await rebuild()
   } catch (error) {
+    controller.abort()
     await rm(root, { recursive: true, force: true }).catch(() => {})
     throw error
   }
+  if (count === 0) log("info", "Mirrored 0 OpenCode skill(s) for ACP agents; watching for more")
 
-  log("info", `Mirrored ${count} OpenCode skill(s) for ACP agents`)
+  if (options.watch !== false) {
+    for (const delay of SETTLE_DELAYS_MS) {
+      const timer = setTimeout(() => void sync(), delay)
+      timer.unref?.()
+      timers.push(timer)
+    }
+  }
+
   return {
     root,
     agentsDir,
     claudeDir,
-    count,
+    get count() {
+      return count
+    },
+    sync,
     close: async () => {
+      closed = true
+      for (const timer of timers) clearTimeout(timer)
+      controller.abort()
+      await queue.catch(() => {})
       await rm(root, { recursive: true, force: true }).catch(() => {})
     },
   }

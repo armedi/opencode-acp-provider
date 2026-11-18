@@ -1,4 +1,5 @@
 import type { AcpServerManager, LogFn } from "./server-manager.ts"
+import { basicAuth } from "./util.ts"
 
 /** Local HTTP API of the OpenCode server hosting this plugin. */
 export interface LocalService {
@@ -33,7 +34,7 @@ const START_POLL_MS = 25
 async function sessionRunning(service: LocalService, directory: string, sessionID: string, timeoutMs: number) {
   const response = await fetch(`${service.url.replace(/\/+$/, "")}/api/session/active`, {
     headers: {
-      authorization: `Basic ${Buffer.from(`opencode:${service.password}`, "utf8").toString("base64")}`,
+      authorization: basicAuth(service.password),
       "x-opencode-directory": encodeURIComponent(directory),
     },
     signal: AbortSignal.timeout(timeoutMs),
