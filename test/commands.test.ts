@@ -24,7 +24,10 @@ afterEach(async () => {
 function context(options: {
   skills?: Array<{ id: string; description?: string }>
   sessionModel?: { providerID: string; id: string }
+  /** Plugin storage, shared between contexts to model a restart. */
+  storage?: Map<string, unknown>
 }) {
+  const storage = options.storage ?? new Map<string, unknown>()
   const added: Array<{ name: string; description?: string; execute: (input: any) => Promise<void> }> = []
   const prompts: Array<{ sessionID: string; text: string; delivery: string }> = []
   let currentSkills = options.skills ?? []
@@ -43,6 +46,14 @@ function context(options: {
   }
 
   const ctx = {
+    storage: {
+      async get(key: string) {
+        return storage.get(key)
+      },
+      async set(key: string, value: unknown) {
+        storage.set(key, value)
+      },
+    },
     skill: {
       async list() {
         return { data: currentSkills }
@@ -314,6 +325,40 @@ test("filters skills that OpenCode discovers after the bridge starts", async () 
     await waitFor(() => added.length === 0)
 
     expect(added).toEqual([])
+  } finally {
+    await bridge.close()
+    await manager.stop()
+  }
+})
+
+test("registers the previous run's commands before the agent reports, then follows the agent", async () => {
+  // Commands registered after setup never reach clients that are already
+  // connected, so a restart must register the last known list up front.
+  const storage = new Map<string, unknown>()
+  const first = await managerWithCommands()
+  const before = context({ storage })
+  const firstBridge = await createCommandBridge({
+    ctx: before.ctx,
+    manager: first,
+    serverForProvider: () => undefined,
+    log: () => {},
+  })
+  await firstBridge.close()
+  await first.stop()
+
+  // Next start: the agent has not initialized, so it has reported nothing.
+  const manager = new AcpServerManager({
+    servers: [{ id: "fake", command: [process.execPath, agent], autoApprove: true }],
+    defaultCwd: await tempDir(),
+  })
+  const { ctx, added } = context({ storage })
+  const bridge = await createCommandBridge({ ctx, manager, serverForProvider: () => undefined, log: () => {} })
+  try {
+    expect(added.map((command) => command.name)).toEqual(["fake:compact"])
+
+    manager.get("fake")!.commands = [{ name: "review", description: "Review the current diff" }]
+    await bridge.sync("fake")
+    expect(added.map((command) => command.name)).toEqual(["fake:review"])
   } finally {
     await bridge.close()
     await manager.stop()

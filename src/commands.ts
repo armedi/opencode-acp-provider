@@ -29,9 +29,14 @@ interface RegisteredCommand {
   description?: string
 }
 
+/** Plugin storage key for the last command lists the agents advertised. */
+export const COMMAND_CACHE_KEY = "commands.v1"
+
 export async function createCommandBridge(options: CommandBridgeOptions): Promise<AcpCommandBridge> {
   const { ctx, manager, serverForProvider, log } = options
-  const commands = new Map<string, RegisteredCommand[]>()
+  // Seeded from the previous run so the commands are registered while the
+  // plugin is still in setup. See `readCache`.
+  const commands = await readCache(ctx, manager, log)
 
   let closed = false
   // Updates arrive as agents send them; serialize so rebuilds cannot interleave.
@@ -46,7 +51,9 @@ export async function createCommandBridge(options: CommandBridgeOptions): Promis
     for (const [id, state] of manager.servers) {
       if (server && id !== server) continue
       if (state.config.disabled) continue
-      const forwarded = forwardable(state.commands ?? [], skills)
+      // Not reported yet: keep the cached list until the agent sends its own.
+      if (state.commands === undefined) continue
+      const forwarded = forwardable(state.commands, skills)
       const previous = commands.get(id)
       if (forwarded.length) {
         commands.set(id, forwarded)
@@ -57,7 +64,19 @@ export async function createCommandBridge(options: CommandBridgeOptions): Promis
       }
     }
     // Reloading republishes the registry, so skip it when nothing moved.
-    if (changed) await ctx.command.reload()
+    if (!changed) return
+    await ctx.command.reload()
+    const cache: Record<string, Array<Record<string, string>>> = Object.fromEntries(
+      [...commands].map(([id, list]) => [
+        id,
+        list.map(({ name, description }): Record<string, string> =>
+          description === undefined ? { name } : { name, description },
+        ),
+      ]),
+    )
+    await ctx.storage.set(COMMAND_CACHE_KEY, cache).catch((error) => {
+      log("warn", `could not cache ACP commands: ${error instanceof Error ? error.message : String(error)}`)
+    })
   }
 
   /**
@@ -158,6 +177,46 @@ export async function createCommandBridge(options: CommandBridgeOptions): Promis
       await registration.dispose().catch(() => {})
     },
   }
+}
+
+/**
+ * The command lists stored by the previous run, for servers still configured.
+ *
+ * Agents start in the background, so their commands normally arrive after
+ * setup. OpenCode 2.3 publishes a command change made after setup without a
+ * location, and clients only refetch commands for a location-scoped
+ * `command.updated`. So a client already connected never sees late commands.
+ * Changes made during setup are batched and published with the location, so
+ * registering the last known lists here reaches every client. The agent's
+ * own list then replaces the cached one, which costs nothing when it is
+ * unchanged, the usual case.
+ */
+async function readCache(
+  ctx: Plugin.Context,
+  manager: AcpServerManager,
+  log: LogFn,
+): Promise<Map<string, RegisteredCommand[]>> {
+  const commands = new Map<string, RegisteredCommand[]>()
+  let stored: unknown
+  try {
+    stored = await ctx.storage.get(COMMAND_CACHE_KEY)
+  } catch (error) {
+    log("warn", `could not read cached ACP commands: ${error instanceof Error ? error.message : String(error)}`)
+    return commands
+  }
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) return commands
+  for (const [id, list] of Object.entries(stored)) {
+    const state = manager.get(id)
+    if (!state || state.config.disabled || !Array.isArray(list)) continue
+    const valid = list.flatMap((entry): RegisteredCommand[] => {
+      if (!entry || typeof entry !== "object") return []
+      const { name, description } = entry as { name?: unknown; description?: unknown }
+      if (typeof name !== "string" || !name) return []
+      return [{ name, ...(typeof description === "string" ? { description } : {}) }]
+    })
+    if (valid.length) commands.set(id, valid)
+  }
+  return commands
 }
 
 /** Whether the registered set for one server already matches a rebuilt one. */

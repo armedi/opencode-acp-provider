@@ -312,6 +312,14 @@ Commands are filtered and kept current:
 - **The list is live.** The setup session supplies a first snapshot, and any later
   `available_commands_update` from a pooled session replaces it. A `skill.updated` event rebuilds
   the filter once skill discovery settles.
+- **Commands are there from startup.** Agents start in the background, so their commands arrive
+  after plugin setup. OpenCode 2.3 publishes a command change made after setup without a location,
+  and clients (TUI, desktop, web) only refetch commands for a location-scoped update, so an open
+  client would never see them. The plugin therefore stores each agent's last command list and
+  registers it during setup, when OpenCode still publishes the change for the location. The agent's
+  own list replaces it once the agent reports, at no cost when nothing changed.
+- **The first run, and a list that changes, still lag in open clients.** Clients pick up the change
+  when they reconnect or open the project again.
 - **A command only runs on its own agent.** Command lists are per location, not per model, so all
   agents' commands are visible at once. Running one in a session that is on another provider fails
   with a message naming the agent to switch to, rather than sending text an agent cannot handle.
