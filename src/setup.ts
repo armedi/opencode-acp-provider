@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process"
 import { homedir } from "node:os"
 import type { LogFn } from "./server-manager.ts"
+import { errorMessage } from "./util.ts"
 
 const DEFAULT_TIMEOUT_MS = 300_000
 const FAILURE_TAIL_LINES = 20
@@ -70,7 +71,7 @@ function execute(script: string, log: LogFn, timeoutMs: number): Promise<void> {
         env: process.env,
       })
     } catch (error) {
-      finish(error instanceof Error ? error.message : String(error))
+      finish(errorMessage(error))
       return
     }
 

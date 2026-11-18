@@ -1,4 +1,5 @@
 import {
+  ACP_REQUEST_CANCELLED,
   AcpClient,
   AcpError,
   type AcpCommand,
@@ -9,6 +10,7 @@ import {
 import { applyCmdMods } from "./agents/cmd/index.ts"
 import { isCmdCommand } from "./agent-command.ts"
 import { runSetup } from "./setup.ts"
+import { errorMessage } from "./util.ts"
 
 export interface AcpServerConfig {
   /** Stable id used for the OpenCode provider and tool arguments. */
@@ -186,8 +188,7 @@ export type AcpCompactResult =
 const DEFAULT_MAX_SESSIONS = 32
 const DEFAULT_SESSION_IDLE_MS = 30 * 60_000
 const DEFAULT_INIT_TIMEOUT_MS = 20_000
-/** `AcpClient` uses this code when a request was cancelled. */
-const ACP_REQUEST_CANCELLED = -32800
+
 /** ACP's "resource not found": the agent no longer knows the session. */
 const ACP_UNKNOWN_SESSION = -32002
 /** Failed turns in a row before the pooled session is recycled. */
@@ -280,7 +281,7 @@ export class AcpServerManager {
       } catch (error) {
         this.log(
           "error",
-          `ignoring ACP server "${config.id}": ${error instanceof Error ? error.message : String(error)}`,
+          `ignoring ACP server "${config.id}": ${errorMessage(error)}`,
         )
         continue
       }
@@ -296,6 +297,10 @@ export class AcpServerManager {
       this.sweeper = setInterval(() => this.sweepIdleSessions(), SWEEP_INTERVAL_MS)
       this.sweeper.unref?.()
     }
+  }
+
+  private assertLive() {
+    if (this.disposed) throw new Error("ACP server manager is stopped")
   }
 
   get list() {
@@ -316,7 +321,7 @@ export class AcpServerManager {
     try {
       return await this.sessions.get(poolKey)
     } catch (error) {
-      this.log("warn", `could not read a stored ACP session: ${error instanceof Error ? error.message : String(error)}`)
+      this.log("warn", `could not read a stored ACP session: ${errorMessage(error)}`)
       return undefined
     }
   }
@@ -326,7 +331,7 @@ export class AcpServerManager {
     try {
       await this.sessions.set(poolKey, sessionId)
     } catch (error) {
-      this.log("warn", `could not store ACP session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`)
+      this.log("warn", `could not store ACP session ${sessionId}: ${errorMessage(error)}`)
     }
   }
 
@@ -459,7 +464,7 @@ export class AcpServerManager {
           )
         } catch (error) {
           if (this.disposed) return
-          state.error = error instanceof Error ? error.message : String(error)
+          state.error = errorMessage(error)
           this.log("error", `ACP server "${state.config.id}" failed to initialize: ${state.error}`)
           // Do not stop the client here: a timed-out prepare may still finish.
           // It stops its own client on failure, and a success is still usable.
@@ -471,16 +476,16 @@ export class AcpServerManager {
 
   /** Re-run discovery, e.g. after a server failed to start during setup. */
   async refresh(state: AcpServerState) {
-    if (this.disposed) throw new Error("ACP server manager is stopped")
+    this.assertLive()
     const id = state.config.id
     // Setup runs outside the timed work: a slow install is not an init timeout.
     await this.setupFor(state)
-    if (this.disposed) throw new Error("ACP server manager is stopped")
+    this.assertLive()
     const work = (async () => {
       const inFlight = this.preparing.get(id)
       if (inFlight) await inFlight.catch(() => {})
       if (state.initialized && state.models.length) return
-      if (this.disposed) throw new Error("ACP server manager is stopped")
+      this.assertLive()
       state.initialized = false
       state.error = undefined
       await this.prepare(state)
@@ -488,7 +493,7 @@ export class AcpServerManager {
     try {
       await withTimeout(work, this.initTimeoutMs, `ACP server "${id}" did not initialize within ${this.initTimeoutMs}ms`)
     } catch (error) {
-      state.error = error instanceof Error ? error.message : String(error)
+      state.error = errorMessage(error)
       throw error
     }
   }
@@ -509,11 +514,11 @@ export class AcpServerManager {
 
   private async doPrepare(state: AcpServerState) {
     const config = state.config
-    if (this.disposed) throw new Error("ACP server manager is stopped")
+    this.assertLive()
     // The lazy path through `prepare()` waits for setup too; the memo makes it
     // instant when discovery already ran it.
     await this.setupFor(state)
-    if (this.disposed) throw new Error("ACP server manager is stopped")
+    this.assertLive()
     const { command, args } = normalizeCommand(this.commandFor(config))
     const env: Record<string, string> = { ...config.env }
     if (config.skills !== false && this.cmdSkillDir && isCmdCommand(config.command)) {
@@ -527,7 +532,7 @@ export class AcpServerManager {
       if (value && name) env[name] = value
       if (!value) this.log("warn", `no credential found for integration "${config.credential}"; starting "${config.id}" unauthenticated`)
     }
-    if (this.disposed) throw new Error("ACP server manager is stopped")
+    this.assertLive()
 
     const previous = state.client
     if (previous) {
@@ -560,7 +565,7 @@ export class AcpServerManager {
         meta: config.meta,
         additionalDirectories: this.sessionDirectories(config),
       })
-      if (this.disposed) throw new Error("ACP server manager is stopped")
+      this.assertLive()
       const defaultModel = session.currentModel ?? (session.modelConfigID ? undefined : "default")
       let models = session.models.length
         ? session.models
@@ -693,7 +698,7 @@ export class AcpServerManager {
         // Install this reservation before the negotiation can open a session.
         negotiating = Promise.resolve().then(async () => {
           if (eviction) await eviction
-          if (this.disposed) throw new Error("ACP server manager is stopped")
+          this.assertLive()
           const sessionStartedAt = Date.now()
           const lease = this.mcp?.servers(input.key!, state.config)
           let session: { sessionId: string } | undefined
@@ -717,9 +722,7 @@ export class AcpServerManager {
                 .catch(async (error) => {
                   this.log(
                     "warn",
-                    `could not restore ACP session ${stored} for key ${input.key!.slice(0, 24)}: ${
-                      error instanceof Error ? error.message : String(error)
-                    }; starting a new one`,
+                    `could not restore ACP session ${stored} for key ${input.key!.slice(0, 24)}: ${errorMessage(error)}; starting a new one`,
                   )
                   await this.forgetSession(poolKey)
                   return undefined
@@ -829,61 +832,55 @@ export class AcpServerManager {
         return turn
       })
       pooled.queue = run.catch(() => {})
-      const settled = run.then(
-        () => {},
-        () => {},
-      )
-      settled
-        .finally(() => {
-          pooled.pending = Math.max(0, pooled.pending - 1)
-          pooled.lastUsed = Date.now()
-        })
-        .catch(() => {})
-      run.then(
+      void run.then(
         () => {
           pooled.failures = 0
         },
-        () => {},
-      ).catch(() => {})
-      run.catch((error: unknown) => {
-        // A failed turn does not necessarily invalidate the ACP session. The
-        // process dying or the agent forgetting the session does; everything else
-        // (cancel, timeout, reset) keeps the context, so a retry resumes the same
-        // conversation instead of starting a new one.
-        if (this.pools.get(poolKey) !== pooled) return
-        const message = error instanceof Error ? error.message : String(error)
-        const unknown = isUnknownSession(error)
-        if (unknown || !pooled.client.alive || !pooled.client.hasSession(pooled.sessionId)) {
-          void this.dropPool(poolKey, pooled)
-          if (unknown) void this.forgetSession(poolKey)
-          return
-        }
-        pooled.failures += 1
-        if (error instanceof AcpError && error.code === ACP_REQUEST_CANCELLED) {
-          // A stopped turn is normal; the agent already ended it, so the session
-          // is intact and the next prompt picks up the same conversation.
-          pooled.failures = 0
-          this.log("debug", `kept ACP session ${pooled.sessionId} after a cancelled turn`)
-          return
-        }
-        if (pooled.failures >= MAX_TURN_FAILURES) {
-          this.log("warn", `dropping ACP session ${pooled.sessionId} after ${pooled.failures} failed turns: ${message}`)
-          void this.dropPool(poolKey, pooled)
-          // A session that failed this many times in a row should not be restored
-          // into the same state on the next turn.
-          void this.forgetSession(poolKey)
-          return
-        }
-        // Ask the agent to end whatever it is still running so the queued or next
-        // prompt enters the same context at a clean boundary.
-        pooled.client.cancelTurn(pooled.sessionId)
-        this.log("debug", `keeping ACP session ${pooled.sessionId} after a failed turn: ${message}`)
+        (error: unknown) => this.onTurnFailed(poolKey, pooled, error),
+      ).finally(() => {
+        pooled.pending = Math.max(0, pooled.pending - 1)
+        pooled.lastUsed = Date.now()
       })
       return await run
     } finally {
       finishStarting()
       if (key && !this.starting.has(key)) this.startCancels.delete(key)
     }
+  }
+
+  private onTurnFailed(poolKey: string, pooled: PooledSession, error: unknown) {
+    // A failed turn does not necessarily invalidate the ACP session. The
+    // process dying or the agent forgetting the session does; everything else
+    // (cancel, timeout, reset) keeps the context, so a retry resumes the same
+    // conversation instead of starting a new one.
+    if (this.pools.get(poolKey) !== pooled) return
+    const message = errorMessage(error)
+    const unknown = isUnknownSession(error)
+    if (unknown || !pooled.client.alive || !pooled.client.hasSession(pooled.sessionId)) {
+      void this.dropPool(poolKey, pooled)
+      if (unknown) void this.forgetSession(poolKey)
+      return
+    }
+    pooled.failures += 1
+    if (error instanceof AcpError && error.code === ACP_REQUEST_CANCELLED) {
+      // A stopped turn is normal; the agent already ended it, so the session
+      // is intact and the next prompt picks up the same conversation.
+      pooled.failures = 0
+      this.log("debug", `kept ACP session ${pooled.sessionId} after a cancelled turn`)
+      return
+    }
+    if (pooled.failures >= MAX_TURN_FAILURES) {
+      this.log("warn", `dropping ACP session ${pooled.sessionId} after ${pooled.failures} failed turns: ${message}`)
+      void this.dropPool(poolKey, pooled)
+      // A session that failed this many times in a row should not be restored
+      // into the same state on the next turn.
+      void this.forgetSession(poolKey)
+      return
+    }
+    // Ask the agent to end whatever it is still running so the queued or next
+    // prompt enters the same context at a clean boundary.
+    pooled.client.cancelTurn(pooled.sessionId)
+    this.log("debug", `keeping ACP session ${pooled.sessionId} after a failed turn: ${message}`)
   }
 
   /** Drop a pooled session on our side, leaving its stored id unless callers forget it. */
@@ -990,12 +987,9 @@ export class AcpServerManager {
     const prefix = `${server}\u0000`
     const closed: Array<Promise<unknown>> = []
     for (const [key, pooled] of this.pools) {
-      if (!key.startsWith(prefix)) continue
-      this.pools.delete(key)
-      pooled.broken = true
-      pooled.mcpRelease?.()
-      closed.push(pooled.client.closeSession(pooled.sessionId))
+      if (key.startsWith(prefix)) closed.push(this.dropPool(key, pooled))
     }
+
     await Promise.allSettled(closed)
   }
 

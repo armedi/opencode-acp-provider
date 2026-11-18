@@ -2,6 +2,7 @@ import type { Mcp, Plugin } from "@opencode/plugin"
 import type { AcpMcpServer } from "./acp-client.ts"
 import type { AcpServerConfig, LogFn } from "./server-manager.ts"
 import { executableName, isCmdCommand } from "./agent-command.ts"
+import { errorMessage } from "./util.ts"
 
 type Ctx = Plugin.Context
 type ServerConfig = Mcp.ServerConfig
@@ -66,7 +67,7 @@ export async function createOpenCodeMcpSource(ctx: Ctx, log: LogFn): Promise<Ope
   // A registry read replays the registered transforms, so this also captures the
   // configuration for plugin setups that read nothing else.
   await ctx.mcp.list().catch((error) => {
-    log("warn", `could not read OpenCode's MCP configuration: ${error instanceof Error ? error.message : String(error)}`)
+    log("warn", `could not read OpenCode's MCP configuration: ${errorMessage(error)}`)
   })
 
   const warned = new Set<string>()

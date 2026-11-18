@@ -1,7 +1,8 @@
 import type { Plugin } from "@opencode/plugin"
 import type { AcpCommand } from "./acp-client.ts"
 import type { AcpServerManager, LogFn } from "./server-manager.ts"
-import { agentName } from "./util.ts"
+import { followSkillUpdates } from "./skills.ts"
+import { agentName, errorMessage } from "./util.ts"
 
 /**
  * Exposes the slash commands an ACP agent advertises as OpenCode commands.
@@ -76,7 +77,7 @@ export async function createCommandBridge(options: CommandBridgeOptions): Promis
       ]),
     )
     await ctx.storage.set(COMMAND_CACHE_KEY, cache).catch((error) => {
-      log("warn", `could not cache ACP commands: ${error instanceof Error ? error.message : String(error)}`)
+      log("warn", `could not cache ACP commands: ${errorMessage(error)}`)
     })
   }
 
@@ -136,44 +137,24 @@ export async function createCommandBridge(options: CommandBridgeOptions): Promis
 
   const sync = (server?: string) => {
     const next = queue.then(() => rebuild(server)).catch((error) => {
-      log("warn", `could not refresh ACP commands: ${error instanceof Error ? error.message : String(error)}`)
+      log("warn", `could not refresh ACP commands: ${errorMessage(error)}`)
     })
     queue = next
     return next
   }
 
-  // Subscribe before the first rebuild: OpenCode finishes skill discovery while
-  // this plugin is still starting up, so that event is likely already on its way
-  // and a subscription created afterwards would miss it.
-  const controller = new AbortController()
-  void (async () => {
-    try {
-      for await (const _ of ctx.event.subscribe({ types: ["skill.updated"], signal: controller.signal })) {
-        if (closed) break
-        await sync()
-      }
-    } catch {
-      // The stream ends on unsubscribe; the palette keeps its last state.
-    }
-  })()
-
+  // The skill filter changes as OpenCode discovers skills, which it finishes
+  // while this plugin is still starting up.
+  const watcher = followSkillUpdates(ctx, sync)
   await rebuild()
-
-  // Skill discovery can finish before this plugin subscribes, in which case no
-  // event ever arrives and the palette keeps commands the filter would drop.
-  // Re-check a few times while skills are still arriving, then stop: past that
-  // point `skill.updated` covers new skills as they appear.
-  const settle = [250, 1_000, 3_000].map((delay) =>
-    setTimeout(() => void sync(), delay),
-  )
-  for (const timer of settle) timer.unref?.()
+  watcher.settle()
 
   return {
     sync,
     close: async () => {
       closed = true
-      for (const timer of settle) clearTimeout(timer)
-      controller.abort()
+      watcher.dispose()
+
       await queue.catch(() => {})
       await registration.dispose().catch(() => {})
     },
@@ -202,7 +183,7 @@ async function readCache(
   try {
     stored = await ctx.storage.get(COMMAND_CACHE_KEY)
   } catch (error) {
-    log("warn", `could not read cached ACP commands: ${error instanceof Error ? error.message : String(error)}`)
+    log("warn", `could not read cached ACP commands: ${errorMessage(error)}`)
     return commands
   }
   if (!stored || typeof stored !== "object" || Array.isArray(stored)) return commands
@@ -277,9 +258,7 @@ async function skillDescriptions(ctx: Plugin.Context, log: LogFn): Promise<Set<s
   } catch (error) {
     log(
       "warn",
-      `could not read OpenCode skills, so ACP commands may repeat them: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
+      `could not read OpenCode skills, so ACP commands may repeat them: ${errorMessage(error)}`,
     )
   }
   return descriptions

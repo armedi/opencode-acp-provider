@@ -3,6 +3,7 @@ import { tmpdir } from "node:os"
 import { basename, dirname, join, sep } from "node:path"
 import type { Plugin } from "@opencode/plugin"
 import type { LogFn } from "./server-manager.ts"
+import { errorMessage } from "./util.ts"
 
 /** Agent Skills IDs are portable only as lowercase kebab-case. */
 const SKILL_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
@@ -47,6 +48,43 @@ export interface SkillMirrorOptions {
 
 /** Delays for re-reading skills after setup, in case discovery finished before the subscription. */
 const SETTLE_DELAYS_MS = [250, 1_000, 3_000]
+
+/**
+ * Run `sync` on every `skill.updated`, and from `settle()` a few more times
+ * while OpenCode's background skill discovery finishes. Create it before the
+ * first read so an event fired meanwhile is not lost, and call `settle()` after
+ * that read: discovery can finish before the subscription, and then no event
+ * ever arrives.
+ */
+export function followSkillUpdates(ctx: Plugin.Context, sync: () => Promise<void>) {
+  const controller = new AbortController()
+  const timers: ReturnType<typeof setTimeout>[] = []
+  if (typeof ctx.event?.subscribe === "function") {
+    void (async () => {
+      try {
+        for await (const _ of ctx.event.subscribe({ types: ["skill.updated"], signal: controller.signal })) {
+          if (controller.signal.aborted) break
+          await sync()
+        }
+      } catch {
+        // The stream ends on dispose; the caller keeps its last state.
+      }
+    })()
+  }
+  return {
+    settle() {
+      for (const delay of SETTLE_DELAYS_MS) {
+        const timer = setTimeout(() => void sync(), delay)
+        timer.unref?.()
+        timers.push(timer)
+      }
+    },
+    dispose() {
+      for (const timer of timers) clearTimeout(timer)
+      controller.abort()
+    },
+  }
+}
 
 /**
  * Copy OpenCode's own skills into a throwaway directory that ACP agents already
@@ -107,7 +145,7 @@ export async function createSkillMirror(
           await writeFile(join(destination, "SKILL.md"), renderSkill(skill), "utf8")
         }
       } catch (error) {
-        log("warn", `could not mirror skill "${id}": ${error instanceof Error ? error.message : String(error)}`)
+        log("warn", `could not mirror skill "${id}": ${errorMessage(error)}`)
         continue
       }
       next.add(id)
@@ -126,47 +164,23 @@ export async function createSkillMirror(
   let queue: Promise<void> = Promise.resolve()
   const sync = () => {
     const run = queue.then(rebuild).catch((error) => {
-      log("warn", `could not refresh OpenCode skills mirror: ${error instanceof Error ? error.message : String(error)}`)
+      log("warn", `could not refresh OpenCode skills mirror: ${errorMessage(error)}`)
     })
     queue = run
     return run
   }
 
-  // Subscribe before the first read so a `skill.updated` fired meanwhile is not lost.
-  const controller = new AbortController()
-  const timers: ReturnType<typeof setTimeout>[] = []
-  if (options.watch !== false) {
-    const subscribe = ctx.event?.subscribe
-    if (typeof subscribe === "function") {
-      void (async () => {
-        try {
-          for await (const _ of ctx.event.subscribe({ types: ["skill.updated"], signal: controller.signal })) {
-            if (closed) break
-            await sync()
-          }
-        } catch {
-          // The stream ends on close; the mirror keeps its last state.
-        }
-      })()
-    }
-  }
+  const watcher = options.watch !== false ? followSkillUpdates(ctx, sync) : undefined
 
   try {
     await rebuild()
   } catch (error) {
-    controller.abort()
+    watcher?.dispose()
     await rm(root, { recursive: true, force: true }).catch(() => {})
     throw error
   }
   if (count === 0) log("info", "Mirrored 0 OpenCode skill(s) for ACP agents; watching for more")
-
-  if (options.watch !== false) {
-    for (const delay of SETTLE_DELAYS_MS) {
-      const timer = setTimeout(() => void sync(), delay)
-      timer.unref?.()
-      timers.push(timer)
-    }
-  }
+  watcher?.settle()
 
   return {
     root,
@@ -178,9 +192,9 @@ export async function createSkillMirror(
     sync,
     close: async () => {
       closed = true
-      for (const timer of timers) clearTimeout(timer)
-      controller.abort()
+      watcher?.dispose()
       await queue.catch(() => {})
+
       await rm(root, { recursive: true, force: true }).catch(() => {})
     },
   }

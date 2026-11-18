@@ -1,5 +1,5 @@
 import type { AcpServerManager, LogFn } from "./server-manager.ts"
-import { basicAuth } from "./util.ts"
+import { basicAuth, errorMessage, sleep } from "./util.ts"
 
 /** Local HTTP API of the OpenCode server hosting this plugin. */
 export interface LocalService {
@@ -73,13 +73,13 @@ export function createSteering(options: SteeringOptions) {
         while (!options.manager.running(sessionID)) {
           const delay = Math.min(START_POLL_MS, deadline - performance.now())
           if (delay <= 0) return
-          await new Promise<void>((resolve) => setTimeout(resolve, delay))
+          await sleep(delay)
         }
       }
       options.manager.interrupt(sessionID)
     } catch (error) {
       // A failed lookup must never prevent the host from admitting the prompt.
-      options.log("debug", `ACP steering skipped: ${error instanceof Error ? error.message : String(error)}`)
+      options.log("debug", `ACP steering skipped: ${errorMessage(error)}`)
     }
   }
 }

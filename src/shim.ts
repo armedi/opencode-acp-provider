@@ -4,7 +4,7 @@ import type { AcpServerManager } from "./server-manager.ts"
 import type { SessionUpdate } from "./acp-client.ts"
 import { applyToolUpdate, type AcpToolState } from "./acp-tools.ts"
 import { buildPrompts, historyLimits, isAuxiliaryRequest, type ChatMessage } from "./prompt.ts"
-import { BodyTooLargeError, readBody } from "./util.ts"
+import { BodyTooLargeError, endFailedResponse, errorMessage, listenLocal, readBody } from "./util.ts"
 
 export interface ShimOptions {
   manager: AcpServerManager
@@ -34,6 +34,12 @@ export interface ShimOptions {
 
 const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024
 const DEFAULT_DRAIN_TIMEOUT_MS = 30 * 60_000
+
+/** Answer with an OpenAI-style error body. */
+function sendError(res: ServerResponse, status: number, message: string, type = "invalid_request_error") {
+  res.writeHead(status, { "content-type": "application/json" })
+  res.end(JSON.stringify({ error: { message, type } }))
+}
 
 function sessionKey(req: IncomingMessage, body: any): string | undefined {
   // x-opencode-session-id is the session itself; x-opencode-session is the
@@ -132,8 +138,8 @@ export async function createShim(options: ShimOptions) {
     const url = (req.url ?? "").split("?")[0]
 
     if (!authorized(req)) {
-      res.writeHead(401, { "content-type": "application/json", "www-authenticate": "Bearer" })
-      res.end(JSON.stringify({ error: { message: "Unauthorized", type: "invalid_request_error" } }))
+      res.setHeader("www-authenticate", "Bearer")
+      sendError(res, 401, "Unauthorized")
       return
     }
 
@@ -147,8 +153,7 @@ export async function createShim(options: ShimOptions) {
     }
 
     if (req.method !== "POST" || !(url === "/v1/chat/completions" || url === "/chat/completions")) {
-      res.writeHead(404, { "content-type": "application/json" })
-      res.end(JSON.stringify({ error: { message: `Not found: ${req.method} ${url}`, type: "invalid_request_error" } }))
+      sendError(res, 404, `Not found: ${req.method} ${url}`)
       return
     }
 
@@ -157,17 +162,11 @@ export async function createShim(options: ShimOptions) {
       raw = await readBody(req, maxBodyBytes)
     } catch (error) {
       if (error instanceof BodyTooLargeError) {
-        res.writeHead(413, { "content-type": "application/json" })
-        res.end(
-          JSON.stringify({
-            error: { message: `Request body exceeds ${maxBodyBytes} bytes`, type: "invalid_request_error" },
-          }),
-        )
+        sendError(res, 413, `Request body exceeds ${maxBodyBytes} bytes`)
         req.destroy()
         return
       }
-      res.writeHead(400, { "content-type": "application/json" })
-      res.end(JSON.stringify({ error: { message: "Could not read request body", type: "invalid_request_error" } }))
+      sendError(res, 400, "Could not read request body")
       return
     }
 
@@ -175,25 +174,18 @@ export async function createShim(options: ShimOptions) {
     try {
       body = JSON.parse(raw)
     } catch {
-      res.writeHead(400, { "content-type": "application/json" })
-      res.end(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }))
+      sendError(res, 400, "Invalid JSON body")
       return
     }
 
     if (typeof body?.model !== "string" || !body.model) {
-      res.writeHead(400, { "content-type": "application/json" })
-      res.end(JSON.stringify({ error: { message: "Missing model", type: "invalid_request_error" } }))
+      sendError(res, 400, "Missing model")
       return
     }
     const modelID: string = body.model
     const target = options.resolveModel(modelID)
     if (!target) {
-      res.writeHead(404, { "content-type": "application/json" })
-      res.end(
-        JSON.stringify({
-          error: { message: `No ACP server registered for model "${modelID}"`, type: "invalid_request_error" },
-        }),
-      )
+      sendError(res, 404, `No ACP server registered for model "${modelID}"`)
       return
     }
 
@@ -224,8 +216,7 @@ export async function createShim(options: ShimOptions) {
     const structuredTools = req.headers["x-acp-tool-events"] === "1"
     const prompt = buildPrompts(messages, limits, auxiliary || options.includeSystem === true)
     if (!prompt.fresh.trim()) {
-      res.writeHead(400, { "content-type": "application/json" })
-      res.end(JSON.stringify({ error: { message: "Empty prompt", type: "invalid_request_error" } }))
+      sendError(res, 400, "Empty prompt")
       return
     }
     // The client may have disconnected while the body was being read.
@@ -370,17 +361,15 @@ export async function createShim(options: ShimOptions) {
         )
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const message = errorMessage(error)
       log("error", `ACP prompt failed for ${target.server}/${target.model}: ${message}`)
       if (res.destroyed) return
-      const failure = JSON.stringify({ error: { message, type: "acp_error" } })
       if (!stream) {
-        res.writeHead(500, { "content-type": "application/json" })
-        res.end(failure)
+        sendError(res, 500, message, "acp_error")
         return
       }
       if (!res.writableEnded) {
-        res.end(`data: ${failure}\n\n`)
+        res.end(`data: ${JSON.stringify({ error: { message, type: "acp_error" } })}\n\n`)
       }
     } finally {
       if (heartbeat) clearInterval(heartbeat)
@@ -393,22 +382,8 @@ export async function createShim(options: ShimOptions) {
       try {
         await handleRequest(req, res)
       } catch (error) {
-        log("error", `shim request failed: ${error instanceof Error ? error.message : String(error)}`)
-        if (res.destroyed) return
-        if (!res.headersSent) {
-          try {
-            res.writeHead(500, { "content-type": "application/json" })
-          } catch {
-            // the connection was closed
-          }
-        }
-        if (!res.writableEnded) {
-          try {
-            res.end()
-          } catch {
-            // the connection was closed
-          }
-        }
+        log("error", `shim request failed: ${errorMessage(error)}`)
+        endFailedResponse(res)
       }
     })()
     inflight.add(work)
@@ -421,13 +396,9 @@ export async function createShim(options: ShimOptions) {
   // does not need an idle timeout: `close()` drops the sockets it owns.
   server.keepAliveTimeout = 0
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject)
-    server.listen(0, "127.0.0.1", () => resolve())
-  })
-  const address = server.address()
-  const port = typeof address === "object" && address ? address.port : 0
+  const port = await listenLocal(server)
   log("info", `ACP provider shim listening on http://127.0.0.1:${port}/v1`)
+
   const drainTimeoutMs = options.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS
 
   return {

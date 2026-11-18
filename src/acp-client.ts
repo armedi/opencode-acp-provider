@@ -3,6 +3,7 @@ import { createReadStream } from "node:fs"
 import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises"
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path"
 import { createInterface } from "node:readline"
+import { errorMessage } from "./util.ts"
 
 /**
  * Minimal Agent Client Protocol (ACP) client.
@@ -200,6 +201,17 @@ const DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024
 const MAX_PROTOCOL_BUFFER = 64 * 1024 * 1024
 const MAX_STDERR_BUFFER = 1024 * 1024
 const SIGKILL_DELAY_MS = 2_000
+/** JSON-RPC error code for a request that was cancelled. */
+export const ACP_REQUEST_CANCELLED = -32800
+
+/** `session/new`, `session/resume`, and `session/load` share these fields. */
+function sessionParams(options: { mcpServers?: AcpMcpServer[]; additionalDirectories?: string[]; meta?: Record<string, unknown> }) {
+  return {
+    mcpServers: options.mcpServers ?? [],
+    ...(options.additionalDirectories?.length ? { additionalDirectories: options.additionalDirectories } : {}),
+    ...(options.meta ? { _meta: options.meta } : {}),
+  }
+}
 
 export class AcpError extends Error {
   code: number
@@ -305,7 +317,6 @@ export class AcpClient {
           },
           clientInfo: { name: "opencode", version: "2" },
         },
-        { timeout: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS },
       )
 
       if (!current()) throw new AcpError("ACP agent stopped during initialization")
@@ -389,7 +400,7 @@ export class AcpClient {
   private onMessage(message: RpcMessage) {
     if (message.method && message.id !== undefined) {
       void this.onRequest(message).catch((error) => {
-        this.log("error", `ACP request handler failed: ${error instanceof Error ? error.message : String(error)}`)
+        this.log("error", `ACP request handler failed: ${errorMessage(error)}`)
       })
       return
     }
@@ -498,7 +509,7 @@ export class AcpClient {
       this.log("warn", `unsupported ACP client method: ${method}`)
       this.reply(message.id!, undefined, -32601, `Method not supported by client: ${method}`)
     } catch (error) {
-      const text = error instanceof Error ? error.message : String(error)
+      const text = errorMessage(error)
       const code = error instanceof AcpError ? error.code : -32603
       this.reply(message.id!, undefined, code, text)
     }
@@ -570,7 +581,7 @@ export class AcpClient {
           }
           const grace = options.abortGraceMs ?? DEFAULT_ABORT_GRACE_MS
           graceTimer = setTimeout(
-            () => fail(new AcpError(`ACP request "${method}" was cancelled`, -32800)),
+            () => fail(new AcpError(`ACP request "${method}" was cancelled`, ACP_REQUEST_CANCELLED)),
             Math.max(0, grace),
           )
           graceTimer.unref?.()
@@ -609,16 +620,7 @@ export class AcpClient {
     } = {},
   ) {
     await this.start()
-    const result = await this.request(
-      "session/new",
-      {
-        cwd,
-        mcpServers: options.mcpServers ?? [],
-        ...(options.additionalDirectories?.length ? { additionalDirectories: options.additionalDirectories } : {}),
-        ...(options.meta ? { _meta: options.meta } : {}),
-      },
-      { timeout: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS },
-    )
+    const result = await this.request("session/new", { cwd, ...sessionParams(options) })
     const sessionId: string = result.sessionId
     if (!sessionId) throw new AcpError("ACP agent did not return a session id", -32603)
     const configOptions: AcpConfigOption[] = result.configOptions ?? []
@@ -686,13 +688,7 @@ export class AcpClient {
     const timeout = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
     const result = await this.request(
       resume ? "session/resume" : "session/load",
-      {
-        sessionId,
-        cwd: options.cwd,
-        mcpServers: options.mcpServers ?? [],
-        ...(options.additionalDirectories?.length ? { additionalDirectories: options.additionalDirectories } : {}),
-        ...(options.meta ? { _meta: options.meta } : {}),
-      },
+      { sessionId, cwd: options.cwd, ...sessionParams(options) },
       // Replaying a long conversation through session/load is not a control call.
       { timeout: resume ? timeout : Math.max(60_000, timeout) },
     )
@@ -731,11 +727,7 @@ export class AcpClient {
     const session = this.sessions.get(sessionId)
     const option = session?.configOptions.find((option) => option.id === configId)
     if (option?.currentValue === value) return
-    const result = await this.request(
-      "session/set_config_option",
-      { sessionId, configId, value },
-      { timeout: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS },
-    )
+    const result = await this.request("session/set_config_option", { sessionId, configId, value })
     if (session) {
       session.configOptions = Array.isArray(result.configOptions)
         ? result.configOptions
@@ -752,11 +744,7 @@ export class AcpClient {
   }
 
   async setMode(sessionId: string, modeId: string) {
-    return this.request(
-      "session/set_mode",
-      { sessionId, modeId },
-      { timeout: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS },
-    )
+    return this.request("session/set_mode", { sessionId, modeId })
   }
 
   /** Send a prompt turn and stream `session/update` notifications. */
@@ -805,12 +793,10 @@ export class AcpClient {
       }
       return { stopReason: result?.stopReason ?? "end_turn", text }
     } finally {
-      if (this.sessions.get(sessionId)?.onUpdate === onUpdate) {
-        const current = this.sessions.get(sessionId)
-        if (current) {
-          current.onUpdate = undefined
-          current.requestPermission = undefined
-        }
+      const current = this.sessions.get(sessionId)
+      if (current?.onUpdate === onUpdate) {
+        current.onUpdate = undefined
+        current.requestPermission = undefined
       }
     }
   }
@@ -863,11 +849,8 @@ export class AcpClient {
       return
     }
     try {
-      await this.request(
-        "session/close",
-        { sessionId },
-        { timeout: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS },
-      )
+      await this.request("session/close", { sessionId })
+
     } catch {
       // close is best effort
     }

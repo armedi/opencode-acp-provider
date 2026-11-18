@@ -1,7 +1,6 @@
 import { boundedMessages, historyLimits, isAuxiliaryRequest, type ChatMessage } from "./prompt.ts"
-import { sleep } from "./util.ts"
-
-type Log = (level: "debug" | "info" | "warn" | "error", message: string) => void
+import type { LogFn } from "./server-manager.ts"
+import { errorMessage, sleep } from "./util.ts"
 
 export interface AcpLanguageModelOptions {
   /** ACP server id, as registered with the manager. */
@@ -12,7 +11,7 @@ export interface AcpLanguageModelOptions {
   url: string
   /** Bearer token required by the shim, when it enforces one. */
   token?: string
-  log?: Log
+  log?: LogFn
   includeSystem?: boolean
   historyTurns?: number
   historyChars?: number
@@ -136,7 +135,7 @@ function failureText(error: unknown, depth = 0): string {
  * saw the turn, so asking again cannot duplicate it. Once headers arrive the
  * caller owns the stream, so a mid-stream reset is left to OpenCode's retry.
  */
-async function post(url: string, init: RequestInit, log?: Log) {
+async function post(url: string, init: RequestInit, log?: LogFn) {
   for (let attempt = 0; ; attempt++) {
     try {
       return await fetch(url, init)
@@ -206,7 +205,7 @@ interface ToolProgress {
  * reasoning fragments are closed around tool calls so the transcript keeps the
  * agent's actual order (text, card, text).
  */
-function translate(body: ReadableStream<Uint8Array>, log?: Log) {
+function translate(body: ReadableStream<Uint8Array>, log?: LogFn) {
   let textID: string | undefined
   let reasoningID: string | undefined
   let textSeq = 0
@@ -342,7 +341,7 @@ function translate(body: ReadableStream<Uint8Array>, log?: Log) {
     } catch (error) {
       failed = true
       failure = error
-      log?.("warn", `acp language model stream failed: ${error instanceof Error ? error.message : String(error)}`)
+      log?.("warn", `acp language model stream failed: ${errorMessage(error)}`)
     } finally {
       closeText()
       closeReasoning()

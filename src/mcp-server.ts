@@ -7,7 +7,8 @@ import type { Plugin } from "@opencode/plugin"
 import packageJson from "../package.json" with { type: "json" }
 import type { AcpMcpServer } from "./acp-client.ts"
 import type { LogFn, McpLease } from "./server-manager.ts"
-import { basicAuth, BodyTooLargeError, readBody, sleep } from "./util.ts"
+import type { LocalService } from "./steering.ts"
+import { basicAuth, BodyTooLargeError, endFailedResponse, errorMessage, listenLocal, readBody, sleep } from "./util.ts"
 
 type Ctx = Plugin.Context
 
@@ -76,7 +77,7 @@ export interface McpServerOptions {
   ctx: Ctx
   log?: LogFn
   /** Local OpenCode service that can create forms with a location. Resolved per question. */
-  localService?: { url: string; password: string } | (() => Promise<{ url: string; password: string } | undefined>)
+  localService?: LocalServiceSource
   transport?: "stdio" | "http"
   /** Runtime that can execute a JavaScript file, e.g. "node" or "bun". */
   runtime?: string
@@ -88,6 +89,8 @@ export interface McpServerHandle {
   issue: (sessionKey: string) => McpLease
   close: () => Promise<void>
 }
+
+type LocalServiceSource = LocalService | (() => Promise<LocalService | undefined>)
 
 interface McpTool {
   name: string
@@ -152,35 +155,15 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
 
   const server = createServer((req, res) => {
     void handleRequest(req, res).catch((error) => {
-      log("error", `MCP request failed: ${error instanceof Error ? error.message : String(error)}`)
-      if (!res.headersSent) {
-        try {
-          res.writeHead(500, { "content-type": "application/json" })
-        } catch {
-          // connection closed
-        }
-      }
-      if (!res.writableEnded) {
-        try {
-          res.end()
-        } catch {
-          // connection closed
-        }
-      }
+      log("error", `MCP request failed: ${errorMessage(error)}`)
+      endFailedResponse(res)
     })
   })
   server.requestTimeout = 0
   server.timeout = 0
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject)
-    server.listen(0, "127.0.0.1", () => resolve())
-  })
-  const address = server.address()
-  const port = typeof address === "object" && address ? address.port : 0
-  const url = `http://127.0.0.1:${port}/mcp`
+  const url = `http://127.0.0.1:${await listenLocal(server)}/mcp`
   log("info", `OpenCode MCP bridge listening on ${url} (${transport})`)
-
 
   function buildServers(token: string): AcpMcpServer[] {
     if (transport === "http") {
@@ -318,7 +301,7 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
       inFlight.set(requestKey, requestController)
       try {
         responses.push(
-          await dispatch(message, auth.sessionKey, combineSignals(controller.signal, requestController.signal)),
+          await dispatch(message, auth.sessionKey, AbortSignal.any([controller.signal, requestController.signal])),
         )
       } finally {
         inFlight.delete(requestKey)
@@ -387,7 +370,7 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
             log("debug", `MCP tool ${name} finished in ${Date.now() - startedAt}ms`)
             return reply(result)
           } catch (error) {
-            const text = error instanceof Error ? error.message : String(error)
+            const text = errorMessage(error)
             log("debug", `MCP tool ${name} failed in ${Date.now() - startedAt}ms: ${text}`)
             return reply({ content: [{ type: "text", text }], isError: true })
           }
@@ -402,7 +385,7 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
           return fail(-32601, `Method not found: ${message.method}`)
       }
     } catch (error) {
-      return fail(-32603, error instanceof Error ? error.message : String(error))
+      return fail(-32603, errorMessage(error))
     }
   }
 
@@ -459,7 +442,7 @@ function answeredQuestions(questions: any[], answer: Record<string, unknown>) {
  */
 async function askViaForm(
   ctx: Ctx,
-  service: { url: string; password: string },
+  service: LocalService,
   sessionKey: string,
   args: any,
   signal: AbortSignal,
@@ -484,7 +467,7 @@ async function askViaForm(
     body: JSON.stringify({ title: "Questions", metadata: { kind: "question" }, fields: questionFields(questions) }),
     signal,
   }).catch((error) => {
-    throw new QuestionFormError(error instanceof Error ? error.message : String(error))
+    throw new QuestionFormError(errorMessage(error))
   })
   if (!created.ok) {
     const detail = await created.text().catch(() => "")
@@ -524,7 +507,7 @@ async function askViaForm(
 async function buildInstructions(
   ctx: Ctx,
   sessionKey: string,
-  service?: { url: string; password: string } | (() => Promise<{ url: string; password: string } | undefined>),
+  service?: LocalServiceSource,
   log?: LogFn,
 ) {
   // Only the names are used here.
@@ -564,7 +547,7 @@ async function buildInstructions(
 async function buildTools(
   ctx: Ctx,
   sessionKey: string,
-  localService?: { url: string; password: string } | (() => Promise<{ url: string; password: string } | undefined>),
+  localService?: LocalServiceSource,
   log?: LogFn,
   { describe = true }: { describe?: boolean } = {},
 ): Promise<McpTool[]> {
@@ -737,7 +720,7 @@ async function buildTools(
         cursor: stringSchema("Paging cursor."),
       }),
       call: async (args, signal) => {
-        await assertList(ctx, sessionKey, signal)
+        await assertSession(ctx, sessionKey, "*", "list", signal)
         return toMcpResult(await ctx.session.list(args ?? {}))
       },
     },
@@ -817,7 +800,8 @@ async function buildTools(
     {
       name: "session_interrupt",
       description: "Interrupt a session's active run. Mirrors session.interrupt.",
-      inputSchema: objectSchema({ sessionID: stringSchema("Target session ID."), resume: { type: "boolean" } }, ["sessionID"]) as Record<string, unknown>,
+      inputSchema: objectSchema({ sessionID: stringSchema("Target session ID."), resume: { type: "boolean" } }, ["sessionID"]),
+
       call: async (args, signal) => {
         await assertSession(ctx, sessionKey, args.sessionID, "interrupt", signal)
         return toMcpResult(await ctx.session.interrupt(args))
@@ -844,6 +828,10 @@ async function subagentDescription(ctx: Ctx) {
   return parts.join("\n")
 }
 
+/**
+ * Ask for the `session` permission on a target session. Listing spans sessions,
+ * so it is asserted against `"*"` and needs an explicit permission of its own.
+ */
 async function assertSession(ctx: Ctx, caller: string, target: any, operation: string, signal: AbortSignal) {
   if (!target) throw new Error(`session ${operation} requires a sessionID`)
   try {
@@ -856,23 +844,8 @@ async function assertSession(ctx: Ctx, caller: string, target: any, operation: s
   } catch (error) {
     if (signal.aborted) throw error
     const message = error instanceof Error && error.message ? `: ${error.message}` : ""
-    throw new Error(`Permission denied: session ${operation} on ${target}${message}`)
-  }
-}
-
-/** Listing spans sessions, so it needs an explicit permission of its own. */
-async function assertList(ctx: Ctx, caller: string, signal: AbortSignal) {
-  try {
-    await ctx.permission.assert({
-      sessionID: caller as any,
-      action: "session",
-      resources: ["*"],
-      metadata: { operation: "list" },
-    } as any)
-  } catch (error) {
-    if (signal.aborted) throw error
-    const message = error instanceof Error && error.message ? `: ${error.message}` : ""
-    throw new Error(`Permission denied: session list${message}`)
+    const scope = target === "*" ? "" : ` on ${target}`
+    throw new Error(`Permission denied: session ${operation}${scope}${message}`)
   }
 }
 
@@ -899,20 +872,6 @@ function waitForAbort(signal: AbortSignal): Promise<"cancelled"> {
   })
 }
 
-function combineSignals(...signals: AbortSignal[]): AbortSignal {
-  if (signals.length === 1) return signals[0]!
-  const anyOf = (AbortSignal as unknown as { any?: (list: AbortSignal[]) => AbortSignal }).any
-  if (typeof anyOf === "function") return anyOf(signals)
-  const controller = new AbortController()
-  for (const signal of signals) {
-    if (signal.aborted) {
-      controller.abort(signal.reason)
-      break
-    }
-    signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true })
-  }
-  return controller.signal
-}
 
 function toMcpResult(value: any) {
   const output = value && typeof value === "object" && "output" in value ? value.output : value

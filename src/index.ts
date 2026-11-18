@@ -15,12 +15,12 @@ import { boundedMessages, historyLimits, recentConversation } from "./prompt.ts"
 import { createAcpLanguageModel } from "./language-model.ts"
 import { createMcpServer } from "./mcp-server.ts"
 import { createOpenCodeMcpSource } from "./mcp-config.ts"
-import { createSteering } from "./steering.ts"
+import { createSteering, type LocalService } from "./steering.ts"
 import { createSkillMirror } from "./skills.ts"
 import { createCommandBridge } from "./commands.ts"
 import { effortLevels, readInventory, writeInventory, type AcpInventory } from "./inventory.ts"
 import { debugLog } from "./debug.ts"
-import { agentName } from "./util.ts"
+import { agentName, errorMessage } from "./util.ts"
 
 type LogLevel = "debug" | "info" | "warn" | "error"
 
@@ -87,10 +87,6 @@ function storedSessionKey(poolKey: string) {
   return `acp-session/${createHash("sha256").update(poolKey).digest("hex")}`
 }
 
-interface LocalService {
-  url: string
-  password: string
-}
 
 /**
  * A `serve --service` server records its address and password next to its
@@ -156,7 +152,7 @@ export default Plugin.define({
         // and the mirror picks them up on `skill.updated`.
         skills = await createSkillMirror(ctx, { include: skillFilter, log })
       } catch (error) {
-        log("warn", `OpenCode skills mirror disabled: ${error instanceof Error ? error.message : String(error)}`)
+        log("warn", `OpenCode skills mirror disabled: ${errorMessage(error)}`)
       }
     }
 
@@ -171,7 +167,7 @@ export default Plugin.define({
           runtime: options.mcpRuntime,
         })
       } catch (error) {
-        log("warn", `OpenCode MCP bridge disabled: ${error instanceof Error ? error.message : String(error)}`)
+        log("warn", `OpenCode MCP bridge disabled: ${errorMessage(error)}`)
       }
     }
 
@@ -181,7 +177,7 @@ export default Plugin.define({
     try {
       openCodeMcp = await createOpenCodeMcpSource(ctx, log)
     } catch (error) {
-      log("warn", `OpenCode MCP servers disabled: ${error instanceof Error ? error.message : String(error)}`)
+      log("warn", `OpenCode MCP servers disabled: ${errorMessage(error)}`)
     }
 
     // A plugin reload or a crashed agent starts a new process with no in-memory
@@ -376,7 +372,7 @@ export default Plugin.define({
       } catch (error) {
         log(
           "warn",
-          `could not refresh models for ACP server "${id}": ${error instanceof Error ? error.message : String(error)}`,
+          `could not refresh models for ACP server "${id}": ${errorMessage(error)}`,
         )
       }
       return true
@@ -390,7 +386,7 @@ export default Plugin.define({
       } catch (error) {
         log(
           "debug",
-          `could not cache models for ACP server "${state.config.id}": ${error instanceof Error ? error.message : String(error)}`,
+          `could not cache models for ACP server "${state.config.id}": ${errorMessage(error)}`,
         )
       }
     }
@@ -415,7 +411,7 @@ export default Plugin.define({
             if (disposed) return
             log(
               "warn",
-              `ACP server "${state.config.id}" retry failed: ${error instanceof Error ? error.message : String(error)}`,
+              `ACP server "${state.config.id}" retry failed: ${errorMessage(error)}`,
             )
             scheduleRetry(state, attempt + 1)
           }
@@ -481,6 +477,8 @@ export default Plugin.define({
       // Reserve provider ids in configuration order so a server that succeeds
       // late cannot steal the id of one that already registered.
       for (const state of manager.list) providerIDForServer(state.config.id)
+      // Every provider id is reserved above, so this reverse map is complete.
+      const serverForProvider = new Map([...providerIDs].map(([server, providerID]) => [providerID, server]))
 
       // A server whose models were discovered before, in another location or an
       // earlier process, is registered now, so this location resolves them
@@ -504,29 +502,28 @@ export default Plugin.define({
       // fires while they initialize is already being watched.
       if (options.commands !== false) {
         try {
-          const providerToServer = new Map([...providerIDs].map(([server, providerID]) => [providerID, server]))
           commandBridge = await createCommandBridge({
             ctx,
             manager,
-            serverForProvider: (providerID) => providerToServer.get(providerID),
+            serverForProvider: (providerID) => serverForProvider.get(providerID),
             log,
           })
         } catch (error) {
           commandBridge = undefined
-          log("warn", `ACP commands disabled: ${error instanceof Error ? error.message : String(error)}`)
+          log("warn", `ACP commands disabled: ${errorMessage(error)}`)
         }
       }
 
       // Supply the ACP language model to OpenCode's AI SDK layer. Tool calls the
       // agent runs itself come back as provider-executed parts, so the session
       // shows the real shell/read/edit card without routing the tool.
-      const acpProviderIDs = new Set(providerIDs.values())
+
       // Auxiliary calls share the OpenCode session id, but must not write to
       // the ACP agent's conversation. Carry the typed request kind to the shim
       // through both the AI SDK and OpenAI-compatible provider routes.
       registrations.push(
         await ctx.session.hook("model.request", (event) => {
-          if (!acpProviderIDs.has(event.model.providerID)) return
+          if (!serverForProvider.has(event.model.providerID)) return
           event.headers["x-acp-request-kind"] = event.kind
         }),
       )
@@ -535,7 +532,7 @@ export default Plugin.define({
         registrations.push(
           await ctx.aisdk.hook("sdk", (evt) => {
             if (evt.package !== "acp") return
-            if (!acpProviderIDs.has(evt.model.providerID as string)) return
+            if (!serverForProvider.has(evt.model.providerID as string)) return
             const target = resolveModel(String(evt.model.modelID ?? ""))
             if (!target) return
             evt.sdk = {
@@ -558,7 +555,7 @@ export default Plugin.define({
         // its model request before that happens, without changing the transcript.
         for (const kind of ["context", "generate", "title"] as const) {
           registrations.push(await ctx.session.hook(kind, (event) => {
-            if (!acpProviderIDs.has(event.model.providerID)) return
+            if (!serverForProvider.has(event.model.providerID)) return
             const includeSystem = kind !== "context" || options.includeSystem === true
             if (!includeSystem) event.system = []
             const messages: typeof event.messages = []
@@ -576,7 +573,8 @@ export default Plugin.define({
       // keeps the recent conversation for a new ACP session to replay.
       registrations.push(
         await ctx.session.hook("compaction", async (evt) => {
-          const server = [...providerIDs].find(([, providerID]) => providerID === evt.model.providerID)?.[0]
+          const server = serverForProvider.get(evt.model.providerID)
+
           const state = server ? manager.get(server) : undefined
           if (!server || !state) return
           const agent = agentName(state.config)
@@ -585,7 +583,7 @@ export default Plugin.define({
             const result = await manager.compact({ server, key: evt.sessionID })
             outcome = compactionOutcome(agent, result)
           } catch (error) {
-            const message = error instanceof Error ? error.message : String(error)
+            const message = errorMessage(error)
             log("warn", `ACP /compact failed for ${server}: ${message}`)
             outcome = `${agent} could not compact its context: ${message}`
           }
@@ -629,13 +627,13 @@ export default Plugin.define({
           }
         } catch (error) {
           if (disposed) return
-          log("warn", `could not register ACP server "${state.config.id}": ${error instanceof Error ? error.message : String(error)}`)
+          log("warn", `could not register ACP server "${state.config.id}": ${errorMessage(error)}`)
         }
         scheduleRetry(state, 0)
       }).then(() => {
         if (!disposed) log("info", `registered ${registered.size} ACP provider(s) in ${Date.now() - setupStartedAt}ms`)
       }).catch((error) => {
-        if (!disposed) log("error", `ACP discovery failed: ${error instanceof Error ? error.message : String(error)}`)
+        if (!disposed) log("error", `ACP discovery failed: ${errorMessage(error)}`)
       })
       return cleanup
     } catch (error) {
