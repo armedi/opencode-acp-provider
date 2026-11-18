@@ -1,3 +1,5 @@
+import { boundedMessages, historyLimits, isAuxiliaryRequest, type ChatMessage } from "./prompt.ts"
+
 type Log = (level: "debug" | "info" | "warn" | "error", message: string) => void
 
 export interface AcpLanguageModelOptions {
@@ -10,6 +12,9 @@ export interface AcpLanguageModelOptions {
   /** Bearer token required by the shim, when it enforces one. */
   token?: string
   log?: Log
+  includeSystem?: boolean
+  historyTurns?: number
+  historyChars?: number
 }
 
 /**
@@ -19,6 +24,7 @@ export interface AcpLanguageModelOptions {
  * tool parts instead of running anything itself.
  */
 export function createAcpLanguageModel(options: AcpLanguageModelOptions) {
+  const limits = historyLimits(options)
   const model = {
     specificationVersion: "v3" as const,
     provider: "acp",
@@ -47,7 +53,9 @@ export function createAcpLanguageModel(options: AcpLanguageModelOptions) {
           body: JSON.stringify({
             model: `${options.server}::${options.model}`,
             stream: true,
-            messages: toMessages(call.prompt),
+            messages: boundedMessages(
+              call.prompt ?? [], limits, options.includeSystem === true || isAuxiliaryRequest(requestKind),
+            ).map(({ message, text }) => ({ role: message.role, content: text })),
             reasoning_effort: effortOf(call.providerOptions),
           }),
           signal: call.abortSignal ?? undefined,
@@ -103,16 +111,11 @@ export function createAcpLanguageModel(options: AcpLanguageModelOptions) {
 }
 
 interface CallOptions {
-  prompt?: PromptMessage[]
+  prompt?: ChatMessage[]
   headers?: Record<string, string>
   providerOptions?: Record<string, unknown>
   abortSignal?: AbortSignal
 }
-interface PromptMessage {
-  role: string
-  content: string | Array<{ type?: string; text?: string }>
-}
-
 /** Transport failures worth one more attempt before the model call fails. */
 const RETRYABLE_TRANSPORT = /ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|other side closed|fetch failed/i
 const RETRY_DELAYS_MS = [150, 600]
@@ -198,28 +201,6 @@ function effortOf(providerOptions: unknown): string | undefined {
     return undefined
   }
   return walk(providerOptions, 0)
-}
-
-function textOf(item: { type?: string; text?: string }) {
-  return item?.type === "text" && typeof item.text === "string" ? item.text : ""
-}
-
-/**
- * The shim only needs the visible conversation: the ACP session keeps its own
- * history, and tool parts are not replayed into a fresh agent session.
- */
-function toMessages(prompt: PromptMessage[] | undefined) {
-  const messages: Array<{ role: string; content: string }> = []
-  for (const message of prompt ?? []) {
-    if (typeof message.content === "string") {
-      if (message.content.trim()) messages.push({ role: message.role, content: message.content })
-      continue
-    }
-    if (!Array.isArray(message.content)) continue
-    const value = message.content.map(textOf).filter(Boolean).join("\n")
-    if (value.trim()) messages.push({ role: message.role, content: value })
-  }
-  return messages
 }
 
 /**
@@ -372,6 +353,9 @@ function translate(body: ReadableStream<Uint8Array>, log?: Log) {
             frame = JSON.parse(data)
           } catch {
             continue
+          }
+          if (frame?.error) {
+            throw new Error(typeof frame.error.message === "string" ? frame.error.message : "ACP shim stream failed")
           }
           const choice = frame?.choices?.[0]
           if (choice?.delta) handleDelta(choice.delta)

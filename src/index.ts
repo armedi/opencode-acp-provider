@@ -10,7 +10,8 @@ import {
   type AcpServerState,
   type AcpSessionStore,
 } from "./server-manager.ts"
-import { createShim, historyLimits, recentConversation, type ChatMessage } from "./shim.ts"
+import { createShim } from "./shim.ts"
+import { boundedMessages, historyLimits, recentConversation } from "./prompt.ts"
 import { createAcpLanguageModel } from "./language-model.ts"
 import { createMcpServer } from "./mcp-server.ts"
 import { createOpenCodeMcpSource } from "./mcp-config.ts"
@@ -462,6 +463,7 @@ export default Plugin.define({
           event.headers["x-acp-request-kind"] = event.kind
         }),
       )
+      const limits = historyLimits(options)
       if (nativeToolParts) {
         registrations.push(
           await ctx.aisdk.hook("sdk", (evt) => {
@@ -477,17 +479,34 @@ export default Plugin.define({
                   url: shim.url,
                   token: shimToken,
                   log,
+                  includeSystem: options.includeSystem,
+                  historyTurns: options.historyTurns,
+                  historyChars: options.historyChars,
                 }),
             }
           }),
         )
+      } else {
+        // The native HTTP provider serializes these messages itself. Trim
+        // its model request before that happens, without changing the transcript.
+        for (const kind of ["context", "generate", "title"] as const) {
+          registrations.push(await ctx.session.hook(kind, (event) => {
+            if (!acpProviderIDs.has(event.model.providerID)) return
+            const includeSystem = kind !== "context" || options.includeSystem === true
+            if (!includeSystem) event.system = []
+            const messages: typeof event.messages = []
+            for (const { message, text } of boundedMessages(event.messages, limits, includeSystem)) {
+              if (message.role !== "tool") messages.push({ ...message, content: [{ type: "text", text }] })
+            }
+            event.messages = messages
+          }))
+        }
       }
 
       // The agent holds the conversation in its reused ACP session, so an
       // OpenCode summary turn would cost a full prompt and never be read.
       // Compaction goes to the agent's own /compact instead, and the summary
       // keeps the recent conversation for a new ACP session to replay.
-      const limits = historyLimits(options)
       registrations.push(
         await ctx.session.hook("compaction", async (evt) => {
           const server = [...providerIDs].find(([, providerID]) => providerID === evt.model.providerID)?.[0]
@@ -503,25 +522,20 @@ export default Plugin.define({
             log("warn", `ACP /compact failed for ${server}: ${message}`)
             outcome = `${agent} could not compact its context: ${message}`
           }
-          const recent = recentConversation(evt.messages as ChatMessage[], limits)
+          const recent = recentConversation(evt.messages, limits)
           evt.result = { summary: recent ? `${outcome}\n\nRecent conversation:\n\n${recent}` : outcome }
         }),
       )
 
-      // A message the user sends mid-turn is parked until the next step, and an
-      // ACP turn is one step. Offer it to the running turn instead, and drop
-      // OpenCode's copy once an agent has taken it.
+      // An ACP turn is one OpenCode step. Interrupt it on a steer and let the
+      // host deliver the complete message at the next step boundary.
       const steer = createSteering({
         manager,
         localService: () => readLocalService(),
         directory: ctx.location.directory,
         log,
       })
-      registrations.push(
-        // Check for an existing turn before admission can start this prompt's
-        // own turn. Only inbox cleanup may outlive the admission hook.
-        await ctx.session.hook("prompt", steer),
-      )
+      registrations.push(await ctx.session.hook("prompt", steer))
 
       // Hooks must be in place before models become selectable. Discovery then
       // runs in parallel without holding up OpenCode or neighboring providers.

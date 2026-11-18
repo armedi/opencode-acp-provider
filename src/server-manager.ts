@@ -1,5 +1,3 @@
-import { execFile } from "node:child_process"
-import { promisify } from "node:util"
 import {
   AcpClient,
   AcpError,
@@ -10,8 +8,6 @@ import {
 } from "./acp-client.ts"
 import { applyCmdSkillFlag } from "./skills.ts"
 import { isCmdCommand } from "./agent-command.ts"
-
-const execFileAsync = promisify(execFile)
 
 export interface AcpServerConfig {
   /** Stable id used for the OpenCode provider and tool arguments. */
@@ -171,15 +167,6 @@ interface AcpRunResult {
   text: string
 }
 
-/** What happened to a mid-turn message handed to `AcpServerManager.steer`. */
-export type AcpSteerResult =
-  /** The agent took the text into the turn that was already running. */
-  | { status: "steered" }
-  /** The agent cannot steer, so the running turn was cancelled to let the message land next. */
-  | { status: "interrupted" }
-  /** No ACP turn is running for this session, so there is nothing to steer. */
-  | { status: "unavailable" }
-
 export type AcpCompactResult =
   /** `text` is what the agent said; `tokens` is its context size before and after, when it reports them. */
   | { status: "compacted"; text: string; tokens?: { before: number; after: number } }
@@ -191,8 +178,6 @@ export type AcpCompactResult =
 const DEFAULT_MAX_SESSIONS = 32
 const DEFAULT_SESSION_IDLE_MS = 30 * 60_000
 const DEFAULT_INIT_TIMEOUT_MS = 20_000
-/** `AcpClient` uses this code when a request exceeded its timeout. */
-const ACP_REQUEST_TIMEOUT = -32001
 /** `AcpClient` uses this code when a request was cancelled. */
 const ACP_REQUEST_CANCELLED = -32800
 /** ACP's "resource not found": the agent no longer knows the session. */
@@ -202,9 +187,6 @@ const MAX_TURN_FAILURES = 3
 /** How long to wait for the command list an agent sends after `session/new`. */
 const COMMAND_SNAPSHOT_TIMEOUT_MS = 2_000
 const SWEEP_INTERVAL_MS = 60_000
-/** Do not evict a session that was created or used this recently, so a turn that is
- * between negotiation and its first `pending` increment cannot be closed under it. */
-const EVICT_MIN_IDLE_MS = 1_000
 
 export class AcpServerManager {
   readonly servers = new Map<string, AcpServerState>()
@@ -269,7 +251,8 @@ export class AcpServerManager {
     this.initTimeoutMs = input.initTimeoutMs ?? DEFAULT_INIT_TIMEOUT_MS
     this.requestTimeoutMs = input.requestTimeoutMs
     this.promptTimeoutMs = input.promptTimeoutMs
-    this.maxSessions = Math.max(1, input.maxSessions ?? DEFAULT_MAX_SESSIONS)
+    const maxSessions = input.maxSessions ?? DEFAULT_MAX_SESSIONS
+    this.maxSessions = Number.isFinite(maxSessions) ? Math.max(1, Math.floor(maxSessions)) : DEFAULT_MAX_SESSIONS
     this.sessionIdleMs = Math.max(0, input.sessionIdleMs ?? DEFAULT_SESSION_IDLE_MS)
     this.allowPathsOutsideCwd = input.allowPathsOutsideCwd === true
     this.maxFileBytes = input.maxFileBytes
@@ -548,13 +531,18 @@ export class AcpServerManager {
 
     try {
       const session = await client.newSession(config.cwd ?? this.defaultCwd, {
-        model: config.model,
         meta: config.meta,
         additionalDirectories: this.sessionDirectories(config),
       })
       if (this.disposed) throw new Error("ACP server manager is stopped")
-      let models = session.models
-      if (!models.length) models = await this.fallbackModels(config, env)
+      const defaultModel = session.currentModel ?? (session.modelConfigID ? undefined : "default")
+      let models = session.models.length
+        ? session.models
+        : defaultModel ? [{ id: defaultModel, name: session.currentModel ?? "Agent default" }] : []
+      if (!session.modelConfigID && config.model && config.model !== defaultModel) {
+        state.retryable = false
+        throw new Error(`ACP server "${config.id}" does not expose an ACP model selector; use "default" or omit "model"`)
+      }
       if (config.models?.length) {
         const allow = new Set(config.models)
         models = models.filter((model) => allow.has(model.id))
@@ -572,8 +560,8 @@ export class AcpServerManager {
         )
       }
       state.models = models
-      state.defaultModel = session.currentModel
-      state.modelConfigID = session.configOptions.find((option) => option.category === "model")?.id
+      state.defaultModel = defaultModel
+      state.modelConfigID = session.modelConfigID
       state.efforts = (session.efforts ?? []).filter((value) => value !== "default")
       state.effortConfigID = session.effort?.configId
       state.defaultEffort = session.effort?.currentValue
@@ -594,26 +582,6 @@ export class AcpServerManager {
       await client.stop().catch(() => {})
       if (state.client === client) state.client = undefined
       throw error
-    }
-  }
-
-  private async fallbackModels(config: AcpServerConfig, env: Record<string, string>): Promise<AcpModelInfo[]> {
-    const { command, args } = normalizeCommand(config.command)
-    try {
-      const { stdout } = await execFileAsync(command, [...args, "--list-models"], {
-        timeout: 15_000,
-        cwd: config.cwd ?? this.defaultCwd,
-        env: { ...process.env, ...env },
-      })
-      const models: AcpModelInfo[] = []
-      for (const line of stdout.split("\n")) {
-        const match = line.trim().match(/^([A-Za-z0-9][\w./:-]*)\s{2,}(.+)$/)
-        if (match) models.push({ id: match[1], name: match[2].trim() })
-      }
-      return models
-    } catch (error) {
-      this.log("warn", `could not list models for "${config.id}": ${error instanceof Error ? error.message : String(error)}`)
-      return []
     }
   }
 
@@ -642,7 +610,6 @@ export class AcpServerManager {
     // is not mistaken for an idle session.
     const key = input.key
     let starting = false
-    let started = false
     if (key) {
       starting = true
       this.starting.set(key, (this.starting.get(key) ?? 0) + 1)
@@ -663,7 +630,11 @@ export class AcpServerManager {
       if (!client) throw new Error(`ACP server "${input.server}" is not ready`)
 
       const cwd = state.config.cwd ?? this.defaultCwd
-      const model = input.model ?? state.config.model ?? state.defaultModel
+      const requestedModel = input.model ?? state.config.model ?? state.defaultModel
+      if (!state.modelConfigID && requestedModel !== state.defaultModel) {
+        throw new Error(`ACP server "${input.server}" does not expose an ACP model selector`)
+      }
+      const model = state.modelConfigID ? requestedModel : undefined
       const mode = state.config.mode
       const effort = this.resolveEffort(state, input.effort)
       const onPermission = this.permissionHandler(input.server, input.sessionKey)
@@ -689,16 +660,15 @@ export class AcpServerManager {
       }
 
       const poolKey = this.poolKey(input.server, input.key, cwd)
+      const existing = this.pools.get(poolKey)
       let negotiating = this.negotiating.get(poolKey)
-      if (!negotiating) {
-        negotiating = (async () => {
-          const existing = this.pools.get(poolKey)
-          if (existing) {
-            this.log("debug", `reusing ACP session ${existing.sessionId} for key ${input.key!.slice(0, 24)}`)
-            return existing
-          }
+      if (!existing && !negotiating) {
+        const eviction = this.reserveCapacity()
+        // Install this reservation before the negotiation can open a session.
+        negotiating = Promise.resolve().then(async () => {
+          if (eviction) await eviction
+          if (this.disposed) throw new Error("ACP server manager is stopped")
           const sessionStartedAt = Date.now()
-          this.evictForCapacity()
           const lease = this.mcp?.servers(input.key!, state.config)
           let session: { sessionId: string } | undefined
           let reused = false
@@ -782,11 +752,20 @@ export class AcpServerManager {
             `opened ACP session ${session.sessionId} for key ${input.key!.slice(0, 24)} in ${Date.now() - sessionStartedAt}ms`,
           )
           return created
-        })()
+        })
         this.negotiating.set(poolKey, negotiating)
-        negotiating.finally(() => this.negotiating.delete(poolKey)).catch(() => {})
       }
-      const pooled = await negotiating
+      let pooled: PooledSession
+      if (existing) {
+        pooled = existing
+        this.log("debug", `reusing ACP session ${pooled.sessionId} for key ${input.key.slice(0, 24)}`)
+      } else {
+        try {
+          pooled = await negotiating!
+        } finally {
+          if (this.negotiating.get(poolKey) === negotiating) this.negotiating.delete(poolKey)
+        }
+      }
       if (pooled.broken || this.pools.get(poolKey) !== pooled) {
         throw new Error(`ACP session for key ${input.key.slice(0, 24)} was closed after an earlier turn failed`)
       }
@@ -804,7 +783,6 @@ export class AcpServerManager {
             ? input.prompt
             : pooled.history === "retained" ? input.prompt.reused : input.prompt.fresh
         pooled.active += 1
-        started = true
         finishStarting()
         pooled.history = "retained"
         const turn = pooled.client
@@ -850,7 +828,7 @@ export class AcpServerManager {
         const message = error instanceof Error ? error.message : String(error)
         const unknown = isUnknownSession(error)
         if (unknown || !pooled.client.alive || !pooled.client.hasSession(pooled.sessionId)) {
-          this.dropPool(poolKey, pooled)
+          void this.dropPool(poolKey, pooled)
           if (unknown) void this.forgetSession(poolKey)
           return
         }
@@ -864,7 +842,7 @@ export class AcpServerManager {
         }
         if (pooled.failures >= MAX_TURN_FAILURES) {
           this.log("warn", `dropping ACP session ${pooled.sessionId} after ${pooled.failures} failed turns: ${message}`)
-          this.dropPool(poolKey, pooled)
+          void this.dropPool(poolKey, pooled)
           // A session that failed this many times in a row should not be restored
           // into the same state on the next turn.
           void this.forgetSession(poolKey)
@@ -877,18 +855,17 @@ export class AcpServerManager {
       })
       return await run
     } finally {
-      // A turn that never reached its prompt must not leave a cancel behind.
-      if (key && !started) this.startCancels.delete(key)
       finishStarting()
+      if (key && !this.starting.has(key)) this.startCancels.delete(key)
     }
   }
 
   /** Drop a pooled session on our side, leaving its stored id unless callers forget it. */
-  private dropPool(poolKey: string, pooled: PooledSession) {
+  private async dropPool(poolKey: string, pooled: PooledSession) {
     pooled.broken = true
     if (this.pools.get(poolKey) === pooled) this.pools.delete(poolKey)
     pooled.mcpRelease?.()
-    void pooled.client.closeSession(pooled.sessionId).catch(() => {})
+    await pooled.client.closeSession(pooled.sessionId).catch(() => {})
   }
 
   /**
@@ -901,71 +878,18 @@ export class AcpServerManager {
     return [...this.pools.values()].some((entry) => entry.key === key && entry.active > 0 && !entry.broken)
   }
 
-  /**
-   * Deliver a message into the turn that is running for an OpenCode session.
-   *
-   * An agent that advertises `_session/steering` takes the text where it is, so
-   * the caller can drop the queued OpenCode message and avoid delivering it
-   * twice. Every other agent is interrupted instead: the turn ends at its next
-   * safe point and OpenCode delivers the queued message as its own prompt, which
-   * resumes the same ACP session with its context intact.
-   *
-   * `plain` is false when the message carries files or expands skills. Those
-   * parts are not in `text`, so the turn is interrupted rather than injected:
-   * OpenCode then delivers the full message at the boundary.
-   */
-  async steer(input: {
-    key: string
-    text: string
-    inPlace?: boolean
-    plain?: boolean
-  }): Promise<AcpSteerResult> {
+  /** End the current ACP turn so OpenCode can deliver its queued steer next. */
+  interrupt(key: string) {
     const pooled = [...this.pools.values()]
-      .filter((entry) => entry.key === input.key && entry.active > 0 && !entry.broken)
+      .filter((entry) => entry.key === key && entry.active > 0 && !entry.broken)
       .sort((left, right) => right.lastUsed - left.lastUsed)[0]
     if (!pooled) {
-      // The turn is still negotiating its ACP session. Cancel it as soon as the
-      // prompt starts so the message lands at the next boundary instead of
-      // waiting for the whole turn.
-      if (this.starting.has(input.key)) {
-        this.startCancels.add(input.key)
-        this.log("debug", `cancel requested for ACP turn ${input.key.slice(0, 24)} before its prompt started`)
-        return { status: "interrupted" }
-      }
-      return { status: "unavailable" }
+      if (this.starting.has(key)) this.startCancels.add(key)
+      return
     }
 
-    const client = pooled.client
-    pooled.lastUsed = Date.now()
-    if (input.inPlace !== false && input.plain !== false && client.supportsSteering) {
-      try {
-        const result = await client.steer(pooled.sessionId, input.text)
-        if (result.outcome === "injected" || result.outcome === "startedNewTurn") {
-          this.log("debug", `steered ACP session ${pooled.sessionId} (${result.outcome})`)
-          return { status: "steered" }
-        }
-        this.log(
-          "debug",
-          `ACP session ${pooled.sessionId} did not take the steer: ${result.outcome}${result.reason ? ` (${result.reason})` : ""}`,
-        )
-      } catch (error) {
-        if (error instanceof AcpError && error.code === ACP_REQUEST_TIMEOUT) {
-          // The steer may or may not have landed. Interrupting now could undo
-          // work the agent already accepted, so leave the queued message for
-          // OpenCode's normal delivery instead.
-          this.log("warn", `steering ACP session ${pooled.sessionId} timed out; leaving the message queued`)
-          return { status: "unavailable" }
-        }
-        this.log(
-          "warn",
-          `could not steer ACP session ${pooled.sessionId}: ${error instanceof Error ? error.message : String(error)}`,
-        )
-      }
-    }
-
-    client.cancelTurn(pooled.sessionId)
+    pooled.client.cancelTurn(pooled.sessionId)
     this.log("debug", `interrupted ACP session ${pooled.sessionId} so the queued message can be delivered`)
-    return { status: "interrupted" }
   }
 
   /**
@@ -1012,30 +936,26 @@ export class AcpServerManager {
     return (request) => resolver({ ...request, server, sessionKey })
   }
 
-  private evictForCapacity() {
-    if (this.pools.size < this.maxSessions) return
-    const cutoff = Date.now() - EVICT_MIN_IDLE_MS
-    const candidates = [...this.pools.entries()]
-      .filter(([, pooled]) => pooled.pending === 0 && pooled.lastUsed <= cutoff)
-      .sort((left, right) => left[1].lastUsed - right[1].lastUsed)
-    for (const [key, pooled] of candidates) {
-      if (this.pools.size < this.maxSessions) break
-      this.pools.delete(key)
-      pooled.broken = true
-      pooled.mcpRelease?.()
-      void pooled.client.closeSession(pooled.sessionId).catch(() => {})
-      this.log("debug", `evicted idle ACP session ${pooled.sessionId} (capacity ${this.maxSessions})`)
+  private reserveCapacity(): Promise<void> | undefined {
+    let reserved = this.pools.size
+    for (const key of this.negotiating.keys()) if (!this.pools.has(key)) reserved++
+    if (reserved < this.maxSessions) return
+    let oldest: [string, PooledSession] | undefined
+    for (const entry of this.pools) {
+      const [key, pooled] = entry
+      if (pooled.pending > 0 || this.negotiating.has(key)) continue
+      if (!oldest || pooled.lastUsed < oldest[1].lastUsed) oldest = entry
     }
+    if (!oldest) throw new Error(`ACP session pool at capacity (${this.maxSessions}); retry after a turn finishes`)
+    this.log("debug", `evicting idle ACP session ${oldest[1].sessionId} (capacity ${this.maxSessions})`)
+    return this.dropPool(...oldest)
   }
 
   private sweepIdleSessions() {
     const cutoff = Date.now() - this.sessionIdleMs
     for (const [key, pooled] of this.pools) {
-      if (pooled.pending > 0 || pooled.lastUsed > cutoff) continue
-      this.pools.delete(key)
-      pooled.broken = true
-      pooled.mcpRelease?.()
-      void pooled.client.closeSession(pooled.sessionId).catch(() => {})
+      if (pooled.pending > 0 || this.negotiating.has(key) || pooled.lastUsed > cutoff) continue
+      void this.dropPool(key, pooled)
       this.log("debug", `closed idle ACP session ${pooled.sessionId} after ${this.sessionIdleMs}ms`)
     }
   }

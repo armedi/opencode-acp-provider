@@ -30,19 +30,6 @@ export interface PromptResult {
   text: string
 }
 
-/**
- * Outcome of `_session/steering`, the pre-standard extension shipped by
- * codex-acp and claude-agent-acp. `promptRequired` means the agent had no turn
- * that could take the message and left it with the client.
- */
-type SteeringOutcome = "injected" | "startedNewTurn" | "promptRequired" | "failed"
-
-export interface SteeringResult {
-  outcome: SteeringOutcome
-  /** Why the agent could not take the steer, e.g. "noRunningTurn". */
-  reason?: string
-}
-
 /** MCP servers the agent should connect to for a session (ACP `session/new`). */
 export type AcpMcpServer =
   | {
@@ -105,8 +92,6 @@ interface AgentHandshake {
     [key: string]: unknown
   }
   authMethods: unknown
-  /** The agent advertised `_session/steering` (`_meta.steering.supported`). */
-  steering: boolean
 }
 
 /**
@@ -207,8 +192,6 @@ interface RequestOptions {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
-/** Steering may wait for a pending permission or elicitation to settle inside the agent. */
-const DEFAULT_STEER_TIMEOUT_MS = 60_000
 const DEFAULT_PROMPT_TIMEOUT_MS = 30 * 60_000
 const DEFAULT_ABORT_GRACE_MS = 5_000
 const DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -283,6 +266,8 @@ export class AcpClient {
     const current = () => this.child === child && !this.disposed
     const exitWith = (error: Error) => {
       if (this.child !== child) return
+      // A broken pipe can precede process exit (or the agent can stay alive).
+      if (child.pid && child.exitCode === null && child.signalCode === null) this.killChild(child, "SIGKILL")
       this.handleExit(error)
     }
 
@@ -307,38 +292,46 @@ export class AcpClient {
     child.stdout.on("error", (error) => exitWith(error))
     child.stderr.on("error", (error) => this.log("warn", `ACP agent stderr failed: ${error.message}`))
 
-    const result = await this.request(
-      "initialize",
-      {
-        protocolVersion: 1,
-        clientCapabilities: {
-          fs: { readTextFile: true, writeTextFile: true },
-          terminal: false,
+    try {
+      const result = await this.request(
+        "initialize",
+        {
+          protocolVersion: 1,
+          clientCapabilities: {
+            fs: { readTextFile: true, writeTextFile: true },
+            terminal: false,
+          },
+          clientInfo: { name: "opencode", version: "2" },
         },
-        clientInfo: { name: "opencode", version: "2" },
-      },
-      { timeout: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS },
-    )
+        { timeout: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS },
+      )
 
-    if (this.disposed) throw new AcpError("ACP client stopped")
-    this.handshake = {
-      protocolVersion: result?.protocolVersion ?? 1,
-      agentInfo: result?.agentInfo,
-      agentCapabilities: result?.agentCapabilities ?? {},
-      authMethods: result?.authMethods ?? [],
-      // `_session/steering` is advertised out of band: the standard capability
-      // block has no room for an extension.
-      steering: result?._meta?.steering?.supported === true,
+      if (!current()) throw new AcpError("ACP agent stopped during initialization")
+      this.handshake = {
+        protocolVersion: result?.protocolVersion ?? 1,
+        agentInfo: result?.agentInfo,
+        agentCapabilities: result?.agentCapabilities ?? {},
+        authMethods: result?.authMethods ?? [],
+      }
+      this.log("debug", `initialized ACP agent ${JSON.stringify(this.handshake.agentInfo ?? {})}`)
+      return this.handshake
+    } catch (error) {
+      // Keep start() single-flight until this child is reaped, including on a
+      // timeout where the agent did not exit or close any streams.
+      if (child.pid && child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()))
+        this.killChild(child, "SIGKILL")
+        await exited
+      }
+      throw error
     }
-    this.log("debug", `initialized ACP agent ${JSON.stringify(this.handshake.agentInfo ?? {})}`)
-    return this.handshake
   }
 
   private handleExit(error: Error) {
     const report = !this.closed && !this.disposed
     this.closed = true
     this.child = undefined
-    this.started = undefined
+    if (this.handshake) this.started = undefined
     this.handshake = undefined
     this.buffer = ""
     this.stderrBuffer = ""
@@ -627,7 +620,7 @@ export class AcpClient {
     const sessionId: string = result.sessionId
     if (!sessionId) throw new AcpError("ACP agent did not return a session id", -32603)
     const configOptions: AcpConfigOption[] = result.configOptions ?? []
-    const modelOption = configOptions.find((option) => option.category === "model")
+    const modelOption = configOptions.find((option) => option.category === "model" || option.id === "model")
     const models: Array<{ id: string; name: string; description?: string }> = (modelOption?.options ?? [])
       .filter((option): option is { value: string; name?: string; description?: string } => {
         return typeof option.value === "string" && option.value.length > 0
@@ -642,6 +635,7 @@ export class AcpClient {
     this.sessions.set(sessionId, { cwd, configOptions })
 
     try {
+      if (options.model && !modelOption) throw new AcpError("Agent does not expose an ACP model selector", -32602)
       if (options.model && modelOption && options.model !== modelOption.currentValue) {
         await this.setModel(sessionId, options.model, modelOption.id ?? "model")
       }
@@ -659,6 +653,7 @@ export class AcpClient {
       sessionId,
       configOptions,
       models,
+      modelConfigID: modelOption ? modelOption.id ?? "model" : undefined,
       currentModel: options.model ?? modelOption?.currentValue,
       efforts: effort?.values ?? [],
       effort,
@@ -758,11 +753,6 @@ export class AcpClient {
     )
   }
 
-  /** Whether the agent advertised the `_session/steering` extension. */
-  get supportsSteering() {
-    return this.handshake?.steering === true
-  }
-
   /** Send a prompt turn and stream `session/update` notifications. */
   async prompt(
     sessionId: string,
@@ -817,38 +807,6 @@ export class AcpClient {
         }
       }
     }
-  }
-
-  /**
-   * Deliver a message into the turn that is running now with `_session/steering`,
-   * the pre-standard ACP extension shared by codex-acp and claude-agent-acp.
-   *
-   * The request opts into the host-owned idle fallback (`promptRequired`): when no
-   * turn can take the message, the agent hands it back instead of starting a turn
-   * whose updates this client is not listening for. The caller then keeps the
-   * message and sends it as a normal prompt.
-   */
-  async steer(
-    sessionId: string,
-    prompt: string | ContentBlock[],
-    options: { timeoutMs?: number } = {},
-  ): Promise<SteeringResult> {
-    const blocks: ContentBlock[] = typeof prompt === "string" ? [{ type: "text", text: prompt }] : prompt
-    const result = await this.request(
-      "_session/steering",
-      {
-        sessionId,
-        prompt: blocks,
-        _meta: { steering: { idleBehavior: "promptRequired" } },
-      },
-      { timeout: options.timeoutMs ?? DEFAULT_STEER_TIMEOUT_MS },
-    )
-    const outcome = result?.outcome
-    if (outcome === "injected" || outcome === "startedNewTurn" || outcome === "promptRequired" || outcome === "failed") {
-      const reason = typeof result?.reason === "string" ? result.reason : undefined
-      return reason ? { outcome, reason } : { outcome }
-    }
-    return { outcome: "failed", reason: `unexpected steering outcome: ${JSON.stringify(outcome)}` }
   }
 
   /** Ask the agent to end the running turn; `session/prompt` then resolves with `cancelled`. */

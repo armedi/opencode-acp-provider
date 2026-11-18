@@ -34,6 +34,11 @@ const configOptions = [
   },
 ]
 
+if (process.argv.includes("--list-models")) {
+  console.log("fast  Fast\nslow  Slow")
+  process.exit(0)
+}
+
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`)
 }
@@ -41,15 +46,15 @@ function send(message) {
 const replies = new Map()
 let nextRequest = 1000
 
-// `_session/steering` support is advertised by default so the client path is
-// exercised; `--no-steering` covers agents that only understand prompts.
-const steeringSupported = !process.argv.includes("--no-steering")
 const runningTurns = new Map()
 
 function argument(name) {
   const index = process.argv.indexOf(name)
   return index >= 0 ? process.argv[index + 1] : undefined
 }
+
+const pidLog = argument("--pid-log")
+if (pidLog) appendFileSync(pidLog, `${process.pid}\n`)
 
 // A sessions file lets a later process resume sessions this one opened, which
 // is how an agent survives a plugin reload. `--no-restore` keeps the same file
@@ -143,42 +148,8 @@ function handle(message) {
             ...(canRestore ? { loadSession: true } : {}),
           },
           authMethods: [],
-          ...(steeringSupported ? { _meta: { steering: { supported: true } } } : {}),
         },
       })
-    }
-    case "_session/steering": {
-      const sessionId = message.params?.sessionId
-      const text = (message.params?.prompt ?? [])
-        .filter((block) => block?.type === "text")
-        .map((block) => block.text)
-        .join("\n")
-      if (/\bfail\b/i.test(text)) {
-        return send({
-          jsonrpc: "2.0",
-          id: message.id,
-          error: { code: -32000, message: "scripted steering failure" },
-        })
-      }
-      const pending = runningTurns.get(sessionId)
-      if (!pending) {
-        const idle = message.params?._meta?.steering?.idleBehavior
-        return send({
-          jsonrpc: "2.0",
-          id: message.id,
-          result:
-            idle === "promptRequired"
-              ? { outcome: "promptRequired", reason: "noRunningTurn" }
-              : { outcome: "startedNewTurn" },
-        })
-      }
-      runningTurns.delete(sessionId)
-      update(sessionId, {
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: `steer:${text}` },
-      })
-      send({ jsonrpc: "2.0", id: pending.id, result: { stopReason: "end_turn" } })
-      return send({ jsonrpc: "2.0", id: message.id, result: { outcome: "injected" } })
     }
     case "session/new": {
       const sessionId = `sess-${nextSession++}`
@@ -188,7 +159,7 @@ function handle(message) {
       send({
         jsonrpc: "2.0",
         id: message.id,
-        result: { sessionId, configOptions: optionsFor(sessionId) },
+        result: { sessionId, configOptions: process.argv.includes("--no-model-selector") ? [] : optionsFor(sessionId) },
       })
       if (!process.argv.includes("--no-commands")) {
         update(sessionId, {
@@ -370,8 +341,9 @@ function handle(message) {
       }
 
       if (/\bsteer-me\b/i.test(text)) {
-        // Hold the turn open so the test can steer it or cancel it.
+        // Hold the turn open until the client cancels it.
         runningTurns.set(sessionId, { id: message.id, text })
+        update(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "working" } })
         return
       }
 

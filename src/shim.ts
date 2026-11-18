@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto"
 import type { AcpServerManager } from "./server-manager.ts"
 import type { SessionUpdate } from "./acp-client.ts"
 import { applyToolUpdate, type AcpToolState } from "./acp-tools.ts"
+import { buildPrompts, historyLimits, isAuxiliaryRequest, type ChatMessage } from "./prompt.ts"
 
 export interface ShimOptions {
   manager: AcpServerManager
@@ -30,81 +31,10 @@ export interface ShimOptions {
   drainTimeoutMs?: number
 }
 
-export interface ChatMessage {
-  role: string
-  content?: string | Array<{ type?: string; text?: string }>
-}
-
-interface HistoryLimits {
-  turns: number
-  chars: number
-}
-
-const DEFAULT_HISTORY_TURNS = 16
-const DEFAULT_HISTORY_CHARS = 8_192
 const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024
 const DEFAULT_DRAIN_TIMEOUT_MS = 30 * 60_000
 
 class BodyTooLargeError extends Error {}
-
-function textOf(message: ChatMessage): string {
-  if (typeof message.content === "string") return message.content
-  if (!Array.isArray(message.content)) return ""
-  return message.content
-    .filter((part) => part?.type === "text" && typeof part.text === "string")
-    .map((part) => part.text as string)
-    .join("\n")
-}
-
-function conversationTurns(messages: ChatMessage[]) {
-  return messages.filter((message) => (message.role === "user" || message.role === "assistant") && textOf(message).trim())
-}
-
-/** User and assistant turns as plain text, capped to the newest `limits.turns` and `limits.chars`. */
-function historyText(turns: ChatMessage[], limits: HistoryLimits) {
-  const history = limits.turns > 0 && limits.chars > 0 ? turns.slice(-limits.turns) : []
-  const text = history
-    .map((message) => `${message.role === "assistant" ? "Assistant" : "User"}: ${textOf(message)}`)
-    .join("\n\n")
-  return text.length > limits.chars ? `[...earlier history omitted...]\n\n${text.slice(-limits.chars)}` : text
-}
-
-export function historyLimits(options: { historyTurns?: number; historyChars?: number }): HistoryLimits {
-  return {
-    turns: Math.max(0, options.historyTurns ?? DEFAULT_HISTORY_TURNS),
-    chars: Math.max(0, options.historyChars ?? DEFAULT_HISTORY_CHARS),
-  }
-}
-
-/** The recent conversation a brand new ACP session would be given, as plain text. */
-export function recentConversation(messages: ChatMessage[], limits: HistoryLimits) {
-  return historyText(conversationTurns(messages), limits)
-}
-
-function buildPrompt(messages: ChatMessage[], includeSystem: boolean, limits: HistoryLimits) {
-  const system = messages.filter((message) => message.role === "system").map(textOf).filter(Boolean)
-  const turns = conversationTurns(messages)
-  const last = turns.pop()
-  const history = historyText(turns, limits)
-  const parts: string[] = []
-  if (includeSystem && system.length) parts.push(`System instructions:\n${system.join("\n\n")}`)
-  if (history) parts.push(`Conversation so far:\n\n${history}`)
-  parts.push(last ? textOf(last) : "")
-  return parts.filter(Boolean).join("\n\n---\n\n")
-}
-
-/**
- * A reused ACP session already holds the conversation, so only the newest user
- * turn is needed. Replaying the transcript would duplicate context and cost.
- */
-function lastUserPrompt(messages: ChatMessage[], includeSystem: boolean) {
-  const system = messages.filter((message) => message.role === "system").map(textOf).filter(Boolean)
-  const last = [...messages].reverse().find((message) => message.role !== "system" && textOf(message).trim())
-  const parts: string[] = []
-  if (includeSystem && system.length) parts.push(`System instructions:\n${system.join("\n\n")}`)
-  parts.push(last ? textOf(last) : "")
-  return parts.filter(Boolean).join("\n\n---\n\n")
-}
 
 function sessionKey(req: IncomingMessage, body: any): string | undefined {
   // x-opencode-session-id is the session itself; x-opencode-session is the
@@ -251,19 +181,6 @@ export async function createShim(options: ShimOptions) {
       return
     }
 
-    if (debug) {
-      if (!loggedRequest) {
-        loggedRequest = true
-        log("debug", `shim request keys: ${Object.keys(body).join(", ")}; headers: ${Object.keys(req.headers).join(", ")}`)
-      }
-      log(
-        "debug",
-        `shim session headers: x-opencode-session=${String(req.headers["x-opencode-session"] ?? "")} x-opencode-session-id=${String(
-          req.headers["x-opencode-session-id"] ?? "",
-        )}`,
-      )
-    }
-
     if (typeof body?.model !== "string" || !body.model) {
       res.writeHead(400, { "content-type": "application/json" })
       res.end(JSON.stringify({ error: { message: "Missing model", type: "invalid_request_error" } }))
@@ -285,16 +202,11 @@ export async function createShim(options: ShimOptions) {
     const messages: ChatMessage[] = Array.isArray(body.messages) ? body.messages : []
     const effort = effortOf(body)
     if (debug) {
-      log(
-        "debug",
-        `shim request: ${messages.length} msg(s) roles=${messages.map((message) => message.role).join(",")} effort=${effort ?? "-"} max_tokens=${body.max_tokens ?? "-"} first=${textOf(
-          messages[0] ?? { role: "", content: "" },
-        )
-          .replace(/\s+/g, " ")
-          .slice(0, 90)} last=${textOf(messages[messages.length - 1] ?? { role: "", content: "" })
-          .replace(/\s+/g, " ")
-          .slice(0, 90)}`,
-      )
+      if (!loggedRequest) {
+        loggedRequest = true
+        log("debug", `shim request keys: ${Object.keys(body).join(", ")}; headers: ${Object.keys(req.headers).join(", ")}`)
+      }
+      log("debug", `shim request: ${messages.length} msg(s), effort=${effort ?? "-"}`)
     }
     const id = `chatcmpl-${randomUUID()}`
     const created = Math.floor(Date.now() / 1000)
@@ -302,7 +214,7 @@ export async function createShim(options: ShimOptions) {
     // OpenCode's title/generate/compaction calls carry the same session id as
     // chat. They need disposable ACP sessions, not another turn in its history.
     const kind = req.headers["x-acp-request-kind"]
-    const auxiliary = kind === "title" || kind === "generate" || kind === "compaction"
+    const auxiliary = isAuxiliaryRequest(kind)
     const key = auxiliary ? undefined : sessionKey(req, body)
     if (!key && !auxiliary && !loggedOneOff) {
       loggedOneOff = true
@@ -311,14 +223,12 @@ export async function createShim(options: ShimOptions) {
     // The AI SDK provider asks for structured tool events so OpenCode can
     // render native tool cards; the OpenAI-compatible route keeps inline lines.
     const structuredTools = req.headers["x-acp-tool-events"] === "1"
-    const fresh = buildPrompt(messages, auxiliary || options.includeSystem === true, limits)
-    if (!fresh.trim()) {
+    const prompt = buildPrompts(messages, limits, auxiliary || options.includeSystem === true)
+    if (!prompt.fresh.trim()) {
       res.writeHead(400, { "content-type": "application/json" })
       res.end(JSON.stringify({ error: { message: "Empty prompt", type: "invalid_request_error" } }))
       return
     }
-    const reused = lastUserPrompt(messages, options.includeSystem === true) || fresh
-
     // The client may have disconnected while the body was being read.
     if (res.destroyed) return
 
@@ -370,7 +280,7 @@ export async function createShim(options: ShimOptions) {
         server: target.server,
         model: target.model,
         effort,
-        prompt: { fresh, reused },
+        prompt,
         key,
         sessionKey: key,
         signal: controller.signal,
@@ -464,16 +374,14 @@ export async function createShim(options: ShimOptions) {
       const message = error instanceof Error ? error.message : String(error)
       log("error", `ACP prompt failed for ${target.server}/${target.model}: ${message}`)
       if (res.destroyed) return
+      const failure = JSON.stringify({ error: { message, type: "acp_error" } })
       if (!stream) {
         res.writeHead(500, { "content-type": "application/json" })
-        res.end(JSON.stringify({ error: { message, type: "acp_error" } }))
+        res.end(failure)
         return
       }
-      writeChunk({ content: `\n\n[ACP error: ${message}]` })
-      writeChunk({}, "stop")
       if (!res.writableEnded) {
-        res.write("data: [DONE]\n\n")
-        res.end()
+        res.end(`data: ${failure}\n\n`)
       }
     } finally {
       if (heartbeat) clearInterval(heartbeat)

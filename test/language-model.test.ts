@@ -42,7 +42,10 @@ type RunInput = {
 }
 
 /** The real shim in front of a scripted manager, so tests cover the shim's wire format and its parser together. */
-async function shimWith(run: (input: RunInput) => Promise<{ stopReason: string; text: string }>) {
+async function shimWith(
+  run: (input: RunInput) => Promise<{ stopReason: string; text: string }>,
+  limits: { historyTurns?: number; historyChars?: number; maxBodyBytes?: number } = {},
+) {
   const calls: RunInput[] = []
   const shim = await createShim({
     manager: {
@@ -54,8 +57,9 @@ async function shimWith(run: (input: RunInput) => Promise<{ stopReason: string; 
     } as unknown as AcpServerManager,
     resolveModel: (modelID) => (modelID === "fake::model-a" ? { server: "fake", model: "model-a" } : undefined),
     token: "tok",
+    ...limits,
   })
-  const model = createAcpLanguageModel({ server: "fake", model: "model-a", url: shim.url, token: "tok" }) as any
+  const model = createAcpLanguageModel({ server: "fake", model: "model-a", url: shim.url, token: "tok", ...limits })
   return { shim, model, calls }
 }
 
@@ -101,6 +105,58 @@ test("turns an ACP turn into AI SDK v3 stream parts", async () => {
     const finish = parts.at(-1)
     expect(finish.type).toBe("finish")
     expect(finish.finishReason.unified).toBe("stop")
+  } finally {
+    await shim.close()
+  }
+})
+
+test("reports an ACP failure after partial output without completing the answer", async () => {
+  const { shim, model } = await shimWith(async (input) => {
+    input.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial" } })
+    throw new Error("agent failed")
+  })
+  try {
+    const call = { prompt: [{ role: "user", content: "hi" }] }
+    const { stream } = await model.doStream(call)
+    const parts = await readAll(stream)
+    expect(parts.filter((part) => part.type === "text-delta").map((part) => part.delta)).toEqual(["partial"])
+    expect(parts.at(-1)).toMatchObject({ type: "error", error: new Error("agent failed") })
+    expect(parts.some((part) => part.type === "finish")).toBe(false)
+    await expect(model.doGenerate(call)).rejects.toThrow("agent failed")
+
+    const response = await fetch(`${shim.url}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: "Bearer tok" },
+      body: JSON.stringify({ model: "fake::model-a", stream: true, messages: call.prompt }),
+    })
+    const frames = (await response.text()).split("\n").filter((line) => line.startsWith("data: "))
+    expect(JSON.parse(frames.at(-1)!.slice(6))).toEqual({ error: { message: "agent failed", type: "acp_error" } })
+  } finally {
+    await shim.close()
+  }
+})
+
+test("a long transcript crosses the shim as the latest turn and bounded replay", async () => {
+  const { shim, model, calls } = await shimWith(
+    async () => ({ stopReason: "end_turn", text: "ok" }),
+    { historyTurns: 2, historyChars: 24, maxBodyBytes: 512 },
+  )
+  try {
+    const large = "unused history ".repeat(1_000)
+    const result = await model.doGenerate({
+      prompt: [
+        { role: "system", content: large },
+        { role: "user", content: large },
+        { role: "user", content: [{ type: "text", text: `${large}ending` }] },
+        { role: "assistant", content: "prior" },
+        { role: "user", content: "latest" },
+      ],
+    })
+    expect(result.content).toEqual([{ type: "text", text: "ok" }])
+    expect(calls[0]?.prompt).toEqual({
+      fresh: "Conversation so far:\n\n[...earlier history omitted...]\n\nending\n\nAssistant: prior\n\n---\n\nlatest",
+      reused: "latest",
+    })
   } finally {
     await shim.close()
   }

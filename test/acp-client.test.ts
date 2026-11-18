@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { mkdtemp, readFile, rm, symlink } from "node:fs/promises"
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -74,6 +74,30 @@ test("stop rejects a turn that is still running", async () => {
   await expect(pending).rejects.toThrow("stopped")
 })
 
+test("terminates an agent whose handshake times out before starting another one", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "acp-restart-"))
+  const gate = join(dir, "ready")
+  const log = join(dir, "pids")
+  const acp = client({ agentArgs: ["--initialize-gate", gate, "--pid-log", log], requestTimeoutMs: 1_000 })
+  const pids = async () => (await readFile(log, "utf8")).trim().split("\n").map(Number)
+  let failedPid: number | undefined
+  try {
+    await expect(acp.start()).rejects.toMatchObject({ code: -32001 })
+    failedPid = (await pids())[0]
+    expect(() => process.kill(failedPid!, 0)).toThrow()
+    failedPid = undefined
+    await writeFile(gate, "ready")
+    expect((await acp.newSession(dir)).sessionId).toStartWith("sess-")
+    expect(await pids()).toHaveLength(2)
+  } finally {
+    await acp.stop()
+    if (failedPid) {
+      try { process.kill(failedPid, "SIGKILL") } catch {}
+    }
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("keeps fs writes inside the session directory", async () => {
   const root = await mkdtemp(join(tmpdir(), "acp-root-"))
   const outside = await mkdtemp(join(tmpdir(), "acp-outside-"))
@@ -89,18 +113,5 @@ test("keeps fs writes inside the session directory", async () => {
     await acp.stop()
     await rm(root, { recursive: true, force: true })
     await rm(outside, { recursive: true, force: true })
-  }
-})
-
-test("hands a steer back when no turn is running", async () => {
-  const acp = client()
-  try {
-    const session = await acp.newSession(tmpdir())
-    expect(await acp.steer(session.sessionId, "too early")).toEqual({
-      outcome: "promptRequired",
-      reason: "noRunningTurn",
-    })
-  } finally {
-    await acp.stop()
   }
 })

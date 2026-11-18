@@ -76,3 +76,61 @@ test("loads without waiting for ACP and publishes each agent's models as it beco
   }
   expect(models()).toEqual([])
 }, 10_000)
+
+test("bounds fallback provider requests without rewriting other providers' prompts", async () => {
+  type Request = {
+    model: { providerID: string }
+    system: Array<{ type: "text"; text: string }>
+    messages: Array<{ role: string; content: Array<{ type: "text"; text: string }> }>
+  }
+  const hooks = new Map<string, (event: Request) => void>()
+  const registration = { dispose: async () => {} }
+  const cleanup = await plugin.setup({
+    location: { directory: tmpdir() },
+    options: {
+      skills: false,
+      mcp: false,
+      commands: false,
+      historyChars: 24,
+      logLevel: "error",
+      servers: [{ id: "fake", command: [process.execPath, agent] }],
+    },
+    provider: { transform: async () => registration },
+    session: {
+      async hook(name: string, handler: (event: Request) => void) {
+        hooks.set(name, handler)
+        return registration
+      },
+    },
+    mcp: { transform: async () => registration, list: async () => [] },
+  } as unknown as Plugin.Context)
+  try {
+    const request = (providerID: string): Request => ({
+      model: { providerID },
+      system: [{ type: "text", text: "Title instructions" }],
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: `${"old transcript ".repeat(1_000)}abcdefghijklmnopqrstuvwxyz` }],
+        },
+        { role: "user", content: [{ type: "text", text: "latest" }] },
+      ],
+    })
+    const other = request("other")
+    await hooks.get("context")!(other)
+    expect(other).toEqual(request("other"))
+
+    const primary = request("acp-fake")
+    await hooks.get("context")!(primary)
+    expect(primary.system).toEqual([])
+    expect(primary.messages[0].content[0].text).toBe("bcdefghijklmnopqrstuvwxyz")
+    expect(primary.messages[1].content[0].text).toBe("latest")
+
+    const title = request("acp-fake")
+    await hooks.get("title")!(title)
+    expect(title.system).toEqual(request("acp-fake").system)
+    expect(title.messages).toEqual(primary.messages)
+  } finally {
+    await cleanup?.()
+  }
+})

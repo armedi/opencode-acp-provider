@@ -40,6 +40,7 @@ function manager(
     additionalDirectories?: string[]
     agentArgs?: string[]
     sessions?: AcpSessionStore
+    maxSessions?: number
   } = {},
 ) {
   const instance = new AcpServerManager({
@@ -53,6 +54,7 @@ function manager(
     defaultCwd: options.defaultCwd ?? tmpdir(),
     additionalDirectories: options.additionalDirectories,
     sessions: options.sessions,
+    maxSessions: options.maxSessions,
   })
   return { instance }
 }
@@ -82,6 +84,44 @@ test("discovers models and reuses a pooled session", async () => {
       sessionKey: "ses_test",
     })
     expect(second.text).toBe("got:second-reused")
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("an agent without an ACP model selector only exposes its default", async () => {
+  const { instance } = manager({ agentArgs: ["--echo-history", "--no-model-selector"] })
+  try {
+    await instance.initialize()
+    expect(instance.get("fake")?.models.map((model) => model.id)).toEqual(["default"])
+    const turn = await instance.run({ server: "fake", model: "default", key: "chat", prompt: "hello" })
+    expect(JSON.parse(turn.text)).toMatchObject({ model: "fast", prompts: ["hello"] })
+    await expect(instance.run({ server: "fake", model: "slow", key: "chat", prompt: "wrong model" })).rejects.toThrow(
+      "does not expose an ACP model selector",
+    )
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("reserves capacity for a starting session, then evicts it only when idle", async () => {
+  const { instance } = manager({ maxSessions: 1 })
+  const ready = Promise.withResolvers<void>()
+  try {
+    await instance.initialize()
+    const first = instance.run({
+      server: "fake", key: "first", prompt: "steer-me",
+      onUpdate: (update) => { if (update.sessionUpdate === "agent_thought_chunk") ready.resolve() },
+    })
+    void first.catch(() => {})
+    await expect(instance.run({ server: "fake", key: "next", prompt: "not yet" })).rejects.toThrow("capacity")
+    await ready.promise
+    instance.interrupt("first")
+    expect((await first).stopReason).toBe("cancelled")
+    expect((await instance.run({ server: "fake", key: "next", prompt: "now" })).text).toBe("got:now")
+    expect((await instance.run({
+      server: "fake", key: "first", prompt: { fresh: "replay", reused: "warm" },
+    })).text).toBe("got:replay")
   } finally {
     await instance.stop()
   }
@@ -387,81 +427,38 @@ test("does not open an ACP session just to compact it", async () => {
   }
 })
 
-/** The fixture holds "steer-me" open, so give it a moment to start before steering. */
+/** Give the fixture's held turn a moment to start before cancelling. */
 const running = () => new Promise((resolve) => setTimeout(resolve, 200))
 
-test("steers the running turn when the agent supports it", async () => {
+test("interrupts a running turn so OpenCode can deliver its follow-up", async () => {
   const { instance } = manager()
   try {
     await instance.initialize()
-    const turn = instance.run({ server: "fake", prompt: "steer-me", key: "ses_steer", sessionKey: "ses_steer" })
-    await running()
-    expect(await instance.steer({ key: "ses_steer", text: "change of plan" })).toEqual({ status: "steered" })
-    expect(await turn).toEqual({ stopReason: "end_turn", text: "steer:change of plan" })
-  } finally {
-    await instance.stop()
-  }
-})
-
-test("interrupts the turn when the agent cannot steer", async () => {
-  const { instance } = manager({ agentArgs: ["--no-steering"] })
-  try {
-    await instance.initialize()
-    const turn = instance.run({ server: "fake", prompt: "steer-me", key: "ses_fallback", sessionKey: "ses_fallback" })
-    await running()
-    expect(await instance.steer({ key: "ses_fallback", text: "change of plan" })).toEqual({ status: "interrupted" })
+    const ready = Promise.withResolvers<void>()
+    const turn = instance.run({
+      server: "fake", prompt: "steer-me", key: "ses_fallback", sessionKey: "ses_fallback",
+      onUpdate: (update) => { if (update.sessionUpdate === "agent_thought_chunk") ready.resolve() },
+    })
+    await ready.promise
+    instance.interrupt("ses_fallback")
     expect(await turn).toEqual({ stopReason: "cancelled", text: "cancelled" })
-  } finally {
-    await instance.stop()
-  }
-})
-
-test("does not steer a session with no turn running", async () => {
-  const { instance } = manager()
-  try {
-    await instance.initialize()
-    expect(await instance.steer({ key: "ses_idle", text: "hello" })).toEqual({ status: "unavailable" })
+    const next = await instance.run({
+      server: "fake", key: "ses_fallback", prompt: { fresh: "replayed history", reused: "change of plan" },
+    })
+    expect(next.text).toBe("got:change of plan")
   } finally {
     await instance.stop()
   }
 })
 
 test("cancels a turn that is still starting when a message is steered", async () => {
-  const { instance } = manager({ agentArgs: ["--no-steering"] })
+  const { instance } = manager()
   try {
     await instance.initialize()
     const turn = instance.run({ server: "fake", prompt: "steer-me", key: "ses_starting", sessionKey: "ses_starting" })
     // No wait: the ACP session is still being negotiated, so no prompt exists yet.
-    expect(await instance.steer({ key: "ses_starting", text: "change of plan" })).toEqual({ status: "interrupted" })
+    instance.interrupt("ses_starting")
     expect(await turn).toEqual({ stopReason: "cancelled", text: "cancelled" })
-  } finally {
-    await instance.stop()
-  }
-})
-
-test("interrupts instead of injecting a steer that carries attachments", async () => {
-  const { instance } = manager()
-  try {
-    await instance.initialize()
-    const turn = instance.run({ server: "fake", prompt: "steer-me", key: "ses_attached", sessionKey: "ses_attached" })
-    await running()
-    expect(await instance.steer({ key: "ses_attached", text: "change of plan", plain: false })).toEqual({
-      status: "interrupted",
-    })
-    expect(await turn).toEqual({ stopReason: "cancelled", text: "cancelled" })
-  } finally {
-    await instance.stop()
-  }
-})
-
-test("interrupts when the agent rejects the steer", async () => {
-  const { instance } = manager()
-  try {
-    await instance.initialize()
-    const turn = instance.run({ server: "fake", prompt: "steer-me", key: "ses_reject", sessionKey: "ses_reject" })
-    await running()
-    expect(await instance.steer({ key: "ses_reject", text: "please fail" })).toEqual({ status: "interrupted" })
-    expect((await turn).stopReason).toBe("cancelled")
   } finally {
     await instance.stop()
   }
