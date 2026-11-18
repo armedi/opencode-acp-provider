@@ -28,32 +28,6 @@ const SUBAGENT_DESCRIPTION = [
   "Pass the returned sessionID to continue that specific child conversation. A follow-up to a running child joins its current run.",
 ].join("\n")
 
-const MODELS_DESCRIPTION =
-  "Search the models available to use. Use this to turn a model name the user mentions into an exact reference for a tool that takes a model. Check your own provider first."
-
-const TODOWRITE_DESCRIPTION = [
-  "Create and update a todo list for the current session. The user sees it as your working plan.",
-  "",
-  "Use it proactively when a task has 3 or more distinct steps, or when the user gives several tasks or asks for a todo list. Skip it for a single simple task or a purely conversational request. When in doubt, use it.",
-  "",
-  "- Send the full list on every call; it replaces the previous one.",
-  "- Mark items `in_progress` when you start them and `completed` as soon as they're actually done.",
-  "- Only call it when the list changes.",
-].join("\n")
-
-const QUESTION_DESCRIPTION = [
-  "Use this tool when you need to ask the user questions during execution. This allows you to:",
-  "1. Gather user preferences or requirements",
-  "2. Clarify ambiguous instructions",
-  "3. Get decisions on implementation choices as you work",
-  "4. Offer choices to the user about what direction to take.",
-  "",
-  "Usage notes:",
-  "- A \"Type your own answer\" option is added automatically; don't include a separate option for free form answers",
-  "- Set `multiple: true` to allow selecting more than one option",
-  "- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label",
-].join("\n")
-
 /**
  * Order used by the initialize instructions. Clients that defer MCP tools (Codex
  * shows only the server's `instructions` until a namespace is loaded, and appends
@@ -65,6 +39,7 @@ const TOOL_ORDER = [
   "subagent",
   "models",
   "todowrite",
+  "session_create",
   "session_list",
   "session_get",
   "session_context",
@@ -582,39 +557,30 @@ async function buildTools(
     return tool.execute(args, context)
   }
 
-  const addBuiltin = (
-    name: string,
-    aliases: string[],
-    description: string,
-    inputSchema: Record<string, unknown>,
-    mapArgs: (args: any) => any = (args) => args,
-  ) => {
-    const tool = find(name, ...aliases)
-    if (!tool) return
+  const models = find("models")
+  if (models) {
     tools.push({
-      name,
-      description,
-      inputSchema,
-      call: async (args, signal) => toMcpResult(await invoke(tool, mapArgs(args ?? {}), signal)),
+      name: "models",
+      description: "Search the models available to use. Use this to turn a model name the user mentions into an exact reference for a tool that takes a model. Check your own provider first.",
+      inputSchema: objectSchema({
+        query: stringSchema("Text to search for in model names and IDs."),
+        provider: stringSchema("Provider ID or name to filter by. Try your own provider first."),
+        type: {
+          type: "string",
+          enum: ["chat", "image"],
+          description: [
+            "Which kind of model to list. Defaults to \"chat\".",
+            "\"chat\": a language model (LLM). Powers sessions, agents and subagents, and can call tools.",
+            "\"image\": generates or edits images from a prompt. It can't chat or call tools.",
+          ].join("\n"),
+        },
+        all: { type: "boolean", description: "Include older versions of each model family. By default only the newest version is listed." },
+        limit: { type: "integer", minimum: 1, maximum: 100, description: "Maximum number of models to return. Defaults to 20." },
+        offset: { type: "integer", minimum: 0, description: "Number of models to skip, for paging through results." },
+      }),
+      call: async (args, signal) => toMcpResult(await invoke(models, args ?? {}, signal)),
     })
   }
-
-  addBuiltin("models", ["models"], MODELS_DESCRIPTION, objectSchema({
-    query: stringSchema("Text to search for in model names and IDs."),
-    provider: stringSchema("Provider ID or name to filter by. Try your own provider first."),
-    type: {
-      type: "string",
-      enum: ["chat", "image"],
-      description: [
-        "Which kind of model to list. Defaults to \"chat\".",
-        "\"chat\": a language model (LLM). Powers sessions, agents and subagents, and can call tools.",
-        "\"image\": generates or edits images from a prompt. It can't chat or call tools.",
-      ].join("\n"),
-    },
-    all: { type: "boolean", description: "Include older versions of each model family. By default only the newest version is listed." },
-    limit: { type: "integer", minimum: 1, maximum: 100, description: "Maximum number of models to return. Defaults to 20." },
-    offset: { type: "integer", minimum: 0, description: "Number of models to skip, for paging through results." },
-  }))
 
   const subagent = find("subagent")
   if (subagent) {
@@ -648,7 +614,18 @@ async function buildTools(
   if (question) {
     tools.push({
       name: "question",
-      description: QUESTION_DESCRIPTION,
+      description: [
+        "Use this tool when you need to ask the user questions during execution. This allows you to:",
+        "1. Gather user preferences or requirements",
+        "2. Clarify ambiguous instructions",
+        "3. Get decisions on implementation choices as you work",
+        "4. Offer choices to the user about what direction to take.",
+        "",
+        "Usage notes:",
+        "- A \"Type your own answer\" option is added automatically; don't include a separate option for free form answers",
+        "- Set `multiple: true` to allow selecting more than one option",
+        "- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label",
+      ].join("\n"),
       inputSchema: objectSchema({
         questions: {
           type: "array",
@@ -686,23 +663,39 @@ async function buildTools(
     })
   }
 
-  addBuiltin("todowrite", ["todowrite", "todo"], TODOWRITE_DESCRIPTION, objectSchema({
-    todos: {
-      type: "array",
-      description: "The updated todo list",
-      items: objectSchema(
-        {
-          content: stringSchema("Brief description of the task"),
-          status: {
-            type: "string",
-            enum: ["pending", "in_progress", "completed", "cancelled"],
-            description: "Current status of the task: pending, in_progress, completed, cancelled",
-          },
+  const todowrite = find("todowrite", "todo")
+  if (todowrite) {
+    tools.push({
+      name: "todowrite",
+      description: [
+        "Create and update a todo list for the current session. The user sees it as your working plan.",
+        "",
+        "Use it proactively when a task has 3 or more distinct steps, or when the user gives several tasks or asks for a todo list. Skip it for a single simple task or a purely conversational request. When in doubt, use it.",
+        "",
+        "- Send the full list on every call; it replaces the previous one.",
+        "- Mark items `in_progress` when you start them and `completed` as soon as they're actually done.",
+        "- Only call it when the list changes.",
+      ].join("\n"),
+      inputSchema: objectSchema({
+        todos: {
+          type: "array",
+          description: "The updated todo list",
+          items: objectSchema(
+            {
+              content: stringSchema("Brief description of the task"),
+              status: {
+                type: "string",
+                enum: ["pending", "in_progress", "completed", "cancelled"],
+                description: "Current status of the task: pending, in_progress, completed, cancelled",
+              },
+            },
+            ["content", "status"],
+          ),
         },
-        ["content", "status"],
-      ),
-    },
-  }, ["todos"]))
+      }, ["todos"]),
+      call: async (args, signal) => toMcpResult(await invoke(todowrite, args ?? {}, signal)),
+    })
+  }
 
   tools.push(
     {
@@ -722,6 +715,33 @@ async function buildTools(
       call: async (args, signal) => {
         await assertSession(ctx, sessionKey, "*", "list", signal)
         return toMcpResult(await ctx.session.list(args ?? {}))
+      },
+    },
+    {
+      name: "session_create",
+      description: "Start an independent top-level session that never reports back. For work that should report back, use `subagent`.",
+      inputSchema: objectSchema({
+        prompt: stringSchema("First message."),
+        title: stringSchema(),
+        agent: stringSchema("Primary agent."),
+        model: stringSchema("Only when the user names one: \"providerID/modelID#variant\", from the models tool."),
+        directory: stringSchema("Defaults to your session's directory."),
+      }),
+      call: async (args, signal) => {
+        await assertSession(ctx, sessionKey, "*", "create", signal)
+        const input = args ?? {}
+        const caller = await ctx.session.get({ sessionID: sessionKey as any }).catch(() => undefined)
+        const directory = nonEmpty(input.directory) ?? (caller as any)?.location?.directory ?? ctx.location.directory
+        const model = nonEmpty(input.model)
+        const session = await ctx.session.create({
+          ...(nonEmpty(input.title) ? { title: input.title } : {}),
+          ...(nonEmpty(input.agent) ? { agent: input.agent } : {}),
+          ...(model ? { model: parseModelRef(model) } : {}),
+          location: { directory },
+        } as any)
+        const prompt = nonEmpty(input.prompt)
+        if (prompt) await ctx.session.prompt({ sessionID: session.id, text: prompt } as any)
+        return toMcpResult({ sessionID: session.id, session, prompted: Boolean(prompt) })
       },
     },
     {
@@ -860,6 +880,22 @@ async function readTarget(
   const target = typeof requested === "string" && requested ? requested : caller
   if (target !== caller) await assertSession(ctx, caller, target, operation, signal)
   return target
+}
+
+function nonEmpty(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined
+}
+
+/** Parse "providerID/modelID#variant"; the model id itself may contain slashes. */
+export function parseModelRef(value: string): { providerID: string; id: string; variant?: string } {
+  const hash = value.lastIndexOf("#")
+  const ref = hash === -1 ? value : value.slice(0, hash)
+  const variant = hash === -1 ? undefined : value.slice(hash + 1)
+  const slash = ref.indexOf("/")
+  if (slash <= 0 || slash === ref.length - 1 || variant === "") {
+    throw new Error(`Invalid model "${value}": expected "providerID/modelID" or "providerID/modelID#variant"`)
+  }
+  return { providerID: ref.slice(0, slash), id: ref.slice(slash + 1), ...(variant ? { variant } : {}) }
 }
 
 function waitForAbort(signal: AbortSignal): Promise<"cancelled"> {

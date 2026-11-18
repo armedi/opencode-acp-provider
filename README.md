@@ -109,6 +109,11 @@ that agent is first spawned; every location (including each worktree) reuses the
       "id": "codex",
       "setup": "vp add -g @agentclientprotocol/codex-acp@latest",
       "command": ["codex-acp"]
+    },
+    {
+      "id": "agy",
+      "setup": "agy update",
+      "command": ["agy", "acp"]
     }
   ]
 }
@@ -124,6 +129,61 @@ that agent is first spawned; every location (including each worktree) reuses the
 - The directory the command installs into must be on the `PATH` OpenCode inherits. A desktop app
   launched from the GUI may not see the shell's `PATH` entries; use an absolute path in `command`
   in that case.
+
+### Antigravity (`agy`)
+
+The Antigravity CLI ships its own ACP stdio server, so it needs no adapter package:
+
+```jsonc
+{
+  "servers": [{ "id": "agy", "setup": "agy update", "command": ["agy", "acp"] }]
+}
+```
+
+- **Model ids.** Discovery reads the session's `model` select, whose values are the base ids
+  (`gemini-3.8-flash`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`).
+  `agy models` prints combined ids with the thinking level appended (`gemini-3.8-flash-high`); the
+  selector only lists the base ids, so use those.
+- **Reasoning effort.** `agy` keeps effort out of the model id. Its `thought_level` select (`low`,
+  `medium`, `high`) becomes the model variants, so `acp-agy/gemini-3.8-flash#high` sets it for the
+  turn. There is no `off` variant.
+- **Mode.** The session's `mode` select (`default`, `accept-edits`, `auto`, `plan`) is not a model
+  variant; pin it with the server's `mode` option. Permission requests raised in `default` mode go
+  through the normal `autoApprove` path.
+- **Auth.** Sign in once with agy itself (`agy acp --login`, or export `GEMINI_API_KEY` and set
+  `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json`). The plugin injects no
+  credential and never calls the agent's ACP `authenticate` method, so agy's own stored login is what
+  authenticates each session.
+- **Skills.** `agy` loads `.agents/skills` from its workspace roots and `~/.gemini/config/skills`,
+  so the skills mirror works without an agent-specific mod.
+- **Native tools.** `agy` keeps its own subagent family (`invoke_subagent`, `define_subagent`,
+  `manage_subagents`, `swarm`, `run_workflow`) and `ask_question` alongside the MCP bridge's
+  `subagent` and `question`. ACP has no question method, so `ask_question` does not block: it prints
+  the question into the turn and ends, which looks like a stalled prompt. The `permissions` block in
+  agy's settings cannot gate these tools (it only covers `read_file`, `write_file`, `read_url`,
+  `execute_url`, `command`, and `mcp`), so deny them by tool name in agy's hooks
+  (`~/.gemini/config/hooks.json` for every workspace, or `<workspace>/.agents/hooks.json`) if you
+  want delegation and questions to route through OpenCode:
+
+  ```json
+  {
+    "opencode-orchestration": {
+      "PreToolUse": [
+        {
+          "matcher": "ask_question|invoke_subagent|define_subagent|manage_subagents|swarm|run_workflow",
+          "hooks": [
+            {
+              "command": "echo '{\"decision\":\"deny\",\"reason\":\"Use the OpenCode question and subagent tools instead.\"}'"
+            }
+          ]
+        }
+      ]
+    }
+  }
+  ```
+
+- **Compaction.** `agy` advertises `compact`, so `/compact` on an ACP model reaches its own
+  compaction.
 
 ## Delegating to an ACP agent
 
@@ -181,6 +241,7 @@ The tools are 1:1 wrappers over OpenCode's own tools and session APIs:
 | `question` | builtin `question` (native session form) |
 | `todowrite` | builtin `todowrite` |
 | `artifact_create` / `artifact_read` / `artifact_update` / `artifact_delete` | builtin artifact tools |
+| `session_create` | `session.create`, then `session.prompt` when `prompt` is set (independent top-level session; requires a `session` permission for `*`) |
 | `session_list` | `session.list` (requires a `session` permission for `*`) |
 | `session_get` | `session.get` (defaults to the calling session) |
 | `session_prompt` | `session.prompt` (`delivery: "steer"` joins a running turn; `"queue"` follows up) |
@@ -193,6 +254,11 @@ builtin tool registers the background work itself, so the ACP parent is woken by
 `<subagent>` message when the child goes idle. Passing `sessionID` back to `subagent` steers the
 running child or starts a new run in it.
 
+`session_create` is the counterpart for work the user wants in its own session: it creates a
+top-level session (no parent, so no `<subagent>` wake) in the caller's directory unless `directory`
+is given, with an optional `title`, `agent`, and `model` (`providerID/modelID#variant`), and sends
+`prompt` as its first message.
+
 Calls to these bridge tools appear as console-style cards with a `mcp.<server>.<tool>` command, its
 JSON arguments, and the result, because OpenCode's generic tool card has no detail view.
 
@@ -200,7 +266,7 @@ The wrapped builtin tools assert their own permissions (`subagent`, `question`, 
 `artifact`). The `session_*` tools are normally client-only, so they assert a `session`
 permission with the target session id as the resource. Reads default to the calling session; reading
 another session, `session_wait`, `session_prompt`, and `session_interrupt` require permission for that
-session id, and `session_list` asserts resource `*`:
+session id, and `session_list` and `session_create` assert resource `*`:
 
 ```jsonc
 { "action": "session", "resource": "*", "effect": "allow" }
@@ -223,6 +289,7 @@ second hidden agent loop.
 | Claude Code | `Task`, `AskUserQuestion` | `meta.claudeCode.options.disallowedTools` |
 | Codex | native agents, request-user-input | `CODEX_CONFIG='{"agents":{"enabled":false},"tools":{"experimental_request_user_input":{"enabled":false}}}'` |
 | Command Code (`cmd`) | `agent`, `agent_output`, `ask_user_question` | automatic: the plugin loads a companion mod |
+| Antigravity (`agy`) | `ask_question`, plus `invoke_subagent`, `define_subagent`, `manage_subagents`, `swarm`, `run_workflow` | a `PreToolUse` hook that denies those tool names (see [Antigravity](#antigravity-agy)) |
 
 Claude Code:
 
@@ -286,7 +353,7 @@ and gives that directory to the agent through ACP `session/new`'s `additionalDir
 
 ```text
 <tmp>/opencode-acp-skills-*/
-├── .agents/skills/<id>/SKILL.md   # Codex (and other .agents-compatible agents)
+├── .agents/skills/<id>/SKILL.md   # Codex, Antigravity (and other .agents-compatible agents)
 └── .claude/skills/<id>/SKILL.md   # Claude Code
 ```
 
@@ -331,6 +398,7 @@ models:
 /claude:code-review   Review the current diff, or a PR number/branch/path target…
 /cmd:peek             Peek recap diagram: draw one for the last task now, or turn it on or off
 /codex:review         Review the current diff
+/agy:compact          Compact the conversation now (summarize history to free up the context window)
 ```
 
 Arguments are passed through verbatim: `/claude:code-review 123 --fix` sends `/code-review 123

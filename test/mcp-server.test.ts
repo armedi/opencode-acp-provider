@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { createMcpServer, bridgeCommand } from "../src/mcp-server.ts"
+import { createMcpServer, bridgeCommand, parseModelRef } from "../src/mcp-server.ts"
 
 function context(overrides: Record<string, any> = {}) {
   return {
@@ -128,6 +128,88 @@ test("scopes session reads to the calling session", async () => {
     lease.release()
     await server.close()
   }
+})
+
+test("creates an independent session in the caller's directory and sends its first message", async () => {
+  const base = context()
+  let created: any
+  let prompted: any
+  const ctx = context({
+    session: {
+      ...base.session,
+      get: async ({ sessionID }: { sessionID: string }) => ({
+        id: sessionID,
+        agent: "build",
+        location: { directory: "/tmp/caller" },
+      }),
+      create: async (input: any) => {
+        created = input
+        return { id: "ses_new", location: input.location }
+      },
+      prompt: async (input: any) => {
+        prompted = input
+        return {}
+      },
+    },
+    permission: {
+      assert: async (input: any) => {
+        if (input.metadata?.operation === "create" && input.resources?.[0] === "*") return
+        throw new Error("denied by test")
+      },
+    },
+  })
+  const { server, lease, token } = await start(ctx)
+  try {
+    const response = await rpc(server.url, token, {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: {
+        name: "session_create",
+        arguments: { title: "Docs pass", model: "openrouter/anthropic/claude#high", prompt: "Update the docs" },
+      },
+    })
+    expect(response.body.result.isError).toBeUndefined()
+    expect(response.body.result.structuredContent).toMatchObject({ sessionID: "ses_new", prompted: true })
+    expect(created).toEqual({
+      title: "Docs pass",
+      model: { providerID: "openrouter", id: "anthropic/claude", variant: "high" },
+      location: { directory: "/tmp/caller" },
+    })
+    expect(prompted).toEqual({ sessionID: "ses_new", text: "Update the docs" })
+  } finally {
+    lease.release()
+    await server.close()
+  }
+})
+
+test("refuses to create a session without the session permission", async () => {
+  let created = false
+  const base = context()
+  const ctx = context({
+    session: { ...base.session, create: async () => ((created = true), { id: "ses_new" }) },
+  })
+  const { server, lease, token } = await start(ctx)
+  try {
+    const response = await rpc(server.url, token, {
+      jsonrpc: "2.0",
+      id: 6,
+      method: "tools/call",
+      params: { name: "session_create", arguments: { prompt: "hi" } },
+    })
+    expect(response.body.result.isError).toBe(true)
+    expect(JSON.stringify(response.body.result)).toContain("Permission denied: session create")
+    expect(created).toBe(false)
+  } finally {
+    lease.release()
+    await server.close()
+  }
+})
+
+test("rejects malformed model references", () => {
+  expect(parseModelRef("acp-claude/opus")).toEqual({ providerID: "acp-claude", id: "opus" })
+  expect(() => parseModelRef("opus")).toThrow("Invalid model")
+  expect(() => parseModelRef("acp-claude/opus#")).toThrow("Invalid model")
 })
 
 test("cancels an in-flight tool call", async () => {
