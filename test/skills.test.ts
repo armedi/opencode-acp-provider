@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test"
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { applyCmdSkillFlag, createSkillMirror } from "../src/skills.ts"
+import { createSkillMirror } from "../src/skills.ts"
 
 const dirs: string[] = []
 
@@ -103,59 +103,4 @@ test("leaves shared agent skills where the agents already load them", async () =
   } finally {
     await mirror.close()
   }
-})
-
-test("adds the skills root to cmd without overriding an explicit choice", () => {
-  const runtimeCommand = ["bun", "/node_modules/command-code/dist/index.mjs", "acp"]
-  expect(applyCmdSkillFlag(runtimeCommand, "/tmp/skills", "/mod.ts")).toEqual([
-    ...runtimeCommand, "--mod", "/mod.ts", "--skill", "/tmp/skills",
-  ])
-  const otherRuntimeCommand = ["bun", "/other/dist/index.mjs", "acp"]
-  expect(applyCmdSkillFlag(otherRuntimeCommand, "/tmp/skills", "/mod.ts")).toEqual(otherRuntimeCommand)
-  expect(applyCmdSkillFlag(["cmd", "acp"], "/tmp/skills", "/mod.ts")).toEqual([
-    "cmd",
-    "acp",
-    "--mod",
-    "/mod.ts",
-    "--skill",
-    "/tmp/skills",
-  ])
-  expect(applyCmdSkillFlag(["/usr/local/bin/cmd", "acp", "--mod", "x"], "/tmp/skills", "/mod.ts")).toEqual([
-    "/usr/local/bin/cmd",
-    "acp",
-    "--mod",
-    "x",
-    "--mod",
-    "/mod.ts",
-    "--skill",
-    "/tmp/skills",
-  ])
-  expect(applyCmdSkillFlag(["cmd", "acp", "--mod", "/mod.ts"], "/tmp/skills", "/mod.ts")).toEqual([
-    "cmd",
-    "acp",
-    "--mod",
-    "/mod.ts",
-    "--skill",
-    "/tmp/skills",
-  ])
-  expect(applyCmdSkillFlag(["cmd", "acp", "--skill", "/other"], "/tmp/skills", "/mod.ts")).toEqual([
-    "cmd",
-    "acp",
-    "--skill",
-    "/other",
-    "--mod",
-    "/mod.ts",
-  ])
-  expect(applyCmdSkillFlag(["cmd", "acp", "--no-skills"], "/tmp/skills", "/mod.ts")).toEqual([
-    "cmd",
-    "acp",
-    "--no-skills",
-  ])
-  expect(applyCmdSkillFlag(["cmd", "acp", "--safe-mode"], "/tmp/skills", "/mod.ts")).toEqual([
-    "cmd",
-    "acp",
-    "--safe-mode",
-  ])
-  expect(applyCmdSkillFlag(["claude-agent-acp"], "/tmp/skills", "/mod.ts")).toEqual(["claude-agent-acp"])
-  expect(applyCmdSkillFlag(["cmd", "--list-models"], "/tmp/skills", "/mod.ts")).toEqual(["cmd", "--list-models"])
 })

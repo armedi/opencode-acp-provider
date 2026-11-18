@@ -12,8 +12,8 @@
  * showing OpenCode's question UI. The agent should call the host's MCP
  * `question` tool instead.
  *
- * Loaded by the `cmd` server entry in opencode.jsonc:
- *   "command": ["cmd", "acp", "--mod", "/absolute/path/to/agents/cmd/no-native-orchestration.ts"]
+ * Loaded automatically by the plugin (src/cmd-mods.ts) on any `cmd ... acp`
+ * command while the MCP bridge is enabled. `--safe-mode` disables it.
  */
 import type { ModApi } from "@commandcode/harness"
 

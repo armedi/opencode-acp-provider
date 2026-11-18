@@ -7,7 +7,7 @@
  * discovery plan. The plugin sets OPENCODE_ACP_SKILL_DIR for the child and adds
  * this file with `--mod`.
  *
- * Loaded automatically by the plugin's `cmd` integration. A user-supplied mod
+ * Loaded automatically by the plugin (src/cmd-mods.ts). A user-supplied mod
  * list keeps working; `--safe-mode` disables all mods, including this one.
  */
 interface SkillModApi {

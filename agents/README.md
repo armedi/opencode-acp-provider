@@ -9,8 +9,8 @@ One directory per OpenCode `servers[].id`:
 ```text
 agents/
 ├── cmd/
-│   ├── no-native-orchestration.ts   # loaded with `cmd acp --mod …`
-│   └── opencode-skills.ts           # loaded automatically by the plugin
+│   ├── no-native-orchestration.ts   # loaded by the plugin (src/cmd-mods.ts)
+│   └── opencode-skills.ts           # loaded by the plugin (src/cmd-mods.ts)
 └── <id>/                       # one directory per server id
     └── <capability>.ts         # name the file after the behavior it changes
 ```
@@ -38,22 +38,10 @@ tools. Tools another mod disabled stay disabled, and tools another mod added sta
 `setActiveTools` filters the tool surface only: other mods' commands, hooks, providers, renderers,
 and UI are untouched. If some later mod re-enables `agent`, `beforeToolCall` still blocks the call.
 
-Load it from the server entry:
-
-```jsonc
-{
-  "id": "cmd",
-  "name": "Command Code (ACP)",
-  "command": [
-    "cmd",
-    "acp",
-    "--mod",
-    "/absolute/path/to/opencode-acp/agents/cmd/no-native-orchestration.ts"
-  ]
-}
-```
-
-`--mod` is a global `cmd` flag. `cmd acp` accepts it even though `cmd acp --help` does not list it.
+The plugin loads it automatically whenever the MCP bridge is enabled: `src/cmd-mods.ts` appends
+`--mod <path>` to any `cmd ... acp` command, with the path resolved from the package's install
+location. Do not list it in `opencode.jsonc`. `--mod` is a global `cmd` flag that `cmd acp` accepts
+even though `cmd acp --help` does not list it; `--safe-mode` disables all mods.
 
 The mod also removes `ask_user_question`, because ACP has no question method: leaving it enabled
 makes `cmd acp` relay the question as a permission request instead of using OpenCode's question UI.
@@ -66,5 +54,5 @@ longer sees that tool and should report it as unavailable rather than delegating
 `cmd acp` accepts the global `--skill` flag but its ACP action never applies it; only the interactive
 and print paths call `setSkillLoadOverrides`. Mods are loaded on the ACP path, and
 `cmd.addSkillsPath` feeds the same skill discovery plan. This mod reads
-`OPENCODE_ACP_SKILL_DIR` and registers it. The plugin sets the env var and appends `--mod` to a
-`cmd ... acp` command automatically; `--safe-mode` disables it like any other mod.
+`OPENCODE_ACP_SKILL_DIR` and registers it. The plugin sets the env var and loads the mod through
+`src/cmd-mods.ts`, like `no-native-orchestration.ts`; `--safe-mode` disables it like any other mod.

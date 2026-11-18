@@ -1,16 +1,12 @@
 import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, dirname, join, sep } from "node:path"
-import { fileURLToPath } from "node:url"
 import type { Plugin } from "@opencode/plugin"
 import type { LogFn } from "./server-manager.ts"
-import { isCmdCommand } from "./agent-command.ts"
 
 /** Agent Skills IDs are portable only as lowercase kebab-case. */
 const SKILL_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const MAX_SKILL_ID = 64
-/** Mod that forwards the mirror to `cmd acp`, which ignores `--skill`. */
-export const CMD_SKILL_MOD = fileURLToPath(new URL("../agents/cmd/opencode-skills.ts", import.meta.url))
 
 /**
  * A temporary, agent-owned skill tree. The root is handed to ACP agents as an
@@ -22,8 +18,6 @@ export interface SkillMirror {
   /** Locations a `--skill` flag can take (cmd). */
   agentsDir: string
   claudeDir: string
-  /** Command Code mod that registers `agentsDir` with `cmd acp`. */
-  modPath: string
   count: number
   close: () => Promise<void>
 }
@@ -107,43 +101,11 @@ export async function createSkillMirror(
     root,
     agentsDir,
     claudeDir,
-    modPath: CMD_SKILL_MOD,
     count,
     close: async () => {
       await rm(root, { recursive: true, force: true }).catch(() => {})
     },
   }
-}
-
-/**
- * Add the generated skills root to a `cmd` launch command.
- *
- * `cmd acp` accepts the global `--skill` flag today and ignores it, so the
- * directory also reaches cmd through a mod that calls `addSkillsPath`. The
- * `--skill` flag is kept for cmd builds that apply it on the ACP path too;
- * duplicate paths are de-duplicated by cmd's skill planner.
- */
-export function applyCmdSkillFlag(command: string | string[], directory: string, modPath?: string): string | string[] {
-  if (!isCmdCommand(command)) return command
-  const argv = Array.isArray(command) ? [...command] : [command]
-  if (!argv.some((arg) => arg.toLowerCase() === "acp")) return command
-  if (argv.includes("--no-skills") || argv.includes("--safe-mode")) return command
-  if (modPath && hasOption(argv, "--mod", modPath)) {
-    // already loaded by the user's config
-  } else if (modPath) {
-    argv.push("--mod", modPath)
-  }
-  if (!hasOption(argv, "--skill")) argv.push("--skill", directory)
-  return argv
-}
-
-function hasOption(argv: string[], name: string, value?: string) {
-  if (value !== undefined) {
-    const index = argv.indexOf(name)
-    if (index >= 0 && argv[index + 1] === value) return true
-    return argv.includes(`${name}=${value}`)
-  }
-  return argv.some((arg) => arg === name || arg.startsWith(`${name}=`))
 }
 
 function mirrorable(skill: MirrorableSkill) {

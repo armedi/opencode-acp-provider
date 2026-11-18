@@ -231,7 +231,7 @@ export default Plugin.define({
           : undefined,
       additionalDirectories: skills ? [skills.root] : undefined,
       cmdSkillDir: skills?.agentsDir,
-      cmdSkillMod: skills?.modPath,
+      cmdOrchestration: mcp !== undefined,
       initTimeoutMs: options.initTimeoutMs,
       requestTimeoutMs: options.requestTimeoutMs,
       maxSessions: options.maxSessions,

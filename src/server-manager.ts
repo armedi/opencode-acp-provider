@@ -6,7 +6,7 @@ import {
   type SessionUpdate,
   type PermissionHandler,
 } from "./acp-client.ts"
-import { applyCmdSkillFlag } from "./skills.ts"
+import { applyCmdMods } from "./cmd-mods.ts"
 import { isCmdCommand } from "./agent-command.ts"
 
 export interface AcpServerConfig {
@@ -213,7 +213,7 @@ export class AcpServerManager {
   private maxFileBytes?: number
   private additionalDirectories?: string[]
   private cmdSkillDir?: string
-  private cmdSkillMod?: string
+  private cmdOrchestration: boolean
   private onCommands?: (server: string) => void
   private disposed = false
 
@@ -237,8 +237,8 @@ export class AcpServerManager {
     additionalDirectories?: string[]
     /** Directory passed to cmd through its global `--skill` flag. */
     cmdSkillDir?: string
-    /** Mod that registers the skills directory with `cmd acp`. */
-    cmdSkillMod?: string
+    /** Load the cmd mod that hides native orchestration tools (set when the MCP bridge is on). */
+    cmdOrchestration?: boolean
     /** Called when a server's advertised command list changes. */
     onCommands?: (server: string) => void
   }) {
@@ -258,7 +258,7 @@ export class AcpServerManager {
     this.maxFileBytes = input.maxFileBytes
     this.additionalDirectories = input.additionalDirectories?.filter((directory) => directory.trim())
     this.cmdSkillDir = input.cmdSkillDir
-    this.cmdSkillMod = input.cmdSkillMod
+    this.cmdOrchestration = input.cmdOrchestration === true
     this.onCommands = input.onCommands
 
     for (const config of input.servers) {
@@ -355,8 +355,10 @@ export class AcpServerManager {
   }
 
   private commandFor(config: AcpServerConfig) {
-    if (config.skills === false || !this.cmdSkillDir) return config.command
-    return applyCmdSkillFlag(config.command, this.cmdSkillDir, this.cmdSkillMod)
+    return applyCmdMods(config.command, {
+      orchestration: this.cmdOrchestration,
+      skillDir: config.skills === false ? undefined : this.cmdSkillDir,
+    })
   }
 
   private async applyEffort(

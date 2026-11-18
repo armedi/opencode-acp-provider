@@ -187,7 +187,7 @@ second hidden agent loop.
 | --- | --- | --- |
 | Claude Code | `Task`, `AskUserQuestion` | `meta.claudeCode.options.disallowedTools` |
 | Codex | native agents, request-user-input | `CODEX_CONFIG='{"agents":{"enabled":false},"tools":{"experimental_request_user_input":{"enabled":false}}}'` |
-| Command Code (`cmd`) | `agent`, `agent_output`, `ask_user_question` | load a mod with `cmd acp --mod …` |
+| Command Code (`cmd`) | `agent`, `agent_output`, `ask_user_question` | automatic: the plugin loads a companion mod |
 
 Claude Code:
 
@@ -216,24 +216,18 @@ Codex:
 ```
 
 Command Code has no equivalent setting key. Its docs mark the `agent` tool as always allowed, so a
-`permissions.deny` rule cannot block it. Use the companion mod at
-[`agents/cmd/no-native-orchestration.ts`](agents/cmd/no-native-orchestration.ts), which removes the tools from
-the model's schema and refuses any call that still arrives:
+`permissions.deny` rule cannot block it. When the MCP bridge is enabled, the plugin appends
+`--mod <path>` for the companion mod
+[`agents/cmd/no-native-orchestration.ts`](agents/cmd/no-native-orchestration.ts) to any `cmd ... acp`
+command, resolving the path from its own install location. The mod removes the tools from the
+model's schema and refuses any call that still arrives. The server entry needs no `--mod`:
 
 ```jsonc
-{
-  "id": "cmd",
-  "name": "Command Code (ACP)",
-  "command": [
-    "cmd",
-    "acp",
-    "--mod",
-    "/absolute/path/to/opencode-acp/agents/cmd/no-native-orchestration.ts"
-  ]
-}
+{ "id": "cmd", "name": "Command Code (ACP)", "command": ["cmd", "acp"] }
 ```
 
 `--mod` is a global `cmd` flag, accepted by `cmd acp` even though `cmd acp --help` does not list it.
+`--safe-mode` in the server command disables all mods, including this one.
 The mod also removes `ask_user_question`, because ACP has no question method: leaving it enabled
 makes `cmd acp` relay the question as a permission request instead of using OpenCode's question UI.
 With it disabled the agent calls the MCP `question` tool. The mod filters only the active tool list,
@@ -271,8 +265,9 @@ each agent keeps loading them natively, so the mirror does not copy them or move
 conventions.
 
 `cmd` ignores ACP `additionalDirectories`, and its `acp` subcommand accepts but does not apply the
-global `--skill` flag. The plugin therefore appends a small mod
-([`agents/cmd/opencode-skills.ts`](agents/cmd/opencode-skills.ts)) that registers the directory with
+global `--skill` flag. The plugin therefore appends a companion mod, the same way it loads
+[`no-native-orchestration.ts`](#disabling-native-orchestration-tools)
+([`agents/cmd/opencode-skills.ts`](agents/cmd/opencode-skills.ts)), that registers the directory with
 `cmd.addSkillsPath`, and also passes `--skill` for cmd builds that apply it. An explicit `--skill`,
 `--no-skills`, or `--safe-mode` in the server command wins. Set `"skills": false` on a server to opt
 out entirely.
@@ -547,6 +542,7 @@ Files:
 - `src/agent-command.ts` — reads an agent launch command: which executable it runs.
 - `src/server-manager.ts` — agents, credentials, model discovery, session pooling.
 - `src/skills.ts` — mirrors OpenCode's skills into the agents' native skill trees.
+- `src/cmd-mods.ts` — appends the `agents/cmd/` companion mods to `cmd acp` launch commands.
 - `src/commands.ts` — exposes each agent's slash commands as namespaced OpenCode commands.
 - `src/shim.ts` — OpenAI-compatible HTTP shim.
 - `src/prompt.ts` — bounds transcript replay before transport and builds the ACP prompt.
