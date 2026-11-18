@@ -6,6 +6,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 
 let nextSession = 1
 const sessionDirectories = new Map()
+const sessionMcp = new Map()
 const sessionPrompts = new Map()
 const sessionSelections = new Map()
 const configOptions = [
@@ -155,6 +156,7 @@ function handle(message) {
       const sessionId = `sess-${nextSession++}`
       sessionSelections.set(sessionId, { model: "fast", effort: "medium" })
       sessionDirectories.set(sessionId, message.params?.additionalDirectories ?? [])
+      sessionMcp.set(sessionId, message.params?.mcpServers ?? [])
       rememberSession(sessionId)
       send({
         jsonrpc: "2.0",
@@ -180,6 +182,7 @@ function handle(message) {
         })
       }
       sessionDirectories.set(sessionId, message.params?.additionalDirectories ?? [])
+      sessionMcp.set(sessionId, message.params?.mcpServers ?? [])
       sessionSelections.set(sessionId, { model: "fast", effort: "medium" })
       // Never hand out an id this process already restored.
       const suffix = Number(sessionId.slice("sess-".length))
@@ -236,7 +239,15 @@ function handle(message) {
         sessionPrompts.set(sessionId, prompts)
         update(sessionId, {
           sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: JSON.stringify({ sessionId, prompts, ...sessionSelections.get(sessionId) }) },
+          content: {
+            type: "text",
+            text: JSON.stringify({
+              sessionId,
+              prompts,
+              mcpServers: (sessionMcp.get(sessionId) ?? []).map((server) => server.name),
+              ...sessionSelections.get(sessionId),
+            }),
+          },
         })
         runningTurns.set(sessionId, { id: message.id, text })
         setTimeout(() => {
@@ -319,6 +330,14 @@ function handle(message) {
         update(sessionId, {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: `directories:${directories.join(",")}` },
+        })
+        return send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
+      }
+      if (/\bmcp servers?\b/i.test(text)) {
+        const servers = sessionMcp.get(sessionId) ?? []
+        update(sessionId, {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `mcp:${servers.map((server) => server.name).join(",")}` },
         })
         return send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
       }

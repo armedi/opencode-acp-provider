@@ -103,7 +103,7 @@ export interface McpLease {
 
 export interface McpProvider {
   /** `agent` is the server whose ACP session is being opened. */
-  servers: (sessionKey: string, agent: AcpServerConfig) => McpLease
+  servers: (sessionKey: string, agent: AcpServerConfig) => Promise<McpLease>
 }
 
 /**
@@ -426,24 +426,51 @@ export class AcpServerManager {
     }
 
     // Some agents cannot change a live selection or reset to the provider default.
-    // Keep the conversation queue/lease, but replay history into a new ACP session.
-    const session = await pooled.client.newSession(pooled.cwd, {
-      model: selection.model,
-      mcpServers: pooled.mcpServers,
-      meta: state.config.meta,
-      additionalDirectories: this.sessionDirectories(state.config),
-    })
+    // Keep the conversation queue, but replay history into a new ACP session.
+    // Resolve the MCP servers again: a remote server's OAuth grant may have been
+    // refreshed since this session opened, and ACP cannot update it in place.
+    const lease = this.mcp
+      ? await this.mcp.servers(pooled.key, state.config).catch((error) => {
+          this.log("warn", `could not refresh MCP servers for ${state.config.id}: ${errorMessage(error)}`)
+          return undefined
+        })
+      : undefined
+    const session = await pooled.client
+      .newSession(pooled.cwd, {
+        model: selection.model,
+        mcpServers: lease?.servers ?? pooled.mcpServers,
+        meta: state.config.meta,
+        additionalDirectories: this.sessionDirectories(state.config),
+      })
+      .catch((error) => {
+        lease?.release()
+        throw error
+      })
     try {
       if (state.config.mode) await pooled.client.setMode(session.sessionId, state.config.mode).catch(() => {})
       await this.applyEffort(state, pooled.client, session.sessionId, selection.effort)
     } catch (error) {
+      lease?.release()
       await pooled.client.closeSession(session.sessionId).catch(() => {})
       throw error
+    }
+    // The pool may have been closed while the new session was being prepared
+    // (an agent reload or shutdown does not wait for this queue). Releasing the
+    // fresh lease here keeps its bridge token from outliving a dead pool.
+    if (pooled.broken) {
+      lease?.release()
+      await pooled.client.closeSession(session.sessionId).catch(() => {})
+      throw new Error(`ACP session for key ${pooled.key.slice(0, 24)} was closed while changing selection`)
     }
     const oldSession = pooled.sessionId
     pooled.sessionId = session.sessionId
     pooled.history = "fresh"
     pooled.selection = selection
+    if (lease) {
+      pooled.mcpRelease?.()
+      pooled.mcpServers = lease.servers
+      pooled.mcpRelease = lease.release
+    }
     await this.rememberSession(poolKey, session.sessionId)
     await pooled.client.closeSession(oldSession).catch(() => {})
   }
@@ -700,7 +727,7 @@ export class AcpServerManager {
           if (eviction) await eviction
           this.assertLive()
           const sessionStartedAt = Date.now()
-          const lease = this.mcp?.servers(input.key!, state.config)
+          const lease = await this.mcp?.servers(input.key!, state.config)
           let session: { sessionId: string } | undefined
           let reused = false
           try {

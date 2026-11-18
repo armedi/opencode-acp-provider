@@ -416,6 +416,18 @@ authenticated.
 If no credential is available, the agent still starts, but prompts fail with the agent's own auth
 error.
 
+Remote MCP servers configured in OpenCode are forwarded to every ACP agent. When OpenCode holds an
+OAuth sign-in for one, the plugin resolves the active grant and passes it to the agent as an
+`Authorization: Bearer` header on `session/new`, so the agent reuses the same login. OpenCode
+refreshes an expired grant while resolving it. A header set explicitly in the server's `headers`
+wins. A server that is not signed in to OpenCode still starts, but its tools stay unavailable; run
+`opencode mcp auth <name>` (or sign in through the agent's own CLI) and the next session picks the
+credential up.
+
+ACP cannot update MCP headers on a live session, so a grant that expires during a long-lived pooled
+session is not replaced until that session is recycled or a new conversation starts. The token is
+also visible to the agent in `session/new`; an agent that persists its session state will store it.
+
 ## How it works
 
 1. **Setup** registers each agent's provider from the inventory its last discovery cached in plugin

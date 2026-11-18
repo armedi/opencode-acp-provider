@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { AcpServerManager, type AcpSessionStore } from "../src/server-manager.ts"
+import { AcpServerManager, type AcpSessionStore, type McpProvider } from "../src/server-manager.ts"
 
 const agent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url))
 const dirs: string[] = []
@@ -41,6 +41,7 @@ function manager(
     agentArgs?: string[]
     sessions?: AcpSessionStore
     maxSessions?: number
+    mcp?: McpProvider
   } = {},
 ) {
   const instance = new AcpServerManager({
@@ -55,6 +56,7 @@ function manager(
     additionalDirectories: options.additionalDirectories,
     sessions: options.sessions,
     maxSessions: options.maxSessions,
+    mcp: options.mcp,
   })
   return { instance }
 }
@@ -149,6 +151,76 @@ test("passes additionalDirectories to fresh and pooled sessions", async () => {
   } finally {
     await instance.stop()
   }
+})
+
+test("awaits the MCP provider and passes its servers to session/new", async () => {
+  const calls: string[] = []
+  let releases = 0
+  const { instance } = manager({
+    mcp: {
+      async servers(_sessionKey, agent) {
+        calls.push(agent.id)
+        await Promise.resolve()
+        return {
+          servers: [{ type: "http", name: "remote", url: "https://example.test/mcp", headers: [] }],
+          release: () => {
+            releases++
+          },
+        }
+      },
+    },
+  })
+  try {
+    await instance.initialize()
+    const fresh = await instance.run({ server: "fake", prompt: "mcp servers", key: "chat", sessionKey: "ses_mcp" })
+    expect(fresh.text).toBe("mcp:remote")
+    expect(calls).toEqual(["fake"])
+
+    // A pooled session keeps the servers it opened with and is not re-leased.
+    const pooled = await instance.run({ server: "fake", prompt: "mcp servers", key: "chat", sessionKey: "ses_mcp" })
+    expect(pooled.text).toBe("mcp:remote")
+    expect(calls).toEqual(["fake"])
+  } finally {
+    await instance.stop()
+  }
+  expect(releases).toBe(1)
+})
+
+test("re-resolves MCP servers when replaying into a fresh ACP session", async () => {
+  let calls = 0
+  let releases = 0
+  const { instance } = manager({
+    agentArgs: ["--no-live-switch", "--echo-history"],
+    mcp: {
+      async servers() {
+        calls++
+        return {
+          servers: [
+            { type: "http", name: `remote-${calls}`, url: "https://example.test/mcp", headers: [] },
+          ],
+          release: () => {
+            releases++
+          },
+        }
+      },
+    },
+  })
+  try {
+    await instance.initialize()
+    const first = JSON.parse((await instance.run({ server: "fake", key: "chat", prompt: "first" })).text)
+    expect(first.mcpServers).toEqual(["remote-1"])
+    expect(calls).toBe(1)
+
+    const second = JSON.parse(
+      (await instance.run({ server: "fake", model: "slow", key: "chat", prompt: "second" })).text,
+    )
+    expect(second.mcpServers).toEqual(["remote-2"])
+    expect(calls).toBe(2)
+    expect(releases).toBe(1)
+  } finally {
+    await instance.stop()
+  }
+  expect(releases).toBe(2)
 })
 
 test("model and effort changes preserve history and serialize settings with their prompts", async () => {
