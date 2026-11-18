@@ -90,6 +90,39 @@ Add a variant to pick a reasoning effort for the turn:
 opencode run -m acp-cmd/deepseek/deepseek-v4.1-flash#max "Prove the claim"
 ```
 
+### Installing agents automatically
+
+A server can install or update its agent with `setup`. It runs once per server start, before that
+agent is first spawned; `opencode reload` re-imports the plugin, so it runs again then.
+
+```jsonc
+{
+  "servers": [
+    { "id": "cmd", "setup": "vp add -g command-code@latest", "command": ["cmd", "acp"] },
+    {
+      "id": "claude",
+      "setup": "vp add -g @agentclientprotocol/claude-agent-acp@latest",
+      "command": ["claude-agent-acp"]
+    },
+    {
+      "id": "codex",
+      "setup": "vp add -g @agentclientprotocol/codex-acp@latest",
+      "command": ["codex-acp"]
+    }
+  ]
+}
+```
+
+- The command runs through `sh -c` in the home directory, with the environment OpenCode inherited.
+- Identical commands share one run, even across servers; different commands run in parallel.
+- A failure (non-zero exit, signal, or a timeout after five minutes) is logged with the end of its
+  output, and the agent still starts with whatever is already installed, so an offline start works.
+- Setup time is not counted against `initTimeoutMs`.
+- Pin a version by naming it instead of `@latest`, e.g. `command-code@0.6.0`.
+- The directory the command installs into must be on the `PATH` OpenCode inherits. A desktop app
+  launched from the GUI may not see the shell's `PATH` entries; use an absolute path in `command`
+  in that case.
+
 ## Delegating to an ACP agent
 
 The plugin adds no tools and needs no agent configuration. OpenCode's builtin `subagent` tool
@@ -333,6 +366,7 @@ Set `"commands": false` in the plugin options to turn this off.
 | `id` | `string` | Required. Stable id. Becomes the provider id `acp-<id>`. |
 | `name` | `string` | Provider display name. Defaults to `<id> (ACP)`. |
 | `command` | `string \| string[]` | Required. Command that starts the ACP agent, e.g. `["cmd", "acp"]`. |
+| `setup` | `string` | Shell command that installs or updates the agent before it is first spawned, e.g. `vp add -g command-code@latest`. Runs once per server start. See [Installing agents automatically](#installing-agents-automatically). |
 | `cwd` | `string` | Agent working directory. Defaults to the OpenCode location. |
 | `env` | `object` | Extra environment variables for the agent process. |
 | `credential` | `string` | OpenCode integration id whose saved credential is injected into the agent environment. |
@@ -548,6 +582,7 @@ Files:
 - `src/index.ts` — plugin entry, provider registration.
 - `src/acp-client.ts` — ACP JSON-RPC client over stdio.
 - `src/agent-command.ts` — reads an agent launch command: which executable it runs.
+- `src/setup.ts` — runs a server's install/update command once before its agent starts.
 - `src/server-manager.ts` — agents, credentials, model discovery, session pooling.
 - `src/skills.ts` — mirrors OpenCode's skills into the agents' native skill trees.
 - `src/agents/` — per-agent customization; `src/agents/cmd/` adds Command Code mods to `cmd acp`.

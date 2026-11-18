@@ -491,6 +491,55 @@ test("recycles a session that keeps failing", async () => {
   }
 })
 
+test("runs a server's setup before starting its agent", async () => {
+  const dir = await cwd()
+  const order = join(dir, "order.log")
+  const instance = new AcpServerManager({
+    servers: [
+      {
+        id: "fake",
+        setup: `printf 'setup\\n' >> '${order}'`,
+        command: ["sh", "-c", `printf 'agent\\n' >> '${order}'; exec '${process.execPath}' '${agent}'`],
+        autoApprove: true,
+      },
+    ],
+    defaultCwd: dir,
+  })
+  try {
+    await instance.initialize()
+    expect(instance.get("fake")?.initialized).toBe(true)
+    expect((await readFile(order, "utf8")).trim().split("\n")).toEqual(["setup", "agent"])
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("does not count setup time against initTimeoutMs", async () => {
+  const dir = await cwd()
+  const marker = join(dir, "setup-marker")
+  const instance = new AcpServerManager({
+    servers: [
+      {
+        id: "fake",
+        setup: `sleep 1; printf ready > '${marker}'`,
+        command: [process.execPath, agent],
+        autoApprove: true,
+      },
+    ],
+    defaultCwd: dir,
+    initTimeoutMs: 500,
+  })
+  try {
+    await instance.initialize()
+    const state = instance.get("fake")
+    expect(state?.initialized).toBe(true)
+    expect(state?.error).toBeUndefined()
+    expect(await readFile(marker, "utf8")).toBe("ready")
+  } finally {
+    await instance.stop()
+  }
+})
+
 test("resumes the stored session after the agent process crashes", async () => {
   const dir = await cwd()
   const sessionsFile = join(dir, "sessions.json")

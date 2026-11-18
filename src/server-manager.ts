@@ -8,6 +8,7 @@ import {
 } from "./acp-client.ts"
 import { applyCmdMods } from "./agents/cmd/index.ts"
 import { isCmdCommand } from "./agent-command.ts"
+import { runSetup } from "./setup.ts"
 
 export interface AcpServerConfig {
   /** Stable id used for the OpenCode provider and tool arguments. */
@@ -16,6 +17,13 @@ export interface AcpServerConfig {
   name?: string
   /** Command and arguments that start the ACP agent, e.g. ["cmd", "acp"]. */
   command: string | string[]
+  /**
+   * Shell command that installs or updates the agent, e.g.
+   * `"vp add -g command-code@latest"`. Runs once per plugin-module lifetime,
+   * before the agent is first spawned; a failure is logged and the agent still
+   * starts with whatever is already installed.
+   */
+  setup?: string
   /** Working directory for the agent process. Defaults to the OpenCode location. */
   cwd?: string
   /** Extra environment variables for the agent process. */
@@ -361,6 +369,12 @@ export class AcpServerManager {
     })
   }
 
+  /** Install or update the agent before it is spawned; memoized per script. */
+  private setupFor(state: AcpServerState) {
+    const setup = state.config.setup?.trim()
+    return setup ? runSetup(setup, this.log) : Promise.resolve()
+  }
+
   private async applyEffort(
     state: AcpServerState,
     client: AcpClient,
@@ -435,6 +449,9 @@ export class AcpServerManager {
     await Promise.all(
       this.list.map(async (state) => {
         try {
+          // Installing or updating the agent is not part of the timed handshake.
+          await this.setupFor(state)
+          if (this.disposed) return
           await withTimeout(
             this.prepare(state),
             this.initTimeoutMs,
@@ -456,6 +473,9 @@ export class AcpServerManager {
   async refresh(state: AcpServerState) {
     if (this.disposed) throw new Error("ACP server manager is stopped")
     const id = state.config.id
+    // Setup runs outside the timed work: a slow install is not an init timeout.
+    await this.setupFor(state)
+    if (this.disposed) throw new Error("ACP server manager is stopped")
     const work = (async () => {
       const inFlight = this.preparing.get(id)
       if (inFlight) await inFlight.catch(() => {})
@@ -489,6 +509,10 @@ export class AcpServerManager {
 
   private async doPrepare(state: AcpServerState) {
     const config = state.config
+    if (this.disposed) throw new Error("ACP server manager is stopped")
+    // The lazy path through `prepare()` waits for setup too; the memo makes it
+    // instant when discovery already ran it.
+    await this.setupFor(state)
     if (this.disposed) throw new Error("ACP server manager is stopped")
     const { command, args } = normalizeCommand(this.commandFor(config))
     const env: Record<string, string> = { ...config.env }
