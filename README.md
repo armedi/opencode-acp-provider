@@ -92,8 +92,9 @@ opencode run -m acp-cmd/deepseek/deepseek-v4.1-flash#max "Prove the claim"
 
 ### Installing agents automatically
 
-A server can install or update its agent with `setup`. It runs once per server start, before that
-agent is first spawned; `opencode reload` re-imports the plugin, so it runs again then.
+A server can install or update its agent with `setup`. It runs once per OpenCode server process, before
+that agent is first spawned; every location (including each worktree) reuses the same run, and
+`opencode reload` reuses it too. Restarting the server runs it again.
 
 ```jsonc
 {
@@ -114,7 +115,8 @@ agent is first spawned; `opencode reload` re-imports the plugin, so it runs agai
 ```
 
 - The command runs through `sh -c` in the home directory, with the environment OpenCode inherited.
-- Identical commands share one run, even across servers; different commands run in parallel.
+- Identical commands share one run for the whole server process, even across servers and locations;
+  different commands run in parallel.
 - A failure (non-zero exit, signal, or a timeout after five minutes) is logged with the end of its
   output, and the agent still starts with whatever is already installed, so an offline start works.
 - Setup time is not counted against `initTimeoutMs`.
@@ -366,7 +368,7 @@ Set `"commands": false` in the plugin options to turn this off.
 | `id` | `string` | Required. Stable id. Becomes the provider id `acp-<id>`. |
 | `name` | `string` | Provider display name. Defaults to `<id> (ACP)`. |
 | `command` | `string \| string[]` | Required. Command that starts the ACP agent, e.g. `["cmd", "acp"]`. |
-| `setup` | `string` | Shell command that installs or updates the agent before it is first spawned, e.g. `vp add -g command-code@latest`. Runs once per server start. See [Installing agents automatically](#installing-agents-automatically). |
+| `setup` | `string` | Shell command that installs or updates the agent before it is first spawned, e.g. `vp add -g command-code@latest`. Runs once per OpenCode server process, shared by every location. See [Installing agents automatically](#installing-agents-automatically). |
 | `cwd` | `string` | Agent working directory. Defaults to the OpenCode location. |
 | `env` | `object` | Extra environment variables for the agent process. |
 | `credential` | `string` | OpenCode integration id whose saved credential is injected into the agent environment. |
@@ -416,8 +418,13 @@ error.
 
 ## How it works
 
-1. **Setup** starts discovery in the background. For each agent, it runs `initialize`, creates a
-   throwaway session to read the model inventory, then registers that agent's provider and models.
+1. **Setup** registers each agent's provider from the inventory its last discovery cached in plugin
+   storage, then starts discovery in the background. Discovery runs `initialize`, creates a throwaway
+   session to read the model inventory, and refreshes the registered models and the cache. A location
+   therefore has its models immediately — a fresh worktree included — without waiting for agents whose
+   inventory is already known; the first run of a new agent config still registers when it answers.
+   If a refreshed agent no longer offers a model, a turn that asks for it fails with the agent's own
+   error rather than an unavailable-model error from OpenCode.
 2. **Provider models** use the plugin's AI SDK adapter or the OpenAI-compatible fallback, both pointed
    at a loopback HTTP shim. Each model carries a `modelID` of `<server>::<acp-model>` so requests route
    to the right agent even when two agents expose the same model id. The agent's effort levels become
@@ -534,8 +541,11 @@ those models reach an ACP agent through the builtin `subagent` tool (see
   whose text matches a registered skill, so an agent's own bundled skill under a different
   description survives unless the agent marks it (codex's `$`, cmd's `skill:`).
 - Plugin setup runs per OpenCode location, so each open location gets its own agent processes and
-  shim. Agents start in parallel in the background. Each provider appears in the model picker
-  when its agent is ready. `initTimeoutMs` bounds each discovery attempt, not OpenCode startup.
+  shim. Each provider is registered from the cached inventory, so models are selectable immediately;
+  agents start in parallel in the background and refresh both the models and the cache.
+  `initTimeoutMs` bounds each discovery attempt, not OpenCode startup. The cache is keyed by the
+  server's command, environment, credential, and model allowlist, shared across locations, and
+  replaced on every successful discovery.
 - The skills mirror is rebuilt when plugin setup runs. Skills installed or edited while OpenCode
   stays open reach the agent after a reload. Built-in skills with a virtual `skill://` path have no
   supporting files to copy; only their `SKILL.md` body is mirrored. Native discovery does not run
@@ -584,6 +594,7 @@ Files:
 - `src/agent-command.ts` — reads an agent launch command: which executable it runs.
 - `src/setup.ts` — runs a server's install/update command once before its agent starts.
 - `src/server-manager.ts` — agents, credentials, model discovery, session pooling.
+- `src/inventory.ts` — caches each agent's last model inventory per server config.
 - `src/skills.ts` — mirrors OpenCode's skills into the agents' native skill trees.
 - `src/agents/` — per-agent customization; `src/agents/cmd/` adds Command Code mods to `cmd acp`.
 - `src/commands.ts` — exposes each agent's slash commands as namespaced OpenCode commands.

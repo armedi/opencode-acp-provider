@@ -18,6 +18,7 @@ import { createOpenCodeMcpSource } from "./mcp-config.ts"
 import { createSteering } from "./steering.ts"
 import { createSkillMirror } from "./skills.ts"
 import { createCommandBridge } from "./commands.ts"
+import { effortLevels, readInventory, writeInventory, type AcpInventory } from "./inventory.ts"
 import { debugLog } from "./debug.ts"
 
 type LogLevel = "debug" | "info" | "warn" | "error"
@@ -273,6 +274,8 @@ export default Plugin.define({
     const registrations: Awaited<ReturnType<typeof ctx.provider.transform>>[] = []
     const registered = new Set<string>()
     const providerIDs = new Map<string, string>()
+    /** The inventory a registered provider currently exposes, keyed by server id. */
+    const inventories = new Map<string, AcpInventory>()
 
     const providerIDForServer = (serverID: string) => {
       const existing = providerIDs.get(serverID)
@@ -286,17 +289,12 @@ export default Plugin.define({
       return id
     }
 
-    const registerProvider = async (state: AcpServerState) => {
-      if (disposed) return false
-      if (registered.has(state.config.id)) return true
-      if (!state.models.length) return false
-      const providerID = Provider.ID.make(providerIDForServer(state.config.id))
-      const effortLevels = [...new Set(state.efforts.filter((effort) => effort !== "default" && effort.trim()))]
-      const variants = effortLevels.map((effort) => ({
+    const providerModels = (state: AcpServerState, providerID: ReturnType<typeof Provider.ID.make>, inventory: AcpInventory) => {
+      const variants = effortLevels(inventory.efforts).map((effort) => ({
         id: Model.VariantID.make(effort),
         settings: { reasoningEffort: effort },
       }))
-      const models: Model.Info[] = state.models.map((model) => ({
+      return inventory.models.map((model) => ({
         ...Model.Info.default(providerID, Model.ID.make(model.id)),
         modelID: Model.ID.make(`${state.config.id}::${model.id}`),
         // Codex advertises names such as "6.1 Sol"; keep the GPT branding in
@@ -319,9 +317,19 @@ export default Plugin.define({
         // Pricing is reported by the ACP agent, not known here. An empty cost
         // list means "unknown" and avoids OpenCode's zero-cost "Free" badge.
         cost: [],
-      }))
+      })) as Model.Info[]
+    }
 
+    const registerProvider = async (state: AcpServerState) => {
+      if (disposed) return false
+      if (registered.has(state.config.id)) return true
+      if (!inventories.get(state.config.id)?.models.length) return false
+      const providerID = Provider.ID.make(providerIDForServer(state.config.id))
       const registration = await ctx.provider.transform((editor) => {
+        // Transforms replay on every rebuild, so read the current inventory
+        // rather than capturing the one known when this registration was made.
+        const inventory = inventories.get(state.config.id)
+        if (!inventory?.models.length) return
         editor.add({
           info: {
             ...Provider.Info.empty(providerID),
@@ -333,7 +341,7 @@ export default Plugin.define({
             compatibility: { reasoningField: "reasoning_content" },
             settings: { baseURL: shim.url, apiKey: shimToken },
           },
-          models,
+          models: providerModels(state, providerID, inventory),
         })
       })
       // The plugin can unload while OpenCode is registering this provider.
@@ -346,6 +354,49 @@ export default Plugin.define({
       return true
     }
 
+    const sameInventory = (left: AcpInventory | undefined, right: AcpInventory) => {
+      if (!left) return false
+      if (left.models.length !== right.models.length || left.efforts.length !== right.efforts.length) return false
+      const modelsMatch = left.models.every((model, index) => {
+        const other = right.models[index]
+        return other !== undefined && model.id === other.id && model.name === other.name && model.description === other.description
+      })
+      return modelsMatch && left.efforts.every((effort, index) => effort === right.efforts[index])
+    }
+
+    /** Register or refresh a server's models from what discovery reported. */
+    const publishInventory = async (state: AcpServerState) => {
+      const id = state.config.id
+      if (!state.models.length) return false
+      const next: AcpInventory = { models: state.models, efforts: effortLevels(state.efforts) }
+      const previous = inventories.get(id)
+      inventories.set(id, next)
+      if (!registered.has(id)) return registerProvider(state)
+      if (sameInventory(previous, next)) return true
+      try {
+        await ctx.provider.reload()
+      } catch (error) {
+        log(
+          "warn",
+          `could not refresh models for ACP server "${id}": ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+      return true
+    }
+
+    const persistInventory = async (state: AcpServerState) => {
+      const inventory = inventories.get(state.config.id)
+      if (!inventory) return
+      try {
+        await writeInventory(ctx.storage, state.config, inventory)
+      } catch (error) {
+        log(
+          "debug",
+          `could not cache models for ACP server "${state.config.id}": ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
+
     const scheduleRetry = (state: AcpServerState, attempt: number) => {
       if (attempt >= RETRY_DELAYS.length || disposed || state.retryable === false) return
       const timer = setTimeout(() => {
@@ -355,8 +406,10 @@ export default Plugin.define({
           try {
             await manager.refresh(state)
             if (disposed) return
-            if (await registerProvider(state)) {
-              log("info", `ACP server "${state.config.id}" registered after retry`)
+            if (state.models.length) {
+              await publishInventory(state)
+              await persistInventory(state)
+              log("info", `ACP server "${state.config.id}" refreshed after retry`)
               return
             }
             scheduleRetry(state, attempt + 1)
@@ -430,6 +483,22 @@ export default Plugin.define({
       // Reserve provider ids in configuration order so a server that succeeds
       // late cannot steal the id of one that already registered.
       for (const state of manager.list) providerIDForServer(state.config.id)
+
+      // A server whose models were discovered before, in another location or an
+      // earlier process, is registered now, so this location resolves them
+      // without waiting for its agent. Discovery still runs and refreshes the
+      // list when it lands.
+      await Promise.all(
+        manager.list.map(async (state) => {
+          const inventory = await readInventory(ctx.storage, state.config)
+          if (inventory) inventories.set(state.config.id, inventory)
+        }),
+      )
+      for (const state of manager.list) {
+        if (await registerProvider(state)) {
+          log("debug", `ACP server "${state.config.id}" registered from cached models`)
+        }
+      }
 
       // Expose the agents' own slash commands. Created before the agents start
       // so the first `available_commands_update` from each setup session is
@@ -539,14 +608,27 @@ export default Plugin.define({
 
       // Hooks must be in place before models become selectable. Discovery then
       // runs in parallel without holding up OpenCode or neighboring providers.
+      // A cached provider keeps its registration when an attempt fails; the
+      // retry below refreshes it once the agent answers.
       void manager.initialize(async (state) => {
         try {
-          if (await registerProvider(state) || disposed) return
-          if (state.retryable === false) {
-            log("error", `ACP server "${state.config.id}" cannot be registered: ${state.error ?? "no models available"}`)
+          if (state.models.length) {
+            await publishInventory(state)
+            await persistInventory(state)
             return
           }
-          log("warn", `deferring provider for ACP server "${state.config.id}": no models available yet`)
+          if (disposed) return
+          if (registered.has(state.config.id)) {
+            log(
+              "warn",
+              `ACP server "${state.config.id}" could not refresh its models: ${state.error ?? "no models available"}; keeping the cached list`,
+            )
+          } else if (state.retryable === false) {
+            log("error", `ACP server "${state.config.id}" cannot be registered: ${state.error ?? "no models available"}`)
+            return
+          } else {
+            log("warn", `deferring provider for ACP server "${state.config.id}": no models available yet`)
+          }
         } catch (error) {
           if (disposed) return
           log("warn", `could not register ACP server "${state.config.id}": ${error instanceof Error ? error.message : String(error)}`)

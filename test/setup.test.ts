@@ -63,6 +63,19 @@ test("logs a failing script and resolves anyway", async () => {
   expect(warn[0].message).toContain("boom")
 })
 
+test("shares the memo across plugin module instances in one process", async () => {
+  const dir = await temp()
+  const counter = join(dir, "count")
+  const script = `printf x >> '${counter}'`
+  const { entries, log } = recorder()
+  await runSetup(script, log)
+  // Every location loads its own copy of the plugin module.
+  const copy = await import(`../src/setup.ts?instance=${Date.now()}`)
+  await copy.runSetup(script, log)
+  expect(await readFile(counter, "utf8")).toBe("x")
+  expect(entries.filter((entry) => entry.message.startsWith("ACP setup: running"))).toHaveLength(1)
+})
+
 test("gives up on a script that runs past its timeout", async () => {
   const dir = await temp()
   const { log, warnings } = recorder()

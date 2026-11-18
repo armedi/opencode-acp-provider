@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises"
 import { fileURLToPath } from "node:url"
 import type { Plugin } from "@opencode/plugin"
 import plugin from "../src/index.ts"
+import { inventoryKey } from "../src/inventory.ts"
 
 const agent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url))
 type ProviderTransform = Parameters<Plugin.Context["provider"]["transform"]>[0]
@@ -75,6 +76,148 @@ test("loads without waiting for ACP and publishes each agent's models as it beco
     await rm(directory, { recursive: true, force: true })
   }
   expect(models()).toEqual([])
+}, 10_000)
+
+test("registers cached models before the agent starts and refreshes them after discovery", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-plugin-"))
+  const gate = join(directory, "cmd-ready")
+  try {
+    const transforms = new Set<ProviderTransform>()
+    const registered = () => {
+      const models = new Map<string, string[]>()
+      const editor = {
+        add: (provider: Parameters<Parameters<ProviderTransform>[0]["add"]>[0]) => {
+          for (const model of provider.models) {
+            models.set(
+              String(model.modelID),
+              model.variants.map((variant) => String(variant.id)),
+            )
+          }
+        },
+      } as Parameters<ProviderTransform>[0]
+      for (const transform of transforms) transform(editor)
+      return models
+    }
+    const waitFor = async (check: () => boolean) => {
+      const deadline = performance.now() + 3_000
+      while (!check() && performance.now() < deadline) await delay(10)
+      return check()
+    }
+
+    const values = new Map<string, unknown>()
+    const config = { id: "cmd", command: [process.execPath, agent, "--initialize-gate", gate] }
+    values.set(inventoryKey(config), { v: 1, models: [{ id: "cached", name: "Cached" }], efforts: ["high"] })
+    const registration = { dispose: async () => {} }
+    const ctx = {
+      location: { directory },
+      options: { skills: false, mcp: false, commands: false, logLevel: "error", servers: [config] },
+      provider: {
+        async transform(transform: ProviderTransform) {
+          transforms.add(transform)
+          return { dispose: async () => void transforms.delete(transform) }
+        },
+        async reload() {},
+      },
+      session: { hook: async () => registration },
+      mcp: { transform: async () => registration, list: async () => [] },
+      storage: {
+        async get(key: string) {
+          return values.get(key)
+        },
+        async set(key: string, value: unknown) {
+          values.set(key, value)
+        },
+        async remove(key: string) {
+          values.delete(key)
+        },
+      },
+    } as unknown as Plugin.Context
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const setup = Promise.resolve(plugin.setup(ctx))
+    const cleanup = await Promise.race([
+      setup,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("setup waited for the blocked agent")), 2_000)
+      }),
+    ])
+    clearTimeout(timer)
+    try {
+      expect(cleanup).toBeFunction()
+      // The cached model is selectable before the agent has answered.
+      expect([...registered().keys()]).toEqual(["cmd::cached"])
+      expect(registered().get("cmd::cached")).toEqual(["high"])
+
+      await writeFile(gate, "")
+      expect(await waitFor(() => registered().has("cmd::fast") && registered().has("cmd::slow"))).toBe(true)
+      expect(registered().has("cmd::cached")).toBe(false)
+
+      // Discovery replaces the cached entry with what the agent advertises.
+      expect(await waitFor(() => {
+        const cached = values.get(inventoryKey(config)) as { models?: Array<{ id: string }> } | undefined
+        return cached?.models?.some((model) => model.id === "fast") === true
+      })).toBe(true)
+      const cached = values.get(inventoryKey(config)) as { v: number; models: Array<{ id: string }> }
+      expect(cached.v).toBe(1)
+      expect(cached.models.map((model) => model.id).sort()).toEqual(["fast", "slow"])
+    } finally {
+      await writeFile(gate, "")
+      await cleanup?.()
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+}, 10_000)
+
+test("keeps cached models when the agent cannot start", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-plugin-"))
+  try {
+    const transforms = new Set<ProviderTransform>()
+    const models = () => {
+      const ids: string[] = []
+      const editor = {
+        add: (provider: Parameters<Parameters<ProviderTransform>[0]["add"]>[0]) => {
+          ids.push(...provider.models.map((model) => model.modelID))
+        },
+      } as Parameters<ProviderTransform>[0]
+      for (const transform of transforms) transform(editor)
+      return ids.sort()
+    }
+    const values = new Map<string, unknown>()
+    const config = { id: "cmd", command: [process.execPath, "-e", "process.exit(1)"] }
+    values.set(inventoryKey(config), { v: 1, models: [{ id: "cached", name: "Cached" }], efforts: [] })
+    const registration = { dispose: async () => {} }
+    const cleanup = await plugin.setup({
+      location: { directory },
+      options: { skills: false, mcp: false, commands: false, logLevel: "error", servers: [config] },
+      provider: {
+        async transform(transform: ProviderTransform) {
+          transforms.add(transform)
+          return { dispose: async () => void transforms.delete(transform) }
+        },
+        async reload() {},
+      },
+      session: { hook: async () => registration },
+      mcp: { transform: async () => registration, list: async () => [] },
+      storage: {
+        async get(key: string) {
+          return values.get(key)
+        },
+        async set() {},
+        async remove() {},
+      },
+    } as unknown as Plugin.Context)
+    try {
+      expect(models()).toEqual(["cmd::cached"])
+      // Discovery fails and schedules a retry; the cached provider stays usable.
+      await delay(200)
+      expect(models()).toEqual(["cmd::cached"])
+    } finally {
+      await cleanup?.()
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
 }, 10_000)
 
 test("bounds fallback provider requests without rewriting other providers' prompts", async () => {
