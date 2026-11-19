@@ -105,7 +105,7 @@ export async function createSkillMirror(
 ): Promise<SkillMirror> {
   const log = options.log ?? (() => {})
   const include = options.include ? new Set(options.include) : undefined
-  const root = await mkdtemp(join(tmpdir(), "opencode-acp-skills-"))
+  const root = await mkdtemp(join(tmpdir(), "opencode-acp-provider-skills-"))
   const agentsDir = join(root, ".agents", "skills")
   const claudeDir = join(root, ".claude", "skills")
   await mkdir(agentsDir, { recursive: true })

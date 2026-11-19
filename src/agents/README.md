@@ -59,5 +59,5 @@ longer sees that tool and should report it as unavailable rather than delegating
 `cmd acp` accepts the global `--skill` flag but its ACP action never applies it; only the interactive
 and print paths call `setSkillLoadOverrides`. Mods are loaded on the ACP path, and
 `cmd.addSkillsPath` feeds the same skill discovery plan. This mod reads
-`OPENCODE_ACP_SKILL_DIR` and registers it. The plugin sets the env var and loads the mod through
+`OPENCODE_ACP_PROVIDER_SKILL_DIR` and registers it. The plugin sets the env var and loads the mod through
 `cmd/index.ts`, like `no-native-orchestration.ts`; `--safe-mode` disables it like any other mod.

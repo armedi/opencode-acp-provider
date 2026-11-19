@@ -8,14 +8,15 @@ const FAILURE_TAIL_LINES = 20
 
 /**
  * One run per exact script string for the whole OpenCode server process. A
- * setup command installs or updates an agent, so an identical command must not
- * run again while it is in flight or after it finished; different commands are
- * independent and start in parallel. The memo lives on `globalThis` because
- * every location loads its own copy of this module: without it a new worktree
- * would reinstall every agent. Only a server restart runs the commands again;
- * an `opencode reload` in the same process reuses the finished runs.
+ * setup command can have side effects (installing, logging in, writing config),
+ * so an identical command must not run again while it is in flight or after it
+ * finished; different commands are independent and start in parallel. The memo
+ * lives on `globalThis` because every location loads its own copy of this
+ * module: without it a new worktree would rerun every command. Only a server
+ * restart runs the commands again; an `opencode reload` in the same process
+ * reuses the finished runs.
  */
-const MEMO = Symbol.for("opencode-acp.setup.runs")
+const MEMO = Symbol.for("opencode-acp-provider.setup.runs")
 
 type Runs = Map<string, Promise<void>>
 
@@ -25,9 +26,9 @@ function runs(): Runs {
 }
 
 /**
- * Run an agent's setup command once per OpenCode server process. Never rejects:
- * a failed or timed-out command resolves too, so the agent still starts with
- * whatever is already installed.
+ * Run a server's setup command once per OpenCode server process. Never rejects:
+ * a failed or timed-out command resolves too, so the agent still starts and the
+ * command is never a hard dependency.
  */
 export function runSetup(script: string, log: LogFn, options: { timeoutMs?: number } = {}): Promise<void> {
   const existing = runs().get(script)

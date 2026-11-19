@@ -29,8 +29,6 @@ function cacheInput(config: AcpServerConfig) {
   return {
     command: Array.isArray(config.command) ? config.command : [config.command],
     env: Object.entries(config.env ?? {}).sort(([a], [b]) => a.localeCompare(b)),
-    credential: config.credential ?? null,
-    credentialEnv: config.credentialEnv ?? null,
     models: config.models ?? null,
   }
 }

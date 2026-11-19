@@ -1,5 +1,5 @@
 {
-  "name": "opencode-acp-client",
+  "name": "opencode-acp-provider",
   "version": "0.6.0",
   "description": "OpenCode plugin that acts as an Agent Client Protocol (ACP) client and exposes registered ACP agents as model providers.",
   "type": "module",
@@ -8,8 +8,18 @@
   },
   "files": [
     "src",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/armedi/opencode-acp-provider.git"
+  },
+  "homepage": "https://github.com/armedi/opencode-acp-provider#readme",
+  "bugs": {
+    "url": "https://github.com/armedi/opencode-acp-provider/issues"
+  },
+  "author": "Armedi",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test"

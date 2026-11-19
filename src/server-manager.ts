@@ -20,20 +20,16 @@ export interface AcpServerConfig {
   /** Command and arguments that start the ACP agent, e.g. ["cmd", "acp"]. */
   command: string | string[]
   /**
-   * Shell command that installs or updates the agent, e.g.
-   * `"vp add -g command-code@latest"`. Runs once per plugin-module lifetime,
-   * before the agent is first spawned; a failure is logged and the agent still
-   * starts with whatever is already installed.
+   * Shell command run once before the agent is first spawned. Not limited to
+   * installation, e.g. `"vp add -g command-code@latest"` installs while a login
+   * or config-write command works too. Runs once per plugin-module lifetime; a
+   * failure is logged and the agent still starts.
    */
   setup?: string
   /** Working directory for the agent process. Defaults to the OpenCode location. */
   cwd?: string
   /** Extra environment variables for the agent process. */
   env?: Record<string, string>
-  /** OpenCode integration id whose credential is injected into the agent env. */
-  credential?: string
-  /** Env var that receives the credential. Defaults from the integration id. */
-  credentialEnv?: string
   /** Optional allowlist of ACP model ids to expose. */
   models?: string[]
   /** Default ACP model for direct tool calls. */
@@ -80,10 +76,6 @@ export interface AcpServerState {
   commands?: AcpCommand[]
 }
 
-export interface CredentialResolver {
-  (integrationID: string): Promise<string | undefined>
-}
-
 export interface AcpPermissionInput {
   server: string
   sessionKey: string
@@ -116,20 +108,6 @@ export interface AcpSessionStore {
   get(key: string): Promise<string | undefined>
   set(key: string, sessionId: string): Promise<void>
   delete(key: string): Promise<void>
-}
-
-const DEFAULT_CREDENTIAL_ENV: Record<string, string> = {
-  commandcode: "COMMAND_CODE_API_KEY",
-  deepseek: "DEEPSEEK_API_KEY",
-  openai: "OPENAI_API_KEY",
-  anthropic: "ANTHROPIC_API_KEY",
-  openrouter: "OPENROUTER_API_KEY",
-}
-
-function credentialEnvName(config: AcpServerConfig) {
-  if (config.credentialEnv) return config.credentialEnv
-  if (!config.credential) return undefined
-  return DEFAULT_CREDENTIAL_ENV[config.credential] ?? `${config.credential.toUpperCase()}_API_KEY`
 }
 
 function normalizeCommand(command: string | string[]): { command: string; args: string[] } {
@@ -199,7 +177,6 @@ const SWEEP_INTERVAL_MS = 60_000
 
 export class AcpServerManager {
   readonly servers = new Map<string, AcpServerState>()
-  private resolver: CredentialResolver
   private permissionResolver?: PermissionResolver
   private log: LogFn
   private defaultCwd: string
@@ -229,7 +206,6 @@ export class AcpServerManager {
   constructor(input: {
     servers: AcpServerConfig[]
     defaultCwd: string
-    resolveCredential?: CredentialResolver
     requestPermission?: PermissionResolver
     mcp?: McpProvider
     /** Persisted ACP session ids, so a restarted agent can resume its conversation. */
@@ -252,7 +228,6 @@ export class AcpServerManager {
     onCommands?: (server: string) => void
   }) {
     this.defaultCwd = input.defaultCwd
-    this.resolver = input.resolveCredential ?? (async () => undefined)
     this.permissionResolver = input.requestPermission
     this.mcp = input.mcp
     this.sessions = input.sessions
@@ -551,13 +526,7 @@ export class AcpServerManager {
     if (config.skills !== false && this.cmdSkillDir && isCmdCommand(config.command)) {
       // Read by agents/cmd/mods/opencode-skills.ts, which registers the directory
       // because `cmd acp` does not apply the global `--skill` flag.
-      env.OPENCODE_ACP_SKILL_DIR = this.cmdSkillDir
-    }
-    if (config.credential) {
-      const name = credentialEnvName(config)
-      const value = await this.resolver(config.credential)
-      if (value && name) env[name] = value
-      if (!value) this.log("warn", `no credential found for integration "${config.credential}"; starting "${config.id}" unauthenticated`)
+      env.OPENCODE_ACP_PROVIDER_SKILL_DIR = this.cmdSkillDir
     }
     this.assertLive()
 

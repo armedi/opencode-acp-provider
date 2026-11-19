@@ -5,7 +5,7 @@ const mod = (name: string) => fileURLToPath(new URL(`./mods/${name}`, import.met
 
 /** Hides cmd's native `agent`/`ask_user_question` tools so the MCP bridge's tools are used. */
 export const CMD_ORCHESTRATION_MOD = mod("no-native-orchestration.ts")
-/** Registers OPENCODE_ACP_SKILL_DIR with cmd, because `cmd acp` ignores `--skill`. */
+/** Registers OPENCODE_ACP_PROVIDER_SKILL_DIR with cmd, because `cmd acp` ignores `--skill`. */
 export const CMD_SKILL_MOD = mod("opencode-skills.ts")
 
 export interface CmdLaunchOptions {

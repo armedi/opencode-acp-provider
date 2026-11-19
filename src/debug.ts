@@ -8,8 +8,11 @@ import { join } from "node:path"
  * on Linux, where another user could otherwise claim the name first.
  */
 const FILE =
-  process.env.ACP_PLUGIN_LOG ??
-  join(tmpdir(), typeof process.getuid === "function" ? `opencode-acp-${process.getuid()}.log` : "opencode-acp.log")
+  process.env.OPENCODE_ACP_PROVIDER_LOG ??
+  join(
+    tmpdir(),
+    typeof process.getuid === "function" ? `opencode-acp-provider-${process.getuid()}.log` : "opencode-acp-provider.log",
+  )
 const MAX_BYTES = 10 * 1024 * 1024
 // Agent stderr can contain credentials, so keep the file private to this user.
 const FILE_MODE = 0o600

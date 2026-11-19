@@ -119,7 +119,7 @@ async function readLocalService(): Promise<LocalService | undefined> {
 }
 
 export default Plugin.define({
-  id: "acp.client",
+  id: "acp-provider",
   async setup(ctx) {
     const options = (ctx.options ?? {}) as AcpPluginOptions
     const servers = Array.isArray(options.servers) ? options.servers : []
@@ -239,15 +239,6 @@ export default Plugin.define({
       allowPathsOutsideCwd: options.allowPathsOutsideCwd === true,
       maxFileBytes: options.maxFileBytes,
       promptTimeoutMs: options.promptTimeoutMs,
-      resolveCredential: async (integrationID) => {
-        const connection = await ctx.integration.connection.active(integrationID)
-        if (!connection) return undefined
-        const credential = await ctx.integration.connection.resolve(connection)
-        if (!credential) return undefined
-        if (credential.type === "key") return credential.key
-        if (credential.type === "oauth") return credential.access
-        return undefined
-      },
       // Only consulted when a server sets `autoApprove: false`.
       requestPermission: async (input) => {
         const sessionID = input.sessionKey as Parameters<typeof ctx.permission.assert>[0]["sessionID"]
