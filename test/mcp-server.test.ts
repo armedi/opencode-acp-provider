@@ -22,6 +22,11 @@ function context(overrides: Record<string, any> = {}) {
         throw new Error("denied by test")
       },
     },
+    location: { directory: "/tmp/project", project: { id: "prj_default" } },
+    worktree: {
+      create: async () => ({ directory: "/tmp/wt" }),
+      remove: async () => {},
+    },
     ...overrides,
   } as any
 }
@@ -200,6 +205,149 @@ test("refuses to create a session without the session permission", async () => {
     expect(response.body.result.isError).toBe(true)
     expect(JSON.stringify(response.body.result)).toContain("Permission denied: session create")
     expect(created).toBe(false)
+  } finally {
+    lease.release()
+    await server.close()
+  }
+})
+
+test("creates a worktree for the caller's project and returns its directory", async () => {
+  let created: any
+  let asserted: any
+  const base = context()
+  const ctx = context({
+    session: {
+      ...base.session,
+      get: async ({ sessionID }: { sessionID: string }) => ({
+        id: sessionID,
+        projectID: "prj_1",
+        location: { directory: "/tmp/caller" },
+      }),
+    },
+    permission: {
+      assert: async (input: any) => {
+        asserted = input
+        if (input.action === "worktree" && input.metadata?.operation === "create" && input.resources?.[0] === "*") return
+        throw new Error("denied by test")
+      },
+    },
+    worktree: {
+      create: async (input: any) => {
+        created = input
+        return { directory: "/tmp/wt/task-a" }
+      },
+      remove: async () => {},
+    },
+  })
+  const { server, lease, token } = await start(ctx)
+  try {
+    const response = await rpc(server.url, token, {
+      jsonrpc: "2.0",
+      id: 7,
+      method: "tools/call",
+      params: {
+        name: "worktree_create",
+        arguments: { from: "abc123", name: "task-a", branch: "" },
+      },
+    })
+    expect(response.body.result.isError).toBeUndefined()
+    expect(created).toEqual({ projectID: "prj_1", from: "abc123", name: "task-a" })
+    expect(response.body.result.structuredContent).toEqual({ directory: "/tmp/wt/task-a" })
+    expect(asserted).toMatchObject({ action: "worktree", resources: ["*"], metadata: { operation: "create" } })
+  } finally {
+    lease.release()
+    await server.close()
+  }
+})
+
+test("removes a worktree with and without force", async () => {
+  const removed: any[] = []
+  const asserted: any[] = []
+  const base = context()
+  const ctx = context({
+    session: {
+      ...base.session,
+      get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, projectID: "prj_1" }),
+    },
+    permission: {
+      assert: async (input: any) => {
+        asserted.push(input)
+        if (input.action === "worktree" && input.metadata?.operation === "remove" && input.resources?.[0] === "/tmp/wt") return
+        throw new Error("denied by test")
+      },
+    },
+    worktree: {
+      create: async () => ({ directory: "/tmp/wt" }),
+      remove: async (input: any) => {
+        removed.push(input)
+      },
+    },
+  })
+  const { server, lease, token } = await start(ctx)
+  try {
+    const first = await rpc(server.url, token, {
+      jsonrpc: "2.0",
+      id: 8,
+      method: "tools/call",
+      params: { name: "worktree_remove", arguments: { directory: "/tmp/wt" } },
+    })
+    expect(first.body.result.isError).toBeUndefined()
+    expect(first.body.result.structuredContent).toEqual({ directory: "/tmp/wt", removed: true })
+
+    const second = await rpc(server.url, token, {
+      jsonrpc: "2.0",
+      id: 9,
+      method: "tools/call",
+      params: { name: "worktree_remove", arguments: { directory: "/tmp/wt", force: true } },
+    })
+    expect(second.body.result.isError).toBeUndefined()
+    expect(removed).toEqual([
+      { projectID: "prj_1", directory: "/tmp/wt", force: false },
+      { projectID: "prj_1", directory: "/tmp/wt", force: true },
+    ])
+    expect(asserted).toHaveLength(2)
+    for (const input of asserted) {
+      expect(input).toMatchObject({ action: "worktree", resources: ["/tmp/wt"], metadata: { operation: "remove" } })
+    }
+  } finally {
+    lease.release()
+    await server.close()
+  }
+})
+
+test("refuses worktree tools without the worktree permission", async () => {
+  let mutated = false
+  const ctx = context({
+    worktree: {
+      create: async () => {
+        mutated = true
+        return { directory: "/tmp/wt" }
+      },
+      remove: async () => {
+        mutated = true
+      },
+    },
+  })
+  const { server, lease, token } = await start(ctx)
+  try {
+    const create = await rpc(server.url, token, {
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: { name: "worktree_create", arguments: {} },
+    })
+    expect(create.body.result.isError).toBe(true)
+    expect(JSON.stringify(create.body.result)).toContain("Permission denied: worktree create")
+
+    const remove = await rpc(server.url, token, {
+      jsonrpc: "2.0",
+      id: 12,
+      method: "tools/call",
+      params: { name: "worktree_remove", arguments: { directory: "/tmp/wt" } },
+    })
+    expect(remove.body.result.isError).toBe(true)
+    expect(JSON.stringify(remove.body.result)).toContain("Permission denied: worktree remove")
+    expect(mutated).toBe(false)
   } finally {
     lease.release()
     await server.close()

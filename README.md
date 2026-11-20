@@ -229,6 +229,8 @@ token per ACP session. Every tool is a 1:1 wrapper:
 | `session_context` | `session.context` (defaults to the calling session; bounded to recent items) |
 | `session_wait` | `session.wait` (timeout does not cancel the session) |
 | `session_interrupt` | `session.interrupt` |
+| `worktree_create` | `worktree.create` for the calling session's project (returns the actual directory) |
+| `worktree_remove` | `worktree.remove` |
 
 The wrapped builtins (`subagent`, `question`, `todowrite`) assert their own permissions. The
 `session_*` tools are normally client-only, so they assert a `session` permission on the target id:
@@ -238,6 +240,12 @@ resource `*`:
 
 ```jsonc
 { "action": "session", "resource": "*", "effect": "allow" }
+```
+
+`worktree_create` asserts a `worktree` permission on resource `*`, and `worktree_remove` on the worktree directory:
+
+```jsonc
+{ "action": "worktree", "resource": "*", "effect": "allow" }
 ```
 
 MCP transport defaults to stdio, which runs `mcp-bridge.mjs` with `node` from `PATH`; set

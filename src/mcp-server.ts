@@ -46,6 +46,8 @@ const TOOL_ORDER = [
   "session_prompt",
   "session_wait",
   "session_interrupt",
+  "worktree_create",
+  "worktree_remove",
 ]
 
 export interface McpServerOptions {
@@ -713,7 +715,7 @@ async function buildTools(
         cursor: stringSchema("Paging cursor."),
       }),
       call: async (args, signal) => {
-        await assertSession(ctx, sessionKey, "*", "list", signal)
+        await assertPermission(ctx, sessionKey, "session", "*", "list", signal)
         return toMcpResult(await ctx.session.list(args ?? {}))
       },
     },
@@ -728,7 +730,7 @@ async function buildTools(
         directory: stringSchema("Defaults to your session's directory."),
       }),
       call: async (args, signal) => {
-        await assertSession(ctx, sessionKey, "*", "create", signal)
+        await assertPermission(ctx, sessionKey, "session", "*", "create", signal)
         const input = args ?? {}
         const caller = await ctx.session.get({ sessionID: sessionKey as any }).catch(() => undefined)
         const directory = nonEmpty(input.directory) ?? (caller as any)?.location?.directory ?? ctx.location.directory
@@ -771,7 +773,7 @@ async function buildTools(
         ["sessionID", "text"],
       ),
       call: async (args, signal) => {
-        await assertSession(ctx, sessionKey, args.sessionID, "prompt", signal)
+        await assertPermission(ctx, sessionKey, "session", args.sessionID, "prompt", signal)
         return toMcpResult(await ctx.session.prompt(args))
       },
     },
@@ -823,8 +825,50 @@ async function buildTools(
       inputSchema: objectSchema({ sessionID: stringSchema("Target session ID."), resume: { type: "boolean" } }, ["sessionID"]),
 
       call: async (args, signal) => {
-        await assertSession(ctx, sessionKey, args.sessionID, "interrupt", signal)
+        await assertPermission(ctx, sessionKey, "session", args.sessionID, "interrupt", signal)
         return toMcpResult(await ctx.session.interrupt(args))
+      },
+    },
+    {
+      name: "worktree_create",
+      description: "Create a git worktree for the calling session's project and return its directory. Pass `from` to start it at a specific commit or ref. Mirrors worktree.create.",
+      inputSchema: objectSchema({
+        from: stringSchema("Commit, branch, or tag to start from. Defaults to the project's current HEAD."),
+        branch: stringSchema("Branch for the worktree."),
+        name: stringSchema("Name for the worktree; used to pick its directory."),
+        directory: stringSchema("Requested directory. The worktree strategy may choose another; use the returned directory."),
+      }),
+      call: async (args, signal) => {
+        await assertPermission(ctx, sessionKey, "worktree", "*", "create", signal)
+        const input: Record<string, string> = { projectID: await callerProjectID(ctx, sessionKey) }
+        for (const field of ["from", "branch", "name", "directory"]) {
+          const value = nonEmpty(args?.[field])
+          if (value) input[field] = value
+        }
+        const created = await ctx.worktree.create(input as any)
+        return toMcpResult({ directory: created.directory })
+      },
+    },
+    {
+      name: "worktree_remove",
+      description: "Remove a worktree of the calling session's project by its directory. Mirrors worktree.remove.",
+      inputSchema: objectSchema(
+        {
+          directory: stringSchema("Worktree directory, as returned by worktree_create."),
+          force: { type: "boolean", description: "Remove even with uncommitted changes. Defaults to false." },
+        },
+        ["directory"],
+      ),
+      call: async (args, signal) => {
+        const directory = nonEmpty(args?.directory)
+        if (!directory) throw new Error("worktree remove requires a directory")
+        await assertPermission(ctx, sessionKey, "worktree", directory, "remove", signal)
+        await ctx.worktree.remove({
+          projectID: await callerProjectID(ctx, sessionKey),
+          directory,
+          force: args?.force === true,
+        } as any)
+        return toMcpResult({ directory, removed: true })
       },
     },
   )
@@ -849,15 +893,23 @@ async function subagentDescription(ctx: Ctx) {
 }
 
 /**
- * Ask for the `session` permission on a target session. Listing spans sessions,
- * so it is asserted against `"*"` and needs an explicit permission of its own.
+ * Ask for a `session` or `worktree` permission on a target. Listing spans
+ * targets, so it is asserted against `"*"` and needs an explicit permission of
+ * its own.
  */
-async function assertSession(ctx: Ctx, caller: string, target: any, operation: string, signal: AbortSignal) {
-  if (!target) throw new Error(`session ${operation} requires a sessionID`)
+async function assertPermission(
+  ctx: Ctx,
+  caller: string,
+  action: "session" | "worktree",
+  target: any,
+  operation: string,
+  signal: AbortSignal,
+) {
+  if (!target) throw new Error(`${action} ${operation} requires a ${action === "session" ? "sessionID" : "target"}`)
   try {
     await ctx.permission.assert({
       sessionID: caller as any,
-      action: "session",
+      action,
       resources: [String(target)],
       metadata: { operation },
     } as any)
@@ -865,7 +917,7 @@ async function assertSession(ctx: Ctx, caller: string, target: any, operation: s
     if (signal.aborted) throw error
     const message = error instanceof Error && error.message ? `: ${error.message}` : ""
     const scope = target === "*" ? "" : ` on ${target}`
-    throw new Error(`Permission denied: session ${operation}${scope}${message}`)
+    throw new Error(`Permission denied: ${action} ${operation}${scope}${message}`)
   }
 }
 
@@ -878,8 +930,14 @@ async function readTarget(
   signal: AbortSignal,
 ) {
   const target = typeof requested === "string" && requested ? requested : caller
-  if (target !== caller) await assertSession(ctx, caller, target, operation, signal)
+  if (target !== caller) await assertPermission(ctx, caller, "session", target, operation, signal)
   return target
+}
+
+/** The calling session's project, falling back to the plugin's own project. */
+async function callerProjectID(ctx: Ctx, sessionKey: string) {
+  const caller = (await ctx.session.get({ sessionID: sessionKey as any }).catch(() => undefined)) as any
+  return caller?.projectID ?? ctx.location.project.id
 }
 
 function nonEmpty(value: unknown): string | undefined {
