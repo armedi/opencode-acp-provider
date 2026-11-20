@@ -3,6 +3,7 @@
 // stdio and implements just enough of the protocol for the client.
 
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs"
+import { basename } from "node:path"
 
 let nextSession = 1
 const sessionDirectories = new Map()
@@ -160,9 +161,15 @@ function handle(message) {
       rememberSession(sessionId)
       const advertiseCommands = () => {
         if (process.argv.includes("--no-commands")) return
+        const availableCommands = [{ name: "compact", description: "Summarize the conversation so far" }]
+        // `--cwd-commands` names a command after the session directory, so a
+        // test can tell which manager's session advertised it.
+        if (process.argv.includes("--cwd-commands")) {
+          availableCommands.push({ name: `cwd-${basename(message.params?.cwd ?? "")}` })
+        }
         update(sessionId, {
           sessionUpdate: "available_commands_update",
-          availableCommands: [{ name: "compact", description: "Summarize the conversation so far" }],
+          availableCommands,
         })
       }
       // `--commands-first` advertises before the response, so the client sees a

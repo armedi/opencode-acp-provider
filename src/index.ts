@@ -10,6 +10,7 @@ import {
   type AcpServerState,
   type AcpSessionStore,
 } from "./server-manager.ts"
+import { sharedAgentPool } from "./agent-pool.ts"
 import { createShim } from "./shim.ts"
 import { boundedMessages, historyLimits, recentConversation } from "./prompt.ts"
 import { createAcpLanguageModel } from "./language-model.ts"
@@ -207,6 +208,7 @@ export default Plugin.define({
       defaultCwd: ctx.location.directory,
       log,
       sessions: sessionStore,
+      agents: sharedAgentPool(),
       onCommands: (server) => void commandBridge?.sync(server),
       mcp:
         mcp || openCodeMcp

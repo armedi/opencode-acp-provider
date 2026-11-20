@@ -1,3 +1,5 @@
+import { homedir } from "node:os"
+import { isAbsolute } from "node:path"
 import {
   ACP_REQUEST_CANCELLED,
   AcpClient,
@@ -7,6 +9,7 @@ import {
   type SessionUpdate,
   type PermissionHandler,
 } from "./acp-client.ts"
+import { AgentPool, type AgentLaunch, type AgentLease, type AgentSubscriber } from "./agent-pool.ts"
 import { applyCmdMods } from "./agents/cmd/index.ts"
 import { isCmdCommand } from "./agent-command.ts"
 import { runSetup } from "./setup.ts"
@@ -26,10 +29,21 @@ export interface AcpServerConfig {
    * failure is logged and the agent still starts.
    */
   setup?: string
-  /** Working directory for the agent process. Defaults to the OpenCode location. */
+  /**
+   * Working directory for the agent process and its sessions. When unset,
+   * sessions use the OpenCode location, and the process starts in the home
+   * directory if it is shared across directories (else in the OpenCode location).
+   */
   cwd?: string
   /** Extra environment variables for the agent process. */
   env?: Record<string, string>
+  /**
+   * Share one agent process across OpenCode directories. Defaults to true,
+   * except for Command Code (`cmd`), which binds a process to one directory and
+   * always gets its own process with a warm spare. Set false for other agents
+   * that serve one directory per process.
+   */
+  share?: boolean
   /** Optional allowlist of ACP model ids to expose. */
   models?: string[]
   /** Default ACP model for direct tool calls. */
@@ -201,6 +215,11 @@ export class AcpServerManager {
   private cmdSkillDir?: string
   private cmdOrchestration: boolean
   private onCommands?: (server: string) => void
+  /** Pool that owns agent processes; shared with other OpenCode directories when passed in. */
+  private agents: AgentPool
+  private ownsAgents: boolean
+  /** The pool lease each server's client came from, so released sessions do not outlive it. */
+  private leases = new Map<string, AgentLease>()
   private disposed = false
 
   constructor(input: {
@@ -226,6 +245,11 @@ export class AcpServerManager {
     cmdOrchestration?: boolean
     /** Called when a server's advertised command list changes. */
     onCommands?: (server: string) => void
+    /**
+     * Pool that owns agent processes. Pass `sharedAgentPool()` to share them
+     * across OpenCode directories; defaults to a private pool.
+     */
+    agents?: AgentPool
   }) {
     this.defaultCwd = input.defaultCwd
     this.permissionResolver = input.requestPermission
@@ -244,6 +268,8 @@ export class AcpServerManager {
     this.cmdSkillDir = input.cmdSkillDir
     this.cmdOrchestration = input.cmdOrchestration === true
     this.onCommands = input.onCommands
+    this.agents = input.agents ?? new AgentPool()
+    this.ownsAgents = input.agents === undefined
 
     for (const config of input.servers) {
       if (!config?.id || !config.command) continue
@@ -338,15 +364,37 @@ export class AcpServerManager {
     return effort && effort !== "default" ? effort : undefined
   }
 
-  private sessionDirectories(config: AcpServerConfig) {
-    return config.skills === false ? undefined : this.additionalDirectories
+  private sessionDirectories(config: AcpServerConfig, client?: AcpClient) {
+    const directories = [...(config.skills === false ? [] : (this.additionalDirectories ?? []))]
+    const lease = this.leases.get(config.id)
+    if (client && lease?.client === client) directories.push(...lease.readRoots)
+    return directories.length ? directories : undefined
   }
 
-  private commandFor(config: AcpServerConfig) {
-    return applyCmdMods(config.command, {
-      orchestration: this.cmdOrchestration,
-      skillDir: config.skills === false ? undefined : this.cmdSkillDir,
-    })
+  private launchFor(config: AcpServerConfig, skillDir: string | undefined): AgentLaunch {
+    const { command, args } = normalizeCommand(
+      applyCmdMods(config.command, { orchestration: this.cmdOrchestration, skillDir }),
+    )
+    const env: Record<string, string> = { ...config.env }
+    if (skillDir !== undefined && isCmdCommand(config.command)) {
+      // Read by agents/cmd/mods/opencode-skills.ts, which registers the directory
+      // because `cmd acp` does not apply the global `--skill` flag.
+      env.OPENCODE_ACP_PROVIDER_SKILL_DIR = skillDir
+    }
+    return {
+      command,
+      args,
+      env,
+      cwd:
+        config.cwd ??
+        (this.ownsAgents || (!isAbsolute(command) && /[\\/]/.test(command)) ? this.defaultCwd : homedir()),
+      scope: this.ownsAgents ? config.id : undefined,
+      autoApprove: config.autoApprove !== false,
+      requestTimeoutMs: this.requestTimeoutMs,
+      promptTimeoutMs: this.promptTimeoutMs,
+      allowPathsOutsideCwd: this.allowPathsOutsideCwd,
+      maxFileBytes: this.maxFileBytes,
+    }
   }
 
   /** Install or update the agent before it is spawned; memoized per script. */
@@ -415,18 +463,25 @@ export class AcpServerManager {
         model: selection.model,
         mcpServers: lease?.servers ?? pooled.mcpServers,
         meta: state.config.meta,
-        additionalDirectories: this.sessionDirectories(state.config),
+        additionalDirectories: this.sessionDirectories(state.config, pooled.client),
+        owner: this,
+        onCommands: (commands) => this.recordCommands(state, commands),
       })
       .catch((error) => {
         lease?.release()
         throw error
       })
+    if (this.disposed) {
+      await pooled.client.closeSession(session.sessionId, this).catch(() => {})
+      lease?.release()
+      throw new Error("ACP server manager is stopped")
+    }
     try {
       if (state.config.mode) await pooled.client.setMode(session.sessionId, state.config.mode).catch(() => {})
       await this.applyEffort(state, pooled.client, session.sessionId, selection.effort)
     } catch (error) {
       lease?.release()
-      await pooled.client.closeSession(session.sessionId).catch(() => {})
+      await pooled.client.closeSession(session.sessionId, this).catch(() => {})
       throw error
     }
     // The pool may have been closed while the new session was being prepared
@@ -434,7 +489,7 @@ export class AcpServerManager {
     // fresh lease here keeps its bridge token from outliving a dead pool.
     if (pooled.broken) {
       lease?.release()
-      await pooled.client.closeSession(session.sessionId).catch(() => {})
+      await pooled.client.closeSession(session.sessionId, this).catch(() => {})
       throw new Error(`ACP session for key ${pooled.key.slice(0, 24)} was closed while changing selection`)
     }
     const oldSession = pooled.sessionId
@@ -447,7 +502,7 @@ export class AcpServerManager {
       pooled.mcpRelease = lease.release
     }
     await this.rememberSession(poolKey, session.sessionId)
-    await pooled.client.closeSession(oldSession).catch(() => {})
+    await pooled.client.closeSession(oldSession, this).catch(() => {})
   }
 
   /** Discover enabled agents in parallel and report each result independently. */
@@ -521,92 +576,91 @@ export class AcpServerManager {
     // instant when discovery already ran it.
     await this.setupFor(state)
     this.assertLive()
-    const { command, args } = normalizeCommand(this.commandFor(config))
-    const env: Record<string, string> = { ...config.env }
-    if (config.skills !== false && this.cmdSkillDir && isCmdCommand(config.command)) {
-      // Read by agents/cmd/mods/opencode-skills.ts, which registers the directory
-      // because `cmd acp` does not apply the global `--skill` flag.
-      env.OPENCODE_ACP_PROVIDER_SKILL_DIR = this.cmdSkillDir
-    }
-    this.assertLive()
 
     const previous = state.client
     if (previous) {
       await this.closePoolsFor(config.id)
-      await previous.stop().catch(() => {})
+      this.leases.get(config.id)?.release()
+      this.leases.delete(config.id)
     }
+    this.assertLive()
 
-    const client = new AcpClient({
-      command,
-      args,
-      cwd: config.cwd ?? this.defaultCwd,
-      env,
-      autoApprove: config.autoApprove !== false,
-      requestTimeoutMs: this.requestTimeoutMs,
-      promptTimeoutMs: this.promptTimeoutMs,
-      allowPathsOutsideCwd: this.allowPathsOutsideCwd,
-      maxFileBytes: this.maxFileBytes,
-      onLog: (level, message) => this.log(level === "debug" ? "debug" : level, `[${config.id}] ${message}`),
-      onCommands: (_sessionId, commands) => this.recordCommands(state, commands),
+    const skillDir = config.skills === false ? undefined : this.cmdSkillDir
+    const subscriber: AgentSubscriber = {
+      onLog: (level, message) => this.log(level, `[${config.id}] ${message}`),
       onExit: (error) => {
         this.log("warn", `ACP agent "${config.id}" exited; pooled sessions were dropped: ${error.message}`)
         void this.closePoolsFor(config.id)
       },
-    })
+    }
+    const dedicated = isCmdCommand(config.command) || config.share === false
+    const lease = dedicated
+      ? this.agents.dedicated({ launch: (dir) => this.launchFor(config, dir), skillDir }, subscriber)
+      : this.agents.acquire(this.launchFor(config, skillDir), subscriber)
+    this.leases.set(config.id, lease)
+    const client = lease.client
     state.client = client
     state.retryable = true
 
     try {
       const session = await client.newSession(config.cwd ?? this.defaultCwd, {
         meta: config.meta,
-        additionalDirectories: this.sessionDirectories(config),
+        additionalDirectories: this.sessionDirectories(config, client),
+        owner: this,
+        onCommands: (commands) => this.recordCommands(state, commands),
       })
-      this.assertLive()
-      const defaultModel = session.currentModel ?? (session.modelConfigID ? undefined : "default")
-      let models = session.models.length
-        ? session.models
-        : defaultModel ? [{ id: defaultModel, name: session.currentModel ?? "Agent default" }] : []
-      if (!session.modelConfigID && config.model && config.model !== defaultModel) {
-        state.retryable = false
-        throw new Error(`ACP server "${config.id}" does not expose an ACP model selector; use "default" or omit "model"`)
-      }
-      if (config.models?.length) {
-        const allow = new Set(config.models)
-        models = models.filter((model) => allow.has(model.id))
-        if (!models.length) {
+      try {
+        this.assertLive()
+        const defaultModel = session.currentModel ?? (session.modelConfigID ? undefined : "default")
+        let models = session.models.length
+          ? session.models
+          : defaultModel ? [{ id: defaultModel, name: session.currentModel ?? "Agent default" }] : []
+        if (!session.modelConfigID && config.model && config.model !== defaultModel) {
           state.retryable = false
-          throw new Error(
-            `ACP server "${config.id}" advertised no model matching "models" (${config.models.join(", ")})`,
+          throw new Error(`ACP server "${config.id}" does not expose an ACP model selector; use "default" or omit "model"`)
+        }
+        if (config.models?.length) {
+          const allow = new Set(config.models)
+          models = models.filter((model) => allow.has(model.id))
+          if (!models.length) {
+            state.retryable = false
+            throw new Error(
+              `ACP server "${config.id}" advertised no model matching "models" (${config.models.join(", ")})`,
+            )
+          }
+        }
+        if (config.model && models.length && !models.some((model) => model.id === config.model)) {
+          this.log(
+            "warn",
+            `ACP server "${config.id}" does not advertise the configured model "${config.model}"; it will be sent anyway`,
           )
         }
-      }
-      if (config.model && models.length && !models.some((model) => model.id === config.model)) {
+        state.models = models
+        state.defaultModel = defaultModel
+        state.modelConfigID = session.modelConfigID
+        state.efforts = (session.efforts ?? []).filter((value) => value !== "default")
+        state.effortConfigID = session.effort?.configId
+        state.defaultEffort = session.effort?.currentValue
+        state.initialized = true
+        state.error = undefined
+        // The command list arrives as a notification just after `session/new`, so
+        // wait for it before this discovery session is closed: once it is gone,
+        // the only way to learn the list is to open another session.
+        const commands = await client.waitForCommands(session.sessionId, COMMAND_SNAPSHOT_TIMEOUT_MS)
+        if (commands) this.recordCommands(state, commands)
         this.log(
-          "warn",
-          `ACP server "${config.id}" does not advertise the configured model "${config.model}"; it will be sent anyway`,
+          "info",
+          `ACP server "${config.id}" ready with ${models.length} model(s)` +
+            (state.efforts.length ? ` and effort levels: ${state.efforts.join(", ")}` : ""),
         )
+      } finally {
+        await client.closeSession(session.sessionId, this).catch(() => {})
       }
-      state.models = models
-      state.defaultModel = defaultModel
-      state.modelConfigID = session.modelConfigID
-      state.efforts = (session.efforts ?? []).filter((value) => value !== "default")
-      state.effortConfigID = session.effort?.configId
-      state.defaultEffort = session.effort?.currentValue
-      state.initialized = true
-      state.error = undefined
-      // The command list arrives as a notification just after `session/new`, so
-      // wait for it before this discovery session is closed: once it is gone,
-      // the only way to learn the list is to open another session.
-      const commands = await client.waitForCommands(session.sessionId, COMMAND_SNAPSHOT_TIMEOUT_MS)
-      if (commands) this.recordCommands(state, commands)
-      await client.closeSession(session.sessionId).catch(() => {})
-      this.log(
-        "info",
-        `ACP server "${config.id}" ready with ${models.length} model(s)` +
-          (state.efforts.length ? ` and effort levels: ${state.efforts.join(", ")}` : ""),
-      )
     } catch (error) {
-      await client.stop().catch(() => {})
+      if (this.leases.get(config.id) === lease) {
+        lease.release()
+        this.leases.delete(config.id)
+      }
       if (state.client === client) state.client = undefined
       throw error
     }
@@ -671,18 +725,25 @@ export class AcpServerManager {
         const session = await client.newSession(cwd, {
           model,
           meta: state.config.meta,
-          additionalDirectories: this.sessionDirectories(state.config),
+          additionalDirectories: this.sessionDirectories(state.config, client),
+          owner: this,
+          onCommands: (commands) => this.recordCommands(state, commands),
         })
+        if (this.disposed) {
+          await client.closeSession(session.sessionId, this).catch(() => {})
+          throw new Error("ACP server manager is stopped")
+        }
         try {
           if (mode) await client.setMode(session.sessionId, mode).catch(() => {})
           await this.applyEffort(state, client, session.sessionId, effort)
           return await client.prompt(session.sessionId, prompt, {
+            owner: this,
             onUpdate: input.onUpdate,
             signal: input.signal,
             requestPermission: onPermission,
           })
         } finally {
-          await client.closeSession(session.sessionId)
+          await client.closeSession(session.sessionId, this)
         }
       }
 
@@ -713,7 +774,9 @@ export class AcpServerManager {
                   cwd,
                   mcpServers: lease?.servers,
                   meta: state.config.meta,
-                  additionalDirectories: this.sessionDirectories(state.config),
+                  additionalDirectories: this.sessionDirectories(state.config, client),
+                  owner: this,
+                  onCommands: (commands) => this.recordCommands(state, commands),
                 })
                 .catch(async (error) => {
                   this.log(
@@ -723,6 +786,11 @@ export class AcpServerManager {
                   await this.forgetSession(poolKey)
                   return undefined
                 })
+              if (this.disposed) {
+                if (restored) await client.closeSession(stored, this).catch(() => {})
+                lease?.release()
+                throw new Error("ACP server manager is stopped")
+              }
               if (restored) {
                 session = { sessionId: stored }
                 reused = true
@@ -738,8 +806,15 @@ export class AcpServerManager {
                 model,
                 mcpServers: lease?.servers,
                 meta: state.config.meta,
-                additionalDirectories: this.sessionDirectories(state.config),
+                additionalDirectories: this.sessionDirectories(state.config, client),
+                owner: this,
+                onCommands: (commands) => this.recordCommands(state, commands),
               })
+              if (this.disposed) {
+                await client.closeSession(session.sessionId, this).catch(() => {})
+                lease?.release()
+                throw new Error("ACP server manager is stopped")
+              }
               await this.rememberSession(poolKey, session.sessionId)
             }
             if (mode) await client.setMode(session.sessionId, mode).catch(() => {})
@@ -751,8 +826,13 @@ export class AcpServerManager {
             await this.applyEffort(state, client, session.sessionId, effort)
           } catch (error) {
             lease?.release()
-            if (session) await client.closeSession(session.sessionId).catch(() => {})
+            if (session) await client.closeSession(session.sessionId, this).catch(() => {})
             throw error
+          }
+          if (this.disposed) {
+            await client.closeSession(session.sessionId, this).catch(() => {})
+            lease?.release()
+            throw new Error("ACP server manager is stopped")
           }
           const created: PooledSession = {
             server: input.server,
@@ -812,6 +892,7 @@ export class AcpServerManager {
         pooled.history = "retained"
         const turn = pooled.client
           .prompt(pooled.sessionId, prompt, {
+            owner: this,
             onUpdate: input.onUpdate,
             signal: input.signal,
             requestPermission: onPermission,
@@ -822,7 +903,7 @@ export class AcpServerManager {
         // `prompt` has already written the request, so the agent sees the cancel
         // after the prompt it belongs to.
         if (key && this.startCancels.delete(key)) {
-          pooled.client.cancelTurn(pooled.sessionId)
+          pooled.client.cancelTurn(pooled.sessionId, this)
           this.log("debug", `cancelled ACP session ${pooled.sessionId} for a steer that arrived while it was starting`)
         }
         return turn
@@ -852,7 +933,7 @@ export class AcpServerManager {
     if (this.pools.get(poolKey) !== pooled) return
     const message = errorMessage(error)
     const unknown = isUnknownSession(error)
-    if (unknown || !pooled.client.alive || !pooled.client.hasSession(pooled.sessionId)) {
+    if (unknown || !pooled.client.alive || !pooled.client.hasSession(pooled.sessionId, this)) {
       void this.dropPool(poolKey, pooled)
       if (unknown) void this.forgetSession(poolKey)
       return
@@ -875,7 +956,7 @@ export class AcpServerManager {
     }
     // Ask the agent to end whatever it is still running so the queued or next
     // prompt enters the same context at a clean boundary.
-    pooled.client.cancelTurn(pooled.sessionId)
+    pooled.client.cancelTurn(pooled.sessionId, this)
     this.log("debug", `keeping ACP session ${pooled.sessionId} after a failed turn: ${message}`)
   }
 
@@ -884,7 +965,7 @@ export class AcpServerManager {
     pooled.broken = true
     if (this.pools.get(poolKey) === pooled) this.pools.delete(poolKey)
     pooled.mcpRelease?.()
-    await pooled.client.closeSession(pooled.sessionId).catch(() => {})
+    await pooled.client.closeSession(pooled.sessionId, this).catch(() => {})
   }
 
   /**
@@ -907,7 +988,7 @@ export class AcpServerManager {
       return
     }
 
-    pooled.client.cancelTurn(pooled.sessionId)
+    pooled.client.cancelTurn(pooled.sessionId, this)
     this.log("debug", `interrupted ACP session ${pooled.sessionId} so the queued message can be delivered`)
   }
 
@@ -930,6 +1011,7 @@ export class AcpServerManager {
     const run = pooled.queue.then(() => {
       if (pooled.broken) throw new Error(`ACP session ${pooled.sessionId} is no longer usable`)
       return pooled.client.prompt(pooled.sessionId, "/compact", {
+        owner: this,
         onUpdate: (update) => {
           // Claude Code reports a compaction as a tool call with its context size before and after.
           const output = update.rawOutput as { preTokens?: unknown; postTokens?: unknown } | undefined
@@ -997,14 +1079,24 @@ export class AcpServerManager {
     this.negotiating.clear()
     const pools = [...this.pools.values()]
     this.pools.clear()
-    // Best effort: the agents are killed below, so do not wait on a close
-    // handshake that could hang shutdown.
+    // Best effort: the agent may be shared with another directory, so do not
+    // wait on a close handshake that could hang shutdown.
     for (const pooled of pools) {
       pooled.broken = true
       pooled.mcpRelease?.()
-      void pooled.client.closeSession(pooled.sessionId).catch(() => {})
+      void pooled.client.closeSession(pooled.sessionId, this).catch(() => {})
     }
-    await Promise.allSettled([...this.servers.values()].map((state) => state.client?.stop()))
+    // Only this manager's sessions close; another directory's stay on the client.
+    for (const lease of this.leases.values()) {
+      for (const sessionId of lease.client.sessionsOwnedBy(this)) {
+        lease.client.cancelTurn(sessionId, this)
+        void lease.client.closeSession(sessionId, this).catch(() => {})
+      }
+    }
+    for (const lease of this.leases.values()) lease.release()
+    this.leases.clear()
+    for (const state of this.servers.values()) state.client = undefined
+    if (this.ownsAgents) await this.agents.stop()
   }
 }
 

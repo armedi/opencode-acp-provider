@@ -294,6 +294,20 @@ them would duplicate every OpenCode skill. A command list is per location, not p
 agents' commands are visible at once; running one on the wrong provider fails with a message naming
 the agent to switch to. Set `"commands": false` to turn this off.
 
+## Agent processes
+
+One process per agent is shared by every OpenCode directory (Claude, Codex, Antigravity, and any
+agent that takes the session `cwd`), so opening another directory does not start them again. Shared
+processes start in the home directory (or `cwd`), and each session uses its own directory. After the
+last directory releases an agent it keeps running for 60 s, so a reload reuses it. During a reload, a
+conversation that the old plugin instance is still running is handed to the new one when its turn
+ends.
+
+Command Code (`cmd`) binds a process to one directory, so it keeps one process per directory. The
+plugin keeps one pre-started spare `cmd` process (about 180 MB) that the next new directory adopts,
+skipping its ~3 s startup, with its skills linked in on adoption. Set `"share": false` for other
+agents that serve one directory per process.
+
 ## Server options
 
 | Option | Type | Meaning |
@@ -302,8 +316,9 @@ the agent to switch to. Set `"commands": false` to turn this off.
 | `name` | `string` | Provider display name. Defaults to `<id> (ACP)`. |
 | `command` | `string \| string[]` | Required. Command that starts the ACP agent, e.g. `["cmd", "acp"]`. |
 | `setup` | `string` | Shell command run once before the agent is first spawned. See [setup](#setup). |
-| `cwd` | `string` | Agent working directory. Defaults to the OpenCode location. |
+| `cwd` | `string` | Working directory for the agent process and its sessions. When unset, sessions use the OpenCode location, and the process starts in the home directory if it is shared across directories (else in the OpenCode location). |
 | `env` | `object` | Extra environment variables for the agent process, including any API key the agent reads. |
+| `share` | `boolean` | Share one agent process across OpenCode directories. Defaults to `true`, except for Command Code (`cmd`), which binds a process to one directory and always gets its own process with a warm spare. Set `false` for other agents that serve one directory per process. See [Agent processes](#agent-processes). |
 | `models` | `string[]` | Optional allowlist of model ids to expose. An agent without a model selector only exposes `default`. |
 | `model` | `string` | Default ACP model for the server. If the agent has no ACP model selector, omit this or use `default`. |
 | `effort` | `string` | Default ACP reasoning effort for sessions without a `#variant`. `cmd` accepts `off`, `low`, `high`, `max`, or `default`. Lower is faster; `off` disables thinking. Per-model variants override this. |

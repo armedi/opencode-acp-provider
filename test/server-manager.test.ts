@@ -1,12 +1,14 @@
 import { afterEach, expect, test } from "bun:test"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { AcpServerManager, type AcpSessionStore, type McpProvider } from "../src/server-manager.ts"
+import { AgentPool } from "../src/agent-pool.ts"
 
 const agent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url))
 const dirs: string[] = []
+const pools: AgentPool[] = []
 
 async function cwd() {
   const dir = await mkdtemp(join(tmpdir(), "acp-manager-"))
@@ -15,8 +17,61 @@ async function cwd() {
 }
 
 afterEach(async () => {
+  await Promise.all(pools.splice(0).map((pool) => pool.stop()))
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
 })
+
+/** A pool a test can hand to several managers, stopped with the test. */
+function agentPool() {
+  const instance = new AgentPool()
+  pools.push(instance)
+  return instance
+}
+
+async function until(check: () => boolean | Promise<boolean>, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    if (await check()) return true
+    if (Date.now() >= deadline) return false
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
+
+/** Every request the fixture logged, in the order it received them. */
+async function rpcRequests(file: string) {
+  const text = await readFile(file, "utf8").catch(() => "")
+  return text
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as { method: string; params?: Record<string, any> })
+}
+
+/** The sessions `session/new` opened, numbered the way the fixture numbers them. */
+function newSessions(requests: Array<{ method: string; params?: Record<string, any> }>) {
+  const sessions: Array<{ id: string; cwd?: string }> = []
+  for (const request of requests) {
+    if (request.method !== "session/new") continue
+    sessions.push({ id: `sess-${sessions.length + 1}`, cwd: request.params?.cwd })
+  }
+  return sessions
+}
+
+/** Session ids closed in the log so far. */
+async function closedSessions(file: string) {
+  return (await rpcRequests(file))
+    .filter((request) => request.method === "session/close")
+    .map((request) => request.params?.sessionId)
+}
+
+async function pids(file: string) {
+  const text = await readFile(file, "utf8").catch(() => "")
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+}
+
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 function store() {
   const entries = new Map<string, string>()
@@ -42,6 +97,7 @@ function manager(
     sessions?: AcpSessionStore
     maxSessions?: number
     mcp?: McpProvider
+    agents?: AgentPool
   } = {},
 ) {
   const instance = new AcpServerManager({
@@ -57,6 +113,7 @@ function manager(
     sessions: options.sessions,
     maxSessions: options.maxSessions,
     mcp: options.mcp,
+    agents: options.agents,
   })
   return { instance }
 }
@@ -633,5 +690,189 @@ test("resumes the stored session after the agent process crashes", async () => {
     expect(resumed.text).toBe("got:resumed after restart")
   } finally {
     await instance.stop()
+  }
+})
+
+test("shares one agent process across managers with a shared pool", async () => {
+  const root = await cwd()
+  const pidFile = join(root, "pids")
+  const rpcFile = join(root, "rpc.jsonl")
+  const dirOne = await cwd()
+  const dirTwo = await cwd()
+  const shared = agentPool()
+  const agentArgs = ["--pid-log", pidFile, "--rpc-log", rpcFile]
+  const first = manager({ defaultCwd: dirOne, agentArgs, agents: shared })
+  const second = manager({ defaultCwd: dirTwo, agentArgs, agents: shared })
+  try {
+    await first.instance.initialize()
+    await second.instance.initialize()
+    await first.instance.run({ server: "fake", prompt: "hi", key: "k1" })
+    await second.instance.run({ server: "fake", prompt: "hi", key: "k1" })
+
+    expect(await pids(pidFile)).toHaveLength(1)
+    // Discovery and the turn both opened in each manager's own directory.
+    const directories = new Set(newSessions(await rpcRequests(rpcFile)).map((session) => session.cwd))
+    expect([...directories].sort()).toEqual([dirOne, dirTwo].sort())
+
+    await first.instance.stop()
+    const again = await second.instance.run({ server: "fake", prompt: "again", key: "k1" })
+    expect(again.text).toBe("got:again")
+    expect(await pids(pidFile)).toHaveLength(1)
+  } finally {
+    await first.instance.stop()
+    await second.instance.stop()
+    await shared.stop()
+  }
+})
+
+test("keeps command lists per manager", async () => {
+  const dirOne = await cwd()
+  const dirTwo = await cwd()
+  const shared = agentPool()
+  const agentArgs = ["--cwd-commands"]
+  const first = manager({ defaultCwd: dirOne, agentArgs, agents: shared })
+  const second = manager({ defaultCwd: dirTwo, agentArgs, agents: shared })
+  try {
+    await Promise.all([first.instance.initialize(), second.instance.initialize()])
+    expect(first.instance.servers.get("fake")?.commands?.map((command) => command.name)).toEqual([
+      "compact",
+      `cwd-${basename(dirOne)}`,
+    ])
+    expect(second.instance.servers.get("fake")?.commands?.map((command) => command.name)).toEqual([
+      "compact",
+      `cwd-${basename(dirTwo)}`,
+    ])
+  } finally {
+    await first.instance.stop()
+    await second.instance.stop()
+    await shared.stop()
+  }
+})
+
+test("stopping one manager closes only its sessions", async () => {
+  const root = await cwd()
+  const pidFile = join(root, "pids")
+  const sessionsFile = join(root, "sessions.json")
+  const rpcFile = join(root, "rpc.jsonl")
+  const dirOne = await cwd()
+  const dirTwo = await cwd()
+  const shared = agentPool()
+  const agentArgs = ["--pid-log", pidFile, "--rpc-log", rpcFile, "--sessions-file", sessionsFile]
+  const first = manager({ defaultCwd: dirOne, agentArgs, agents: shared })
+  const second = manager({ defaultCwd: dirTwo, agentArgs, agents: shared })
+  try {
+    await first.instance.initialize()
+    await second.instance.initialize()
+    await first.instance.run({ server: "fake", prompt: "first", key: "k1" })
+    await second.instance.run({ server: "fake", prompt: "second", key: "k1" })
+    const sessions = newSessions(await rpcRequests(rpcFile))
+    const firstTurn = sessions.filter((session) => session.cwd === dirOne).at(-1)!
+    const secondTurn = sessions.filter((session) => session.cwd === dirTwo).at(-1)!
+
+    await first.instance.stop()
+    expect(await until(async () => (await closedSessions(rpcFile)).includes(firstTurn.id))).toBe(true)
+    expect(await closedSessions(rpcFile)).not.toContain(secondTurn.id)
+
+    // Manager 2 still holds its session on the shared process and reuses it.
+    const opened = (await rpcRequests(rpcFile)).filter((request) => request.method === "session/new").length
+    const next = await second.instance.run({ server: "fake", prompt: "next", key: "k1" })
+    expect(next.text).toBe("got:next")
+    expect((await rpcRequests(rpcFile)).filter((request) => request.method === "session/new")).toHaveLength(opened)
+    expect(await pids(pidFile)).toHaveLength(1)
+  } finally {
+    await first.instance.stop()
+    await second.instance.stop()
+    await shared.stop()
+  }
+})
+
+test("a late session/new after stop is closed", async () => {
+  const root = await cwd()
+  const gate = join(root, "ready")
+  const rpcFile = join(root, "rpc.jsonl")
+  const dirOne = await cwd()
+  const dirTwo = await cwd()
+  const shared = agentPool()
+  const agentArgs = ["--initialize-gate", gate, "--rpc-log", rpcFile]
+  const first = manager({ defaultCwd: dirOne, agentArgs, agents: shared })
+  const second = manager({ defaultCwd: dirTwo, agentArgs, agents: shared })
+  try {
+    // The second manager keeps the shared process alive after the first releases it.
+    const secondReady = second.instance.initialize()
+    const pending = first.instance.run({ server: "fake", prompt: "hi", key: "k" }).then(
+      () => "resolved",
+      (error: Error) => error.message,
+    )
+    await wait(200)
+    await first.instance.stop()
+    await writeFile(gate, "")
+
+    expect(await pending).toBe("ACP server manager is stopped")
+    await secondReady
+    expect(
+      await until(async () => {
+        const sessions = newSessions(await rpcRequests(rpcFile)).filter((session) => session.cwd === dirOne)
+        const closed = await closedSessions(rpcFile)
+        return sessions.length > 0 && sessions.every((session) => closed.includes(session.id))
+      }),
+    ).toBe(true)
+  } finally {
+    await first.instance.stop()
+    await second.instance.stop()
+    await shared.stop()
+  }
+})
+
+test("hands a running conversation to the reloaded manager", async () => {
+  const root = await cwd()
+  const sessionsFile = join(root, "sessions.json")
+  const rpcFile = join(root, "rpc.jsonl")
+  const dir = await cwd()
+  const shared = agentPool()
+  const { entries, sessionStore } = store()
+  const agentArgs = ["--sessions-file", sessionsFile, "--rpc-log", rpcFile]
+  const old = manager({ defaultCwd: dir, agentArgs, agents: shared, sessions: sessionStore })
+  const fresh = manager({ defaultCwd: dir, agentArgs, agents: shared, sessions: sessionStore })
+  try {
+    await old.instance.initialize()
+    const oldTurn = old.instance.run({ server: "fake", prompt: "hang", key: "k" })
+    // The fixture holds a `hang` turn open, so the prompt reaches it and stays there.
+    expect(
+      await until(async () => (await rpcRequests(rpcFile)).some((request) => request.method === "session/prompt")),
+    ).toBe(true)
+
+    let freshSettled = false
+    const freshRun = fresh.instance.run({ server: "fake", prompt: "next", key: "k" }).finally(() => {
+      freshSettled = true
+    })
+    void freshRun.catch(() => {})
+    await wait(200)
+    expect(freshSettled).toBe(false)
+
+    old.instance.interrupt("k")
+    expect(await oldTurn).toEqual({ stopReason: "cancelled", text: "cancelled" })
+    expect((await freshRun).text).toBe("got:next")
+
+    const stored = [...entries.values()][0]
+    const requests = await rpcRequests(rpcFile)
+    const resume = requests.findIndex(
+      (request) => request.method === "session/resume" && request.params?.sessionId === stored,
+    )
+    const close = requests.findIndex(
+      (request) => request.method === "session/close" && request.params?.sessionId === stored,
+    )
+    expect(close).toBeGreaterThan(-1)
+    expect(resume).toBeGreaterThan(close)
+
+    const closes = (await closedSessions(rpcFile)).filter((sessionId) => sessionId === stored).length
+    await old.instance.stop()
+    await wait(200)
+    expect((await closedSessions(rpcFile)).filter((sessionId) => sessionId === stored)).toHaveLength(closes)
+
+    expect((await fresh.instance.run({ server: "fake", prompt: "later", key: "k" })).text).toBe("got:later")
+  } finally {
+    await old.instance.stop()
+    await fresh.instance.stop()
+    await shared.stop()
   }
 })
