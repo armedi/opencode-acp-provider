@@ -876,3 +876,36 @@ test("hands a running conversation to the reloaded manager", async () => {
     await shared.stop()
   }
 })
+
+test("stops a running turn when its manager stops", async () => {
+  const root = await cwd()
+  const rpcFile = join(root, "rpc.jsonl")
+  const dirOne = await cwd()
+  const dirTwo = await cwd()
+  const shared = agentPool()
+  const agentArgs = ["--rpc-log", rpcFile]
+  const first = manager({ defaultCwd: dirOne, agentArgs, agents: shared })
+  const second = manager({ defaultCwd: dirTwo, agentArgs, agents: shared })
+  try {
+    await first.instance.initialize()
+    await second.instance.initialize()
+    // The second manager keeps the shared process alive after the first releases it.
+    const turn = first.instance.run({ server: "fake", prompt: "hang", key: "k" })
+    const settled = turn.then(
+      (result) => result,
+      (error: Error) => error.message,
+    )
+    expect(
+      await until(async () => (await rpcRequests(rpcFile)).some((request) => request.method === "session/prompt")),
+    ).toBe(true)
+
+    await first.instance.stop()
+    const outcome = await Promise.race([settled, wait(2_000).then(() => "pending" as const)])
+    expect(outcome).not.toBe("pending")
+    expect(outcome).toMatchObject({ stopReason: "cancelled" })
+  } finally {
+    await first.instance.stop()
+    await second.instance.stop()
+    await shared.stop()
+  }
+})

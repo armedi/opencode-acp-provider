@@ -1080,10 +1080,13 @@ export class AcpServerManager {
     const pools = [...this.pools.values()]
     this.pools.clear()
     // Best effort: the agent may be shared with another directory, so do not
-    // wait on a close handshake that could hang shutdown.
+    // wait on a close handshake that could hang shutdown. Closing drops the
+    // session from the client, so its owner loop below can no longer see it:
+    // end the turn here, or a shared agent would keep running one nobody reads.
     for (const pooled of pools) {
       pooled.broken = true
       pooled.mcpRelease?.()
+      pooled.client.cancelTurn(pooled.sessionId, this)
       void pooled.client.closeSession(pooled.sessionId, this).catch(() => {})
     }
     // Only this manager's sessions close; another directory's stay on the client.
