@@ -183,6 +183,8 @@ interface SessionState {
   configOptions: AcpConfigOption[]
   onUpdate?: (update: SessionUpdate) => void
   requestPermission?: PermissionHandler
+  /** Called when this session's command list is advertised. */
+  onCommands?: (commands: AcpCommand[]) => void
 }
 
 interface RequestOptions {
@@ -224,6 +226,12 @@ export class AcpError extends Error {
   }
 }
 
+/** True for an AcpError, including one built by another evaluation of this module. */
+export function isAcpError(error: unknown): error is AcpError {
+  return error instanceof AcpError ||
+    (error instanceof Error && error.name === "AcpError" && typeof (error as { code?: unknown }).code === "number")
+}
+
 export class AcpClient {
   private child?: ChildProcessWithoutNullStreams
   private buffer = ""
@@ -235,6 +243,8 @@ export class AcpClient {
   private commands = new Map<string, AcpCommand[]>()
   /** Callers waiting for a session's first command list. */
   private commandWaiters = new Map<string, (commands: AcpCommand[] | undefined) => void>()
+  /** Children signalled by `stop()` that have not reported `exit` yet. */
+  private stopping = new Set<ChildProcessWithoutNullStreams>()
   private started?: Promise<AgentHandshake>
   private handshake?: AgentHandshake
   private closed = false
@@ -349,6 +359,9 @@ export class AcpClient {
     this.buffer = ""
     this.stderrBuffer = ""
     this.sessions.clear()
+    this.commands.clear()
+    for (const finish of [...this.commandWaiters.values()]) finish(undefined)
+    this.commandWaiters.clear()
     const pending = [...this.pending.values()]
     this.pending.clear()
     for (const entry of pending) entry.reject(error)
@@ -442,6 +455,7 @@ export class AcpClient {
       this.commands.set(sessionId, commands)
       this.commandWaiters.get(sessionId)?.(commands)
       this.options.onCommands?.(sessionId, commands)
+      this.sessions.get(sessionId)?.onCommands?.(commands)
     } else if (update.sessionUpdate === "usage_update") {
       this.log(
         "debug",
@@ -453,6 +467,7 @@ export class AcpClient {
 
   private async onRequest(message: RpcMessage) {
     const method = message.method!
+    const child = this.child
     try {
       if (method === "session/request_permission") {
         const params = message.params ?? {}
@@ -464,7 +479,7 @@ export class AcpClient {
           // MCP `question` tool. Never auto-approve one: the first option is an
           // answer, not permission.
           this.log("debug", `declining native ACP question: ${question}`)
-          this.reply(message.id!, { outcome: { outcome: "cancelled" } })
+          this.reply(message.id!, { outcome: { outcome: "cancelled" } }, undefined, undefined, child)
           return
         }
 
@@ -486,36 +501,52 @@ export class AcpClient {
               ? await handler(info).catch(() => false)
               : false
         if (!approved || !allow?.optionId) {
-          this.reply(message.id!, { outcome: { outcome: "cancelled" } })
+          this.reply(message.id!, { outcome: { outcome: "cancelled" } }, undefined, undefined, child)
           return
         }
         this.log("debug", `approving ACP permission: ${info.title}`)
-        this.reply(message.id!, { outcome: { outcome: "selected", optionId: allow.optionId } })
+        this.reply(
+          message.id!,
+          { outcome: { outcome: "selected", optionId: allow.optionId } },
+          undefined,
+          undefined,
+          child,
+        )
         return
       }
 
       if (method === "fs/read_text_file") {
         const content = await this.readTextFile(message.params ?? {})
-        this.reply(message.id!, { content })
+        this.reply(message.id!, { content }, undefined, undefined, child)
         return
       }
 
       if (method === "fs/write_text_file") {
         await this.writeTextFile(message.params ?? {})
-        this.reply(message.id!, {})
+        this.reply(message.id!, {}, undefined, undefined, child)
         return
       }
 
       this.log("warn", `unsupported ACP client method: ${method}`)
-      this.reply(message.id!, undefined, -32601, `Method not supported by client: ${method}`)
+      this.reply(message.id!, undefined, -32601, `Method not supported by client: ${method}`, child)
     } catch (error) {
       const text = errorMessage(error)
-      const code = error instanceof AcpError ? error.code : -32603
-      this.reply(message.id!, undefined, code, text)
+      const code = isAcpError(error) ? error.code : -32603
+      this.reply(message.id!, undefined, code, text, child)
     }
   }
 
-  private reply(id: number | string, result: any, errorCode?: number, errorMessage?: string) {
+  private reply(
+    id: number | string,
+    result: any,
+    errorCode?: number,
+    errorMessage?: string,
+    child?: ChildProcessWithoutNullStreams,
+  ) {
+    if (child && this.child !== child) {
+      this.log("debug", "dropping reply to a request from a previous agent process")
+      return
+    }
     try {
       if (errorCode !== undefined) {
         this.write({ jsonrpc: "2.0", id, error: { code: errorCode, message: errorMessage ?? "error" } })
@@ -617,6 +648,8 @@ export class AcpClient {
       mcpServers?: AcpMcpServer[]
       additionalDirectories?: string[]
       meta?: Record<string, unknown>
+      /** Called when this session's command list is advertised, including one that arrived before registration. */
+      onCommands?: (commands: AcpCommand[]) => void
     } = {},
   ) {
     await this.start()
@@ -636,7 +669,15 @@ export class AcpClient {
       }))
     const effort = readEffortConfig(configOptions)
 
-    this.sessions.set(sessionId, { cwd, additionalDirectories: options.additionalDirectories, configOptions })
+    this.sessions.set(sessionId, {
+      cwd,
+      additionalDirectories: options.additionalDirectories,
+      configOptions,
+      onCommands: options.onCommands,
+    })
+    // The notification can arrive before the response that names the session.
+    const advertised = this.commands.get(sessionId)
+    if (advertised) options.onCommands?.(advertised)
 
     try {
       if (options.model && !modelOption) throw new AcpError("Agent does not expose an ACP model selector", -32602)
@@ -679,6 +720,8 @@ export class AcpClient {
       mcpServers?: AcpMcpServer[]
       additionalDirectories?: string[]
       meta?: Record<string, unknown>
+      /** Called when this session's command list is advertised, including one that arrived before registration. */
+      onCommands?: (commands: AcpCommand[]) => void
     },
   ): Promise<"resumed" | "loaded" | undefined> {
     const capabilities = (await this.start()).agentCapabilities
@@ -696,7 +739,11 @@ export class AcpClient {
       cwd: options.cwd,
       additionalDirectories: options.additionalDirectories,
       configOptions: result.configOptions ?? [],
+      onCommands: options.onCommands,
     })
+    // The notification can arrive before the response that names the session.
+    const advertised = this.commands.get(sessionId)
+    if (advertised) options.onCommands?.(advertised)
     return resume ? "resumed" : "loaded"
   }
 
@@ -871,11 +918,21 @@ export class AcpClient {
     const child = this.child
     this.child = undefined
     if (child) {
+      this.stopping.add(child)
+      child.once("exit", () => this.stopping.delete(child))
+      if (child.exitCode !== null || child.signalCode !== null) this.stopping.delete(child)
       this.killChild(child, "SIGTERM")
       const timer = setTimeout(() => {
         if (child.exitCode === null && child.signalCode === null) this.killChild(child, "SIGKILL")
       }, SIGKILL_DELAY_MS)
       timer.unref?.()
+    }
+  }
+
+  /** SIGKILL the agent (and its process group) right away, including one still stopping. Safe to call repeatedly; for `process.on("exit")`. */
+  killSync() {
+    for (const child of [this.child, ...this.stopping]) {
+      if (child && child.exitCode === null && child.signalCode === null) this.killChild(child, "SIGKILL")
     }
   }
 

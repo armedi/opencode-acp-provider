@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { AcpClient } from "../src/acp-client.ts"
+import { AcpClient, AcpError, isAcpError } from "../src/acp-client.ts"
 
 const agent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url))
 
@@ -19,6 +19,17 @@ function client(
     requestTimeoutMs: options.requestTimeoutMs,
   })
 }
+
+test("recognises an AcpError built by another evaluation of this module", () => {
+  class Foreign extends Error {
+    name = "AcpError"
+    code = -32002
+  }
+  expect(isAcpError(new AcpError("x", -32002))).toBe(true)
+  expect(isAcpError(new Foreign())).toBe(true)
+  expect(isAcpError(new Error("x"))).toBe(false)
+  expect(isAcpError({ name: "AcpError", code: 1 })).toBe(false)
+})
 
 test("runs an ACP session end to end", async () => {
   const acp = client()
@@ -92,6 +103,54 @@ test("stop rejects a turn that is still running", async () => {
   await new Promise((resolve) => setTimeout(resolve, 50))
   await acp.stop()
   await expect(pending).rejects.toThrow("stopped")
+})
+
+test("killSync ends an agent that is still stopping", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "acp-kill-sync-"))
+  const log = join(dir, "pids")
+  const acp = client({ agentArgs: ["--pid-log", log] })
+  try {
+    await acp.start()
+    const pid = Number((await readFile(log, "utf8")).trim().split("\n")[0])
+    void acp.stop()
+    acp.killSync()
+    let gone = false
+    const deadline = Date.now() + 2_000
+    while (!gone && Date.now() < deadline) {
+      try {
+        process.kill(pid, 0)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      } catch {
+        gone = true
+      }
+    }
+    expect(gone).toBe(true)
+  } finally {
+    await acp.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("drops command caches when the agent exits", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "acp-command-cache-"))
+  const log = join(dir, "pids")
+  const acp = client({ agentArgs: ["--pid-log", log] })
+  try {
+    const session = await acp.newSession(tmpdir())
+    expect(await acp.waitForCommands(session.sessionId, 2_000)).toEqual([
+      { name: "compact", description: "Summarize the conversation so far" },
+    ])
+    expect(acp.hasCommand(session.sessionId, "compact")).toBe(true)
+    const pid = Number((await readFile(log, "utf8")).trim().split("\n")[0])
+    process.kill(pid, "SIGKILL")
+    const deadline = Date.now() + 2_000
+    while (acp.alive && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(acp.alive).toBe(false)
+    expect(acp.hasCommand(session.sessionId, "compact")).toBe(false)
+  } finally {
+    await acp.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test("terminates an agent whose handshake times out before starting another one", async () => {

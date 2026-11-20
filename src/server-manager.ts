@@ -1,7 +1,7 @@
 import {
   ACP_REQUEST_CANCELLED,
   AcpClient,
-  AcpError,
+  isAcpError,
   type AcpCommand,
   type AcpMcpServer,
   type SessionUpdate,
@@ -395,7 +395,7 @@ export class AcpServerManager {
         pooled.selection = selection
         return
       } catch (error) {
-        if (!(error instanceof AcpError) || ![-32601, -32602].includes(error.code)) throw error
+        if (!isAcpError(error) || ![-32601, -32602].includes(error.code)) throw error
         this.log("debug", `ACP session refused a selection change; replaying in a fresh session: ${error.message}`)
       }
     }
@@ -858,7 +858,7 @@ export class AcpServerManager {
       return
     }
     pooled.failures += 1
-    if (error instanceof AcpError && error.code === ACP_REQUEST_CANCELLED) {
+    if (isAcpError(error) && error.code === ACP_REQUEST_CANCELLED) {
       // A stopped turn is normal; the agent already ended it, so the session
       // is intact and the next prompt picks up the same conversation.
       pooled.failures = 0
@@ -1009,7 +1009,7 @@ export class AcpServerManager {
 }
 
 function isUnknownSession(error: unknown) {
-  if (!(error instanceof AcpError)) return false
+  if (!isAcpError(error)) return false
   if (error.code === ACP_UNKNOWN_SESSION) return true
   return /unknown (acp )?session|session .*not found|session .*does not exist/i.test(error.message)
 }

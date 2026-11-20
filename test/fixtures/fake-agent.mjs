@@ -158,17 +158,22 @@ function handle(message) {
       sessionDirectories.set(sessionId, message.params?.additionalDirectories ?? [])
       sessionMcp.set(sessionId, message.params?.mcpServers ?? [])
       rememberSession(sessionId)
-      send({
-        jsonrpc: "2.0",
-        id: message.id,
-        result: { sessionId, configOptions: process.argv.includes("--no-model-selector") ? [] : optionsFor(sessionId) },
-      })
-      if (!process.argv.includes("--no-commands")) {
+      const advertiseCommands = () => {
+        if (process.argv.includes("--no-commands")) return
         update(sessionId, {
           sessionUpdate: "available_commands_update",
           availableCommands: [{ name: "compact", description: "Summarize the conversation so far" }],
         })
       }
+      // `--commands-first` advertises before the response, so the client sees a
+      // session id through a notification before `session/new` returns it.
+      if (process.argv.includes("--commands-first")) advertiseCommands()
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { sessionId, configOptions: process.argv.includes("--no-model-selector") ? [] : optionsFor(sessionId) },
+      })
+      if (!process.argv.includes("--commands-first")) advertiseCommands()
       return
     }
     case "session/resume":

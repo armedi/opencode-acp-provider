@@ -172,6 +172,71 @@ test("skips advertising nothing when the agent has no commands", async () => {
   }
 })
 
+test("routes command lists to the session that advertised them", async () => {
+  const first: string[][] = []
+  const second: string[][] = []
+  const acp = new AcpClient({
+    command: process.execPath,
+    args: [agent],
+    cwd: tmpdir(),
+    autoApprove: true,
+  })
+  try {
+    const one = await acp.newSession(tmpdir(), {
+      onCommands: (commands) => first.push(commands.map((command) => command.name)),
+    })
+    const two = await acp.newSession(tmpdir(), {
+      onCommands: (commands) => second.push(commands.map((command) => command.name)),
+    })
+    await acp.waitForCommands(one.sessionId, 2_000)
+    await acp.waitForCommands(two.sessionId, 2_000)
+    expect(first).toEqual([["compact"]])
+    expect(second).toEqual([["compact"]])
+  } finally {
+    await acp.stop()
+  }
+})
+
+test("replays a list that arrived before the session registered", async () => {
+  // The agent advertises commands before the `session/new` response, so no
+  // session state exists when the notification arrives.
+  const first: string[][] = []
+  const acp = new AcpClient({
+    command: process.execPath,
+    args: [agent, "--commands-first"],
+    cwd: tmpdir(),
+    autoApprove: true,
+  })
+  try {
+    const session = await acp.newSession(tmpdir(), {
+      onCommands: (commands) => first.push(commands.map((command) => command.name)),
+    })
+    expect(session.sessionId).toStartWith("sess-")
+    expect(first).toEqual([["compact"]])
+  } finally {
+    await acp.stop()
+  }
+})
+
+test("never calls a session callback when the agent advertises no commands", async () => {
+  const seen: string[][] = []
+  const acp = new AcpClient({
+    command: process.execPath,
+    args: [agent, "--no-commands"],
+    cwd: tmpdir(),
+    autoApprove: true,
+  })
+  try {
+    const session = await acp.newSession(tmpdir(), {
+      onCommands: (commands) => seen.push(commands.map((command) => command.name)),
+    })
+    expect(await acp.waitForCommands(session.sessionId, 300)).toBeUndefined()
+    expect(seen).toEqual([])
+  } finally {
+    await acp.stop()
+  }
+})
+
 test("registers a namespaced command and forwards its arguments to the session", async () => {
   const manager = await managerWithCommands()
   const { ctx, added, prompts } = context({
