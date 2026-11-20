@@ -181,6 +181,17 @@ interface SessionState {
   /** Extra directories granted at session/new; readable through client fs. */
   additionalDirectories?: string[]
   configOptions: AcpConfigOption[]
+  /**
+   * The object that opened this session, usually the server manager. A call
+   * matches the session when it passes no owner, when the session has no
+   * owner, or when both are the same object; a mismatched call is refused.
+   */
+  owner?: object
+  /**
+   * The session's running prompt request, with rejections swallowed, so a new
+   * owner can wait for the turn to end before taking the session over.
+   */
+  turn?: Promise<unknown>
   onUpdate?: (update: SessionUpdate) => void
   requestPermission?: PermissionHandler
   /** Called when this session's command list is advertised. */
@@ -239,6 +250,8 @@ export class AcpClient {
   private nextID = 1
   private pending = new Map<number | string, Pending>()
   private sessions = new Map<string, SessionState>()
+  /** Restores in flight per session id, so a takeover runs before the next restore. */
+  private restoring = new Map<string, Promise<unknown>>()
   /** Slash commands each session advertised in `available_commands_update`. */
   private commands = new Map<string, AcpCommand[]>()
   /** Callers waiting for a session's first command list. */
@@ -257,6 +270,15 @@ export class AcpClient {
 
   private log(level: "debug" | "warn" | "error", message: string) {
     this.options.onLog?.(level, message)
+  }
+
+  /**
+   * A call may touch a session when it passes no owner, when the session has
+   * no owner, or when it passes the session's owner.
+   */
+  private matchesOwner(session: SessionState | undefined, owner: object | undefined) {
+    if (!session) return true
+    return owner === undefined || session.owner === undefined || session.owner === owner
   }
 
   /** Spawn the agent and run the ACP initialize handshake, restarting if it died. */
@@ -648,6 +670,8 @@ export class AcpClient {
       mcpServers?: AcpMcpServer[]
       additionalDirectories?: string[]
       meta?: Record<string, unknown>
+      /** The object that owns this session, e.g. the server manager that opened it. */
+      owner?: object
       /** Called when this session's command list is advertised, including one that arrived before registration. */
       onCommands?: (commands: AcpCommand[]) => void
     } = {},
@@ -673,6 +697,7 @@ export class AcpClient {
       cwd,
       additionalDirectories: options.additionalDirectories,
       configOptions,
+      owner: options.owner,
       onCommands: options.onCommands,
     })
     // The notification can arrive before the response that names the session.
@@ -720,7 +745,36 @@ export class AcpClient {
       mcpServers?: AcpMcpServer[]
       additionalDirectories?: string[]
       meta?: Record<string, unknown>
+      /** The object that owns this session now, e.g. the server manager that restored it. */
+      owner?: object
       /** Called when this session's command list is advertised, including one that arrived before registration. */
+      onCommands?: (commands: AcpCommand[]) => void
+    },
+  ): Promise<"resumed" | "loaded" | undefined> {
+    // Restores of one session run one at a time, so a takeover cannot interleave
+    // with another caller's resume.
+    const previous = this.restoring.get(sessionId)
+    const restore = (async () => {
+      if (previous) await previous.catch(() => {})
+      return await this.doRestoreSession(sessionId, options)
+    })()
+    this.restoring.set(sessionId, restore)
+    restore
+      .catch(() => {})
+      .finally(() => {
+        if (this.restoring.get(sessionId) === restore) this.restoring.delete(sessionId)
+      })
+    return await restore
+  }
+
+  private async doRestoreSession(
+    sessionId: string,
+    options: {
+      cwd: string
+      mcpServers?: AcpMcpServer[]
+      additionalDirectories?: string[]
+      meta?: Record<string, unknown>
+      owner?: object
       onCommands?: (commands: AcpCommand[]) => void
     },
   ): Promise<"resumed" | "loaded" | undefined> {
@@ -728,6 +782,16 @@ export class AcpClient {
     const resume = capabilities?.sessionCapabilities?.resume !== undefined
     const load = capabilities?.loadSession === true
     if (!resume && !load) return undefined
+
+    // Whoever holds the session may still be draining a turn: let that turn end,
+    // then close the session so the old owner's later calls are no-ops. The
+    // agent persists the conversation, and the resume below reattaches it.
+    const existing = this.sessions.get(sessionId)
+    if (existing && existing.owner !== options.owner) {
+      await existing.turn
+      if (this.sessions.get(sessionId) === existing) await this.closeSession(sessionId).catch(() => {})
+    }
+
     const timeout = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
     const result = await this.request(
       resume ? "session/resume" : "session/load",
@@ -739,6 +803,7 @@ export class AcpClient {
       cwd: options.cwd,
       additionalDirectories: options.additionalDirectories,
       configOptions: result.configOptions ?? [],
+      owner: options.owner,
       onCommands: options.onCommands,
     })
     // The notification can arrive before the response that names the session.
@@ -748,8 +813,19 @@ export class AcpClient {
   }
 
   /** Whether this client still holds the ACP session and can take another prompt. */
-  hasSession(sessionId: string) {
-    return this.sessions.has(sessionId)
+  hasSession(sessionId: string, owner?: object) {
+    const session = this.sessions.get(sessionId)
+    if (!session) return false
+    return this.matchesOwner(session, owner)
+  }
+
+  /** Ids of the sessions whose owner is exactly this object. */
+  sessionsOwnedBy(owner: object): string[] {
+    const owned: string[] = []
+    for (const [sessionId, session] of this.sessions) {
+      if (session.owner === owner) owned.push(sessionId)
+    }
+    return owned
   }
 
   /** Whether the agent process is running and usable. */
@@ -799,6 +875,8 @@ export class AcpClient {
     sessionId: string,
     prompt: string | ContentBlock[],
     handlers: {
+      /** The object that owns the session; a mismatched call is refused. */
+      owner?: object
       onUpdate?: (update: SessionUpdate) => void
       signal?: AbortSignal
       requestPermission?: PermissionHandler
@@ -808,6 +886,9 @@ export class AcpClient {
     const blocks: ContentBlock[] = typeof prompt === "string" ? [{ type: "text", text: prompt }] : prompt
     const session = this.sessions.get(sessionId)
     if (!session) throw new AcpError(`Unknown ACP session: ${sessionId}`)
+    if (!this.matchesOwner(session, handlers.owner)) {
+      throw new AcpError("ACP session is owned by another client", -32003)
+    }
     session.requestPermission = handlers.requestPermission
 
     let text = ""
@@ -820,16 +901,21 @@ export class AcpClient {
     session.onUpdate = onUpdate
 
     const promptTimeout = this.options.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS
+    const request = this.request(
+      "session/prompt",
+      { sessionId, prompt: blocks },
+      {
+        timeout: promptTimeout,
+        signal: handlers.signal,
+        onAbort: () => this.cancelTurn(sessionId, handlers.owner),
+      },
+    )
+    // A new owner waits on this turn to know the session is free; it must never
+    // reject, or a taken-over turn would surface as an unhandled rejection.
+    const turn = request.catch(() => {})
+    session.turn = turn
     try {
-      const result = await this.request(
-        "session/prompt",
-        { sessionId, prompt: blocks },
-        {
-          timeout: promptTimeout,
-          signal: handlers.signal,
-          onAbort: () => this.cancelTurn(sessionId),
-        },
-      )
+      const result = await request
       // Usage stays in the debug log: no ACP number is right for both of the
       // ways OpenCode reads a step's tokens (context size and spend).
       if (result?.usage || result?._meta?.usage) {
@@ -840,6 +926,7 @@ export class AcpClient {
       }
       return { stopReason: result?.stopReason ?? "end_turn", text }
     } finally {
+      if (session.turn === turn) session.turn = undefined
       const current = this.sessions.get(sessionId)
       if (current?.onUpdate === onUpdate) {
         current.onUpdate = undefined
@@ -849,7 +936,8 @@ export class AcpClient {
   }
 
   /** Ask the agent to end the running turn; `session/prompt` then resolves with `cancelled`. */
-  cancelTurn(sessionId: string) {
+  cancelTurn(sessionId: string, owner?: object) {
+    if (!this.matchesOwner(this.sessions.get(sessionId), owner)) return
     try {
       this.notify("session/cancel", { sessionId })
     } catch {
@@ -886,7 +974,8 @@ export class AcpClient {
     })
   }
 
-  async closeSession(sessionId: string) {
+  async closeSession(sessionId: string, owner?: object) {
+    if (!this.matchesOwner(this.sessions.get(sessionId), owner)) return
     this.sessions.delete(sessionId)
     this.commands.delete(sessionId)
     this.commandWaiters.delete(sessionId)

@@ -241,3 +241,92 @@ test("lets reads, but not writes, reach the session's additional directories", a
     await rm(extra, { recursive: true, force: true })
   }
 })
+
+/** The requests the fake agent received, in order: `{method, params}` per line. */
+async function rpcCalls(file: string): Promise<Array<{ method: string; params?: any }>> {
+  let text = ""
+  try {
+    text = await readFile(file, "utf8")
+  } catch {
+    return []
+  }
+  return text
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+}
+
+test("hands a live session to a new owner after its turn ends", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "acp-owner-"))
+  const sessions = join(dir, "sessions.json")
+  const rpc = join(dir, "rpc.log")
+  const acp = client({ agentArgs: ["--sessions-file", sessions, "--rpc-log", rpc] })
+  const A = {}
+  const B = {}
+  try {
+    const { sessionId } = await acp.newSession(dir, { owner: A })
+    const turnA = acp.prompt(sessionId, "hang", { owner: A })
+
+    const restoring = acp.restoreSession(sessionId, { cwd: dir, owner: B })
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect((await rpcCalls(rpc)).some((call) => call.method === "session/resume")).toBe(false)
+
+    // A does not own the session anymore: B's cancel must not end A's turn.
+    acp.cancelTurn(sessionId, B)
+    const settled = await Promise.race([
+      turnA.then(() => "settled" as const),
+      new Promise((resolve) => setTimeout(() => resolve("pending" as const), 100)),
+    ])
+    expect(settled).toBe("pending")
+
+    acp.cancelTurn(sessionId, A)
+    expect((await turnA).stopReason).toBe("cancelled")
+    expect(await restoring).toBe("resumed")
+
+    const calls = await rpcCalls(rpc)
+    const closed = calls.findIndex(
+      (call) => call.method === "session/close" && call.params?.sessionId === sessionId,
+    )
+    const resumed = calls.findIndex(
+      (call) => call.method === "session/resume" && call.params?.sessionId === sessionId,
+    )
+    expect(closed).toBeGreaterThanOrEqual(0)
+    expect(resumed).toBeGreaterThan(closed)
+
+    expect(acp.hasSession(sessionId, A)).toBe(false)
+    expect(acp.hasSession(sessionId, B)).toBe(true)
+    expect(acp.sessionsOwnedBy(B)).toEqual([sessionId])
+
+    // The old owner's late cleanup leaves the new owner's session alone.
+    await acp.closeSession(sessionId, A)
+    expect(acp.hasSession(sessionId, B)).toBe(true)
+    expect(
+      (await rpcCalls(rpc)).filter(
+        (call) => call.method === "session/close" && call.params?.sessionId === sessionId,
+      ),
+    ).toHaveLength(1)
+
+    await expect(acp.prompt(sessionId, "hi", { owner: A })).rejects.toMatchObject({ code: -32003 })
+  } finally {
+    await acp.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("keeps calls without an owner working", async () => {
+  const acp = client({ promptTimeoutMs: 0 })
+  try {
+    const { sessionId } = await acp.newSession(tmpdir())
+    expect((await acp.prompt(sessionId, "hello")).text).toBe("got:hello")
+
+    const turn = acp.prompt(sessionId, "hang")
+    acp.cancelTurn(sessionId)
+    expect((await turn).stopReason).toBe("cancelled")
+    expect(acp.hasSession(sessionId)).toBe(true)
+
+    await acp.closeSession(sessionId)
+    expect(acp.hasSession(sessionId)).toBe(false)
+  } finally {
+    await acp.stop()
+  }
+})

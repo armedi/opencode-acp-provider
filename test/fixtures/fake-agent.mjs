@@ -269,7 +269,11 @@ function handle(message) {
           error: { code: -32000, message: "scripted failure" },
         })
       }
-      if (/\bhang\b/i.test(text)) return
+      if (/\bhang\b/i.test(text)) {
+        // Hold the turn open until the client cancels it.
+        runningTurns.set(sessionId, { id: message.id, text })
+        return
+      }
       if (/\bcrash\b/i.test(text)) {
         // Simulate the agent process dying mid-turn.
         process.exit(1)
