@@ -258,7 +258,7 @@ test("bounds fallback provider requests without rewriting other providers' promp
       system: [{ type: "text", text: "Title instructions" }],
       messages: [
         {
-          role: "user",
+          role: "assistant",
           content: [{ type: "text", text: `${"old transcript ".repeat(1_000)}abcdefghijklmnopqrstuvwxyz` }],
         },
         { role: "user", content: [{ type: "text", text: "latest" }] },
@@ -278,6 +278,72 @@ test("bounds fallback provider requests without rewriting other providers' promp
     await hooks.get("title")!(title)
     expect(title.system).toEqual(request("acp-fake").system)
     expect(title.messages).toEqual(primary.messages)
+  } finally {
+    await cleanup?.()
+  }
+})
+
+test("only a lone background wake attaches its continuation to the turn", async () => {
+  const hooks = new Map<string, (event: any) => void>()
+  const registration = { dispose: async () => {} }
+  const cleanup = await plugin.setup({
+    location: { directory: tmpdir() },
+    options: {
+      skills: false,
+      mcp: false,
+      commands: false,
+      logLevel: "error",
+      servers: [{ id: "fake", command: [process.execPath, agent] }],
+    },
+    provider: { transform: async () => registration },
+    session: {
+      async hook(name: string, handler: (event: any) => void) {
+        hooks.set(name, handler)
+        return registration
+      },
+    },
+  } as unknown as Plugin.Context)
+  try {
+    const context = (messages: unknown[]) => ({
+      sessionID: "ses_wake_queue",
+      model: { providerID: "acp-fake", modelID: "fake::fast" },
+      system: [],
+      messages,
+    })
+    const request = () => ({
+      sessionID: "ses_wake_queue",
+      model: { providerID: "acp-fake", modelID: "fake::fast" },
+      kind: "primary",
+      headers: {} as Record<string, string>,
+    })
+
+    // A lone wake attaches even with a stripped <system-update> beside it.
+    hooks.get("context")!(context([
+      { role: "assistant", content: [{ type: "text", text: "waiting" }] },
+      {
+        role: "user",
+        content: [{ type: "text", text: "Background command finished: sleep 1" }],
+        metadata: { source: "acp-background", acpContinuation: "cont-1" },
+      },
+      { role: "user", content: [{ type: "text", text: "<system-update>\nTool catalog changed\n</system-update>" }] },
+    ]))
+    const lone = request()
+    hooks.get("model.request")!(lone)
+    expect(lone.headers["x-acp-continuation"]).toBe("cont-1")
+
+    // A wake queued behind another pending message must run as a normal prompt.
+    hooks.get("context")!(context([
+      { role: "assistant", content: [{ type: "text", text: "waiting" }] },
+      { role: "user", content: [{ type: "text", text: "<subagent>\nBackground finding.\n</subagent>" }] },
+      {
+        role: "user",
+        content: [{ type: "text", text: "Background command finished: sleep 1" }],
+        metadata: { source: "acp-background", acpContinuation: "cont-2" },
+      },
+    ]))
+    const queued = request()
+    hooks.get("model.request")!(queued)
+    expect(queued.headers["x-acp-continuation"]).toBeUndefined()
   } finally {
     await cleanup?.()
   }
