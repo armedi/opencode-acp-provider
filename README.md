@@ -66,8 +66,8 @@ reuses the run, and a server restart runs it again.
     // any command works, e.g. preparing a config file the agent reads at startup
     {
       "id": "agy",
-      "setup": "mkdir -p ~/.config/agy && cp ./agy.json ~/.config/agy/config.json",
-      "command": ["agy", "acp"]
+      "setup": "mkdir -p ~/.gemini/config && cp ./agy-hooks.json ~/.gemini/config/hooks.json",
+      "command": ["agy", "acp", "--process-per-session"]
     }
   ]
 }
@@ -93,7 +93,7 @@ delegation and questions through the MCP bridge instead of a second hidden agent
 | --- | --- | --- | --- |
 | Claude Code (`claude`) | `["claude-agent-acp"]` | adapter's own login | `meta.claudeCode.options.disallowedTools` |
 | Codex (`codex`) | `["codex-acp"]` | adapter's own login | `CODEX_CONFIG` env |
-| Antigravity (`agy`) | `["agy", "acp"]` | `agy acp --login` or `GEMINI_API_KEY` | `PreToolUse` hook |
+| Antigravity (`agy`) | `["agy", "acp", "--process-per-session"]` | `agy acp --login` or `GEMINI_API_KEY` | `PreToolUse` hook |
 | Command Code (`cmd`) | `["cmd", "acp"]` | sign in with `cmd` itself | companion mod (automatic) |
 
 ### Claude Code (`claude`)
@@ -129,9 +129,13 @@ Ships its own ACP stdio server, so it needs no adapter package:
 
 ```jsonc
 {
-  "servers": [{ "id": "agy", "setup": "agy update", "command": ["agy", "acp"] }]
+  "servers": [{ "id": "agy", "setup": "agy update", "command": ["agy", "acp", "--process-per-session"] }]
 }
 ```
+
+- **Session isolation.** `--process-per-session` isolates each session's worker process so the
+  `opencode` MCP server keeps its name across sessions (and is required for injected HTTP MCP
+  servers).
 
 - **Model ids.** The session's `model` select lists base ids without the thinking level, while
   `agy models` appends it (`<model>-high`). Use the base ids the selector lists.
@@ -269,7 +273,7 @@ the agent in `session/new`'s `additionalDirectories`, so each agent reads them w
 
 Skills already living in `.agents/skills` or `.claude/skills` belong to the agents and stay put.
 Skipped: no description, `opencode/autoinvoke: false`, or an ID not portable lowercase kebab-case.
-`"skills": false` opts a server out; `{ "skills": ["opencode"] }` allowlists specific IDs.
+`"skills": false` on a server entry opts that server out; `"skills": ["opencode"]` at the plugin level allowlists specific skill IDs.
 
 `cmd` ignores `additionalDirectories` and never applies `--skill` on the ACP path, so a companion mod
 registers the directory itself; an explicit `--skill`, `--no-skills`, or `--safe-mode` wins. Native
@@ -352,14 +356,14 @@ Restarting the service refreshes discovery. Slash commands are still discovered 
 | `initTimeoutMs` | How long one agent may take to initialize. Defaults to `20000`; a failed server is retried in the background under the same bound. |
 | `requestTimeoutMs` | Timeout for the ACP handshake and control calls such as `session/new`. Defaults to `15000`; raise it for agents that start slowly. |
 | `promptTimeoutMs` | How long one ACP turn may run. Defaults to `1800000` (30 minutes); `0` disables the cap. |
-| `toolCallDisplay` | `inline` (default) shows finished ACP tool calls as transcript lines; `off` hides them. |
+| `toolCallDisplay` | `inline` (default) shows finished ACP tool calls as transcript lines on the fallback chat-completions route when OpenCode cannot render native tool cards; `off` hides them. |
 | `mcp` | Expose OpenCode tools to ACP agents through the MCP bridge. Defaults to `true`. |
 | `commands` | Register the agents' own slash commands as namespaced OpenCode commands. Defaults to `true`. See [Commands](#commands). |
 | `skills` | Mirror OpenCode's skills into the agents' native skill discovery. Defaults to `true`; `false` disables it, and an array such as `["opencode"]` is an allowlist. |
 | `mcpTransport` | `stdio` (default) or `http`. Use `http` only for an agent that accepts injected HTTP MCP servers. |
 | `mcpRuntime` | Runtime that executes the stdio bridge, e.g. `bun`. Defaults to `node` from `PATH`. |
 
-## MCP sign-ins
+## Sign-ins and external MCP servers
 
 Each agent signs in on its own; the plugin holds no credentials for it. To pass an agent a key, set
 it in that server's `env`.
