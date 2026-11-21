@@ -344,7 +344,7 @@ Restarting the service refreshes discovery. Slash commands are still discovered 
 | Option | Meaning |
 | --- | --- |
 | `logLevel` | `debug`, `info` (default), `warn`, or `error`. Debug logs also go to `$OPENCODE_ACP_PROVIDER_LOG` (default `opencode-acp-provider-<uid>.log` in the OS temp directory, truncated at 10 MB). |
-| `includeSystem` | Include OpenCode's system message in the ACP prompt. Defaults to `false`; the agent uses its own instructions. |
+| `includeSystem` | Include OpenCode's system message in the ACP prompt. Defaults to `false`; the agent uses its own instructions. Either way, the `<system-*>` blocks OpenCode puts in user messages (such as `<system-reminder>` and `<system-update>`) are always removed before the prompt reaches the agent. |
 | `historyTurns` | Turns of history replayed into a brand new ACP session. Defaults to `16`. |
 | `historyChars` | Characters of history replayed into a brand new ACP session. Defaults to `8192`. Also caps the recent conversation a `/compact` summary keeps. |
 | `maxSessions` | Pooled ACP sessions per location, including opening ones. Defaults to `32`. At capacity the least recently used idle session closes; if none is idle, a new conversation retries after a turn finishes. |

@@ -18,12 +18,29 @@ export function isAuxiliaryRequest(kind: unknown) {
   return kind === "title" || kind === "generate" || kind === "compaction"
 }
 
+/**
+ * OpenCode injects harness blocks such as `<system-reminder>` (plan mode,
+ * opened-file notes) and `<system-update>` into user text. ACP agents run on
+ * their own instructions, so drop them. Only whole blocks that start and end
+ * on their own lines match, so a user mentioning a tag inline is untouched.
+ */
+const SYSTEM_BLOCK = /(^|\n)[ \t]*<(system(?:[-_][a-z]+)*)(?:\s[^>]*)?>[\s\S]*?<\/\2>[ \t]*(?=\n|$)/gi
+
+export function stripSystemBlocks(text: string): string {
+  if (!text.includes("<system")) return text
+  const stripped = text.replace(SYSTEM_BLOCK, "$1")
+  return stripped === text ? text : stripped.replace(/\n{3,}/g, "\n\n").trim()
+}
+
 export function textOf(message: ChatMessage): string {
-  if (typeof message.content === "string") return message.content
-  if (!Array.isArray(message.content)) return ""
-  return message.content
-    .flatMap((part) => part?.type === "text" && typeof part.text === "string" && part.text ? [part.text] : [])
-    .join("\n")
+  const text = typeof message.content === "string"
+    ? message.content
+    : Array.isArray(message.content)
+      ? message.content
+        .flatMap((part) => part?.type === "text" && typeof part.text === "string" && part.text ? [part.text] : [])
+        .join("\n")
+      : ""
+  return message.role === "user" ? stripSystemBlocks(text) : text
 }
 
 const conversational = (message: ChatMessage) => message.role === "user" || message.role === "assistant"
