@@ -374,6 +374,49 @@ test("auxiliary requests keep their instructions and never enter the chat's ACP 
   }
 })
 
+test("a reused session receives every trailing wake message as one turn", async () => {
+  const manager = new AcpServerManager({
+    servers: [{
+      id: "fake",
+      command: [process.execPath, new URL("./fixtures/fake-agent.mjs", import.meta.url).pathname, "--echo-history"],
+      autoApprove: true,
+    }],
+    defaultCwd: process.cwd(),
+  })
+  const shim = await createShim({
+    manager,
+    resolveModel: () => ({ server: "fake", model: "fast" }),
+    historyChars: 40,
+  })
+  const model = createAcpLanguageModel({ server: "fake", model: "fast", url: shim.url, historyChars: 40 })
+  const generate = async (prompt: Array<{ role: string; content: any }>) => {
+    const result = await model.doGenerate({
+      headers: { "x-opencode-session-id": "ses_trailing_wakes" },
+      prompt,
+    })
+    return JSON.parse(result.content.filter((part) => part.type === "text").map((part) => part.text).join(""))
+  }
+  const firstWake = `<subagent>\n${"Background finding. ".repeat(8)}\n</subagent>`
+  const secondWake = "<subagent>\nThe docs build passed.\n</subagent>"
+  try {
+    const first = await generate([{ role: "user", content: "Audit tools" }])
+    expect(first.prompts).toEqual(["Audit tools"])
+
+    const second = await generate([
+      { role: "user", content: "Audit tools" },
+      { role: "assistant", content: [{ type: "text", text: "Audited." }] },
+      { role: "user", content: firstWake },
+      { role: "user", content: secondWake },
+    ])
+    expect(second.sessionId).toBe(first.sessionId)
+    expect(second.prompts).toHaveLength(2)
+    expect(second.prompts[1]).toBe(`${firstWake}\n\n${secondWake}`)
+  } finally {
+    await shim.close()
+    await manager.stop()
+  }
+})
+
 test("never reports usage, because no ACP number is right for both context and spend", async () => {
   // OpenCode reads a step's tokens as both context size and spend. An ACP turn
   // spans many model calls, so the agent's context reading (here codex-acp's

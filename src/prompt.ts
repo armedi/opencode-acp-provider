@@ -50,6 +50,10 @@ const speaker = (message: ChatMessage) => message.role === "assistant" ? "Assist
  * Keep the current turn intact, plus the suffix needed to reconstruct bounded
  * replay. One extra history character lets the shim detect truncation without
  * losing the original clipping or sending the whole oldest retained message.
+ *
+ * OpenCode drains every message queued while it was busy after the last
+ * assistant reply, so a turn can be several consecutive user messages. All of
+ * them are the current turn and none of them may be clipped or dropped.
  */
 export function boundedMessages<T extends ChatMessage>(
   messages: readonly T[],
@@ -57,14 +61,16 @@ export function boundedMessages<T extends ChatMessage>(
   includeSystem: boolean,
 ): Array<{ message: T; text: string }> {
   const kept: Array<{ message: T; text: string }> = []
-  let latest = false
+  let phase: "tail" | "current-user" | "history" = "tail"
+  // A tool-only assistant turn has no text to replay, but it still separates
+  // trailing user messages from older history. Hold it back until some older
+  // history is kept, so no dangling blank assistant message is emitted.
+  let boundary: T | undefined
   let turns = 0
   let budget = limits.chars > 0 ? limits.chars + 1 : 0
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i]
     if (!message) continue
-    const historyFull = turns >= limits.turns || budget <= 0
-    if (latest && historyFull && !includeSystem) break
     if (message.role === "system") {
       if (includeSystem) {
         const text = textOf(message)
@@ -72,13 +78,38 @@ export function boundedMessages<T extends ChatMessage>(
       }
       continue
     }
-    if (!conversational(message) || (latest && historyFull)) continue
-    const text = textOf(message)
-    if (!text.trim()) continue
-    if (!latest) {
-      kept.push({ message, text })
-      latest = true
+    if (phase === "history" && (turns >= limits.turns || budget <= 0) && !includeSystem) break
+    if (!conversational(message)) {
+      // A tool result ends the assistant turn that follows the current user.
+      if (phase === "current-user") phase = "history"
       continue
+    }
+    const text = textOf(message)
+    if (phase === "tail") {
+      if (!text.trim()) continue
+      kept.push({ message, text })
+      phase = message.role === "user" ? "current-user" : "history"
+      continue
+    }
+    if (phase === "current-user") {
+      if (message.role === "user") {
+        if (text.trim()) kept.push({ message, text })
+        continue
+      }
+      phase = "history"
+    }
+    const historyFull = turns >= limits.turns || budget <= 0
+    if (historyFull) {
+      if (!includeSystem) break
+      continue
+    }
+    if (!text.trim()) {
+      if (message.role === "assistant" && turns === 0 && !boundary) boundary = message
+      continue
+    }
+    if (boundary) {
+      kept.push({ message: boundary, text: "" })
+      boundary = undefined
     }
     const tail = text.length > budget ? text.slice(-budget) : text
     // The visible prefix is clipped away; it keeps a whitespace-only tail
@@ -91,7 +122,10 @@ export function boundedMessages<T extends ChatMessage>(
 }
 
 function historyText(turns: Array<{ message: ChatMessage; text: string }>, chars: number) {
-  const text = turns.map(({ message, text }) => `${speaker(message)}${text}`).join("\n\n")
+  const text = turns
+    .filter(({ text }) => text.trim())
+    .map(({ message, text }) => `${speaker(message)}${text}`)
+    .join("\n\n")
   return text.length > chars ? `[...earlier history omitted...]\n\n${text.slice(-chars)}` : text
 }
 
@@ -106,7 +140,10 @@ export function recentConversation(messages: ChatMessage[], limits: HistoryLimit
 export function buildPrompts(messages: ChatMessage[], limits: HistoryLimits, includeSystem: boolean) {
   const turns = boundedMessages(messages, limits, includeSystem)
   const conversation = turns.filter(({ message }) => conversational(message))
-  const latest = conversation.pop()?.text ?? ""
+  // Every trailing user message is part of the same turn; send them together.
+  const pending: string[] = []
+  while (conversation.at(-1)?.message.role === "user") pending.unshift(conversation.pop()!.text)
+  const latest = pending.length ? pending.join("\n\n") : conversation.pop()?.text ?? ""
   const history = historyText(conversation, limits.chars)
   const system = turns.filter(({ message }) => message.role === "system").map(({ text }) => text).join("\n\n")
   return {

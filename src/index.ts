@@ -92,6 +92,8 @@ function storedSessionKey(poolKey: string) {
 /**
  * Resolve an ACP continuation token when OpenCode is running a turn prompted by
  * a background-completion synthetic message rather than a new user prompt.
+ * A wake queued behind another pending message is left for a normal prompt, so
+ * only a lone user message at the turn boundary can attach a continuation.
  */
 function continuationTokenOf(
   messages: ReadonlyArray<{
@@ -102,16 +104,21 @@ function continuationTokenOf(
   sessionID: string,
   manager: Pick<AcpServerManager, "findContinuationByText">,
 ): string | undefined {
+  let pending: (typeof messages)[number] | undefined
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i]
     if (!message) continue
-    if (message.role === "assistant") return undefined
+    if (message.role === "assistant" || message.role === "tool") break
     if (message.role !== "user") continue
-    const token = message.metadata?.source === "acp-background" ? message.metadata.acpContinuation : undefined
-    if (typeof token === "string" && token) return token
-    return sessionID ? manager.findContinuationByText(sessionID, textOf(message)) : undefined
+    if (!textOf(message).trim()) continue
+    // More than one pending message means the turn is not only the wake.
+    if (pending) return undefined
+    pending = message
   }
-  return undefined
+  if (!pending) return undefined
+  const token = pending.metadata?.source === "acp-background" ? pending.metadata.acpContinuation : undefined
+  if (typeof token === "string" && token) return token
+  return sessionID ? manager.findContinuationByText(sessionID, textOf(pending)) : undefined
 }
 
 
