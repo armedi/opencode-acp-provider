@@ -270,25 +270,32 @@ function translate(body: ReadableStream<Uint8Array>, log?: LogFn) {
     const handleTool = (event: any) => {
       if (!event || typeof event.id !== "string") return
       const existing = tools.get(event.id)
-      const name = existing?.name ?? (typeof event.name === "string" && event.name ? event.name : "tool")
+      if (existing?.settled) return
+      const incomingName = typeof event.name === "string" && event.name ? event.name : undefined
+      const name = existing?.called ? existing.name : (incomingName ?? existing?.name ?? "unknown")
       const current: ToolProgress = existing ?? { name, started: false, called: false, settled: false }
       if (!existing) tools.set(event.id, current)
+      if (!current.called) current.name = name
       if (typeof event.title === "string" && event.title) current.title = event.title
-      if (typeof event.output === "string" && event.output) current.output = event.output
-      closeText()
-      closeReasoning()
-      if (!current.started) {
-        push({ type: "tool-input-start", id: event.id, toolName: name, providerExecuted: true })
-        current.started = true
-      }
+      if (typeof event.output === "string") current.output = event.output
       const input = event.input && typeof event.input === "object" && !Array.isArray(event.input) ? event.input : {}
       const done = event.done === true
       const keys = Object.keys(input)
-      // Agents stream edit/write input in pieces. Wait for the actual change so
-      // the card is created with its diff instead of a path-only placeholder.
+      // Agents stream edit/write/patch input in pieces. Wait for the actual
+      // change so the card is created with its diff instead of a path-only
+      // placeholder, and so tool-input-start commits the final tool name.
       const partial =
-        (name === "edit" && (input.oldString === undefined || input.newString === undefined)) ||
-        (name === "write" && input.content === undefined)
+        (current.name === "edit" && (input.oldString === undefined || input.newString === undefined)) ||
+        (current.name === "write" && input.content === undefined) ||
+        (current.name === "patch" && input.patchText === undefined)
+      if (!partial || done) {
+        closeText()
+        closeReasoning()
+        if (!current.started) {
+          push({ type: "tool-input-start", id: event.id, toolName: current.name, providerExecuted: true })
+          current.started = true
+        }
+      }
       if (!current.called && (done || (keys.length > 0 && !partial))) {
         callTool(event.id, current, input)
         current.called = true
@@ -355,6 +362,10 @@ function translate(body: ReadableStream<Uint8Array>, log?: LogFn) {
     // failed turn cannot leave a card stuck in the streaming state.
     for (const [id, current] of tools) {
       if (current.settled) continue
+      if (!current.started) {
+        push({ type: "tool-input-start", id, toolName: current.name, providerExecuted: true })
+        current.started = true
+      }
       if (!current.called) {
         callTool(id, current, {})
         current.called = true

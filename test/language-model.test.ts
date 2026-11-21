@@ -110,6 +110,143 @@ test("turns an ACP turn into AI SDK v3 stream parts", async () => {
   }
 })
 
+test("sequential plan updates become distinct completed todowrite parts", async () => {
+  const { shim, model } = await shimWith(async (input) => {
+    input.onUpdate?.({
+      sessionUpdate: "plan",
+      entries: [
+        { content: "Inspect sources", status: "completed", priority: "high" },
+        { content: "Write tests", status: "in_progress", priority: "medium" },
+      ],
+    })
+    input.onUpdate?.({
+      sessionUpdate: "plan",
+      entries: [{ content: "Write tests", status: "completed", priority: "medium" }],
+    })
+    return { stopReason: "end_turn", text: "" }
+  })
+  try {
+    const { stream } = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      headers: { "x-opencode-session-id": "ses_plan" },
+    })
+    const parts = await readAll(stream)
+    const calls = parts.filter((part) => part.type === "tool-call")
+    expect(calls.map((part) => part.toolName)).toEqual(["todowrite", "todowrite"])
+    expect(new Set(calls.map((part) => part.toolCallId)).size).toBe(2)
+    expect(JSON.parse(calls[0].input)).toEqual({
+      todos: [
+        { content: "Inspect sources", status: "completed" },
+        { content: "Write tests", status: "in_progress" },
+      ],
+    })
+    expect(JSON.parse(calls[1].input)).toEqual({ todos: [{ content: "Write tests", status: "completed" }] })
+    const results = parts.filter((part) => part.type === "tool-result")
+    expect(results.map((part) => part.toolCallId)).toEqual(calls.map((part) => part.toolCallId))
+    expect(results.every((part) => part.toolName === "todowrite" && part.isError === false)).toBe(true)
+  } finally {
+    await shim.close()
+  }
+})
+
+test("streaming edit, write, and patch defer their card until the input is complete", async () => {
+  const { shim, model } = await shimWith(async (input) => {
+    // Antigravity appends through `write_file`, so the call is only complete
+    // once the diff arrives on a later update.
+    input.onUpdate?.({
+      sessionUpdate: "tool_call",
+      toolCallId: "ag-1",
+      name: "write_file",
+      kind: "edit",
+      title: "write_file",
+      status: "pending",
+      rawInput: { Path: "notes.md", Append: true },
+    })
+    input.onUpdate?.({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "ag-1",
+      status: "completed",
+      content: [{ type: "diff", path: "notes.md", oldText: "old line", newText: "new line" }],
+    })
+    // Codex starts an edit with no diffs, then reveals a single added file.
+    input.onUpdate?.({
+      sessionUpdate: "tool_call",
+      toolCallId: "cx-1",
+      title: "Editing files",
+      kind: "edit",
+      status: "in_progress",
+      rawInput: {},
+      content: [],
+    })
+    input.onUpdate?.({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "cx-1",
+      status: "completed",
+      content: [{ type: "diff", path: "created.md", oldText: null, newText: "hello\n" }],
+    })
+    // Another edit that turns out to touch several files becomes a patch.
+    input.onUpdate?.({
+      sessionUpdate: "tool_call",
+      toolCallId: "cx-2",
+      title: "Editing files",
+      kind: "edit",
+      status: "in_progress",
+      rawInput: {},
+      content: [],
+    })
+    input.onUpdate?.({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "cx-2",
+      status: "completed",
+      content: [
+        { type: "diff", path: "a.ts", oldText: "one", newText: "two" },
+        { type: "diff", path: "b.ts", oldText: "three", newText: "four" },
+      ],
+    })
+    return { stopReason: "end_turn", text: "" }
+  })
+  try {
+    const { stream } = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      headers: { "x-opencode-session-id": "ses_partial" },
+    })
+    const parts = await readAll(stream)
+    const starts = parts.filter((part) => part.type === "tool-input-start")
+    const calls = parts.filter((part) => part.type === "tool-call")
+    const results = parts.filter((part) => part.type === "tool-result")
+    expect(starts.map((part) => [part.id, part.toolName])).toEqual([
+      ["ag-1", "edit"],
+      ["cx-1", "write"],
+      ["cx-2", "patch"],
+    ])
+    expect(calls.map((part) => [part.toolCallId, part.toolName])).toEqual([
+      ["ag-1", "edit"],
+      ["cx-1", "write"],
+      ["cx-2", "patch"],
+    ])
+    expect(results.map((part) => [part.toolCallId, part.toolName])).toEqual([
+      ["ag-1", "edit"],
+      ["cx-1", "write"],
+      ["cx-2", "patch"],
+    ])
+    const index = (type: string, id: string) =>
+      parts.findIndex((part) => part.type === type && (part.toolCallId ?? part.id) === id)
+    expect(index("tool-input-start", "ag-1")).toBeLessThan(index("tool-call", "ag-1"))
+    expect(index("tool-call", "ag-1")).toBeLessThan(index("tool-result", "ag-1"))
+
+    const append = JSON.parse(calls[0].input)
+    expect(append).toMatchObject({ path: "notes.md", oldString: "old line", newString: "new line" })
+    const write = JSON.parse(calls[1].input)
+    expect(write).toMatchObject({ path: "created.md", content: "hello\n" })
+    const patch = JSON.parse(calls[2].input)
+    expect(patch.patchText).toContain("*** Update File: a.ts")
+    expect(patch.patchText).toContain("*** Update File: b.ts")
+    expect(patch.patchText).toContain("+two")
+  } finally {
+    await shim.close()
+  }
+})
+
 test("reports an ACP failure after partial output without completing the answer", async () => {
   const { shim, model } = await shimWith(async (input) => {
     input.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial" } })
