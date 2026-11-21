@@ -33,8 +33,10 @@ src/agents/
 
 ### `no-native-orchestration.ts`
 
-Removes the native `agent`, `agent_output`, and `ask_user_question`
-tools from the main loop. Command Code's permission rules cannot block the `agent` tool (its docs
+Removes the native `agent`, `agent_output`, and `ask_user_question` tools from the main loop, along
+with tools an ACP host cannot use: plan mode (`enter_plan_mode`, `exit_plan_mode`, `plan_review`),
+worktrees (`enter_worktree`, `exit_worktree`), scheduling (`cron_create`, `cron_delete`,
+`cron_list`, `schedule_wakeup`), and artifact publishing (`artifact_publish`, `artifact_manage`). Command Code's permission rules cannot block the `agent` tool (its docs
 mark it as always allowed), so the mod uses `cmd.setActiveTools` to remove it from the model's schema
 and `beforeToolCall` to refuse any call that still arrives.
 

@@ -102,9 +102,28 @@ delegation and questions through the MCP bridge instead of a second hidden agent
 {
   "id": "claude",
   "command": ["claude-agent-acp"],
-  "meta": { "claudeCode": { "options": { "disallowedTools": ["Task", "AskUserQuestion"] } } }
+  "meta": {
+    "claudeCode": {
+      "options": {
+        "disallowedTools": [
+          "Task", "AskUserQuestion",
+          "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+          "ListAgents", "SendMessage",
+          "CronCreate", "CronDelete", "CronList", "ScheduleWakeup",
+          "PushNotification", "RemoteTrigger", "SendToProject", "SendToProjectContext", "DesignSync"
+        ]
+      }
+    }
+  }
 }
 ```
+
+Beyond subagents and questions, this list drops tools that do nothing useful under an ACP host:
+plan mode (approval turns into an auto-approved permission request; use OpenCode's plan agent),
+native worktrees (edits move out of OpenCode's snapshots; use `worktree_create`), peer-session
+messaging, scheduling (idle sessions and processes close, so schedules die silently, and a firing
+one starts a turn nobody sent), and Claude app features (push notifications, remote triggers,
+projects, design sync). claude.ai connectors stay available.
 
 The adapter accepts injected HTTP MCP servers, so `mcpTransport: "http"` works.
 
@@ -115,10 +134,15 @@ The adapter accepts injected HTTP MCP servers, so `mcpTransport: "http"` works.
   "id": "codex",
   "command": ["codex-acp"],
   "env": {
-    "CODEX_CONFIG": "{\"agents\":{\"enabled\":false},\"tools\":{\"experimental_request_user_input\":{\"enabled\":false}}}"
+    "CODEX_CONFIG": "{\"agents\":{\"enabled\":false},\"tools\":{\"experimental_request_user_input\":{\"enabled\":false}},\"features\":{\"goals\":false,\"tool_suggest\":false,\"image_generation\":false}}"
   }
 }
 ```
+
+`features` turns off Codex goals (use OpenCode's goal loop), plugin-install suggestions, and image
+generation (the plugin forwards text only). To drop individual ChatGPT apps, add
+`"apps":{"<connector_id>":{"enabled":false}}`; the ids are in
+`~/.codex/cache/codex_apps_tools/*.json` (`connector_id`).
 
 Codex drops injected HTTP MCP servers, so keep the stdio transport. It does not advertise `/compact`,
 so a manual `/compact` reports that it cannot compact on request.
@@ -148,7 +172,8 @@ Ships its own ACP stdio server, so it needs no adapter package:
   with the server's `mode` option. Permission requests in `default` mode go through `autoApprove`.
 - **Native tools.** `agy` keeps `ask_question` plus its own subagent family (`invoke_subagent`,
   `define_subagent`, `manage_subagents`, `swarm`, `run_workflow`). ACP has no question method, so
-  `ask_question` prints the question into the turn and ends, which looks like a stalled prompt. Its
+  `ask_question` prints the question into the turn and ends, which looks like a stalled prompt.
+  `send_message` only talks to its native subagents, and `schedule` timers die with idle sessions. Its
   `permissions` block cannot gate these (it covers only `read_file`, `write_file`, `read_url`,
   `execute_url`, `command`, and `mcp`), so deny them by tool name in `~/.gemini/config/hooks.json`
   (every workspace) or `<workspace>/.agents/hooks.json`:
@@ -158,7 +183,7 @@ Ships its own ACP stdio server, so it needs no adapter package:
     "opencode-orchestration": {
       "PreToolUse": [
         {
-          "matcher": "ask_question|invoke_subagent|define_subagent|manage_subagents|swarm|run_workflow",
+          "matcher": "ask_question|invoke_subagent|define_subagent|manage_subagents|swarm|run_workflow|send_message|schedule",
           "hooks": [
             {
               "command": "echo '{\"decision\":\"deny\",\"reason\":\"Use the OpenCode question and subagent tools instead.\"}'"

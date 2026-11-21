@@ -3,7 +3,7 @@ import { isCmdCommand } from "../../agent-command.ts"
 
 const mod = (name: string) => fileURLToPath(new URL(`./mods/${name}`, import.meta.url))
 
-/** Hides cmd's native `agent`/`ask_user_question` tools so the MCP bridge's tools are used. */
+/** Hides cmd's native orchestration, question, plan, worktree, scheduling, and artifact tools inside ACP. */
 export const CMD_ORCHESTRATION_MOD = mod("no-native-orchestration.ts")
 /** Registers OPENCODE_ACP_PROVIDER_SKILL_DIR with cmd, because `cmd acp` ignores `--skill`. */
 export const CMD_SKILL_MOD = mod("opencode-skills.ts")
