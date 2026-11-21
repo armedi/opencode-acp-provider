@@ -16,8 +16,38 @@ let protocolVersion = null
 let buffer = ""
 const aborters = new Map()
 
+function extractErrorMessage(error, seen) {
+  if (error === null || error === undefined) return undefined
+  if (typeof error === "string") return error.trim() ? error : undefined
+  if (typeof error !== "object") {
+    try {
+      return String(error)
+    } catch {
+      return undefined
+    }
+  }
+  if (seen.has(error)) return undefined
+  seen.add(error)
+  if (typeof error.message === "string" && error.message.trim()) return error.message
+  if (error.cause !== undefined) {
+    const caused = extractErrorMessage(error.cause, seen)
+    if (caused) return caused
+  }
+  if (typeof error.name === "string" && error.name.trim()) return error.name
+  try {
+    const text = String(error).trim()
+    return text && text !== "[object Object]" ? text : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function errorMessage(error) {
+  return extractErrorMessage(error, new Set()) ?? "Unknown error"
+}
+
 process.stdout.on("error", (error) => {
-  process.stderr.write(`mcp-bridge: stdout failed: ${error.message}\n`)
+  process.stderr.write(`mcp-bridge: stdout failed: ${errorMessage(error)}\n`)
   process.exit(1)
 })
 process.stderr.on("error", () => process.exit(1))
@@ -95,7 +125,7 @@ async function handle(message) {
     try {
       await post(message)
     } catch (error) {
-      log(error instanceof Error ? error.message : String(error))
+      log(errorMessage(error))
     }
     return
   }
@@ -117,7 +147,7 @@ async function handle(message) {
     write({
       jsonrpc: "2.0",
       id: message.id,
-      error: { code: -32000, message: error instanceof Error ? error.message : String(error) },
+      error: { code: -32000, message: errorMessage(error) },
     })
   } finally {
     aborters.delete(message.id)
@@ -145,6 +175,6 @@ process.stdin.on("data", (chunk) => {
 process.stdin.on("end", () => process.exit(0))
 process.stdin.on("close", () => process.exit(0))
 process.stdin.on("error", (error) => {
-  log(error.message)
+  log(errorMessage(error))
   process.exit(1)
 })

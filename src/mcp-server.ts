@@ -866,12 +866,19 @@ async function buildTools(
     },
     {
       name: "worktree_create",
-      description: "Create a git worktree for the calling session's project and return its directory. Pass `from` to start it at a specific commit or ref. Mirrors worktree.create.",
+      description:
+        "Create a detached git worktree for the calling session's project and return its directory. Defaults to the project's canonical checkout HEAD; pass `from` for another existing checkout/worktree directory or `branch` for an existing starting ref (commit, branch, or tag). Mirrors worktree.create.",
       inputSchema: objectSchema({
-        from: stringSchema("Commit, branch, or tag to start from. Defaults to the project's current HEAD."),
-        branch: stringSchema("Branch for the worktree."),
-        name: stringSchema("Name for the worktree; used to pick its directory."),
-        directory: stringSchema("Requested directory. The worktree strategy may choose another; use the returned directory."),
+        from: stringSchema(
+          "Absolute path of an existing checkout or worktree directory to start from. Defaults to the project's canonical checkout. Do not pass a commit SHA or ref here; use `branch` for refs.",
+        ),
+        branch: stringSchema(
+          "Existing git ref (commit SHA, branch, or tag) to start the detached worktree at, not the name of a new branch to create.",
+        ),
+        name: stringSchema("Name for the worktree; used to pick its directory name."),
+        directory: stringSchema(
+          "Parent directory for the new worktree. Uses the project's configured worktree directory or OpenCode's default if omitted; the strategy may choose another, so use the returned directory.",
+        ),
       }),
       call: async (args, signal) => {
         await assertPermission(ctx, sessionKey, "worktree", "*", "create", signal)
@@ -934,7 +941,8 @@ async function assertPermission(
     } as any)
   } catch (error) {
     if (signal.aborted) throw error
-    const message = error instanceof Error && error.message ? `: ${error.message}` : ""
+    const detail = errorMessage(error)
+    const message = detail !== "Error" && detail !== "Unknown error" ? `: ${detail}` : ""
     const scope = target === "*" ? "" : ` on ${target}`
     throw new Error(`Permission denied: ${action} ${operation}${scope}${message}`)
   }
