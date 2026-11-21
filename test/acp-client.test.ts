@@ -330,3 +330,54 @@ test("keeps calls without an owner working", async () => {
     await acp.stop()
   }
 })
+
+test("delivers post-turn unsolicited updates and handles permission requests when autoApprove is false", async () => {
+  const acp = client({ autoApprove: false })
+  const unsolicited: Array<{ sessionUpdate: string; toolCallId?: unknown; status?: unknown }> = []
+  const permissions: string[] = []
+  const permissionChanges: Array<1 | -1> = []
+  try {
+    const { sessionId } = await acp.newSession(tmpdir(), {
+      onUnsolicitedUpdate: (update) => {
+        unsolicited.push({
+          sessionUpdate: update.sessionUpdate,
+          toolCallId: update.toolCallId,
+          status: update.status,
+        })
+      },
+      requestPermission: async (info) => {
+        permissions.push(info.title)
+        return true
+      },
+      onPermissionChange: (delta) => permissionChanges.push(delta),
+    })
+
+    const active: string[] = []
+    const first = await acp.prompt(sessionId, "background-shell-permission", {
+      onUpdate: (update) => {
+        if (update.sessionUpdate !== "available_commands_update") active.push(update.sessionUpdate)
+      },
+    })
+    expect(first).toEqual({ stopReason: "end_turn", text: "waiting" })
+    expect(active).toEqual(["tool_call", "agent_message_chunk"])
+
+    const deadline = Date.now() + 2_000
+    while (
+      !unsolicited.some((item) => item.sessionUpdate === "usage_update") &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+
+    expect(permissions).toEqual(["Run follow-up"])
+    expect(permissionChanges).toEqual([1, -1])
+    expect(unsolicited).toEqual([
+      { sessionUpdate: "tool_call_update", toolCallId: "bg-1", status: "completed" },
+      { sessionUpdate: "tool_call", toolCallId: "followup-1", status: "completed" },
+      { sessionUpdate: "agent_message_chunk", toolCallId: undefined, status: undefined },
+      { sessionUpdate: "usage_update", toolCallId: undefined, status: undefined },
+    ])
+  } finally {
+    await acp.stop()
+  }
+})

@@ -429,7 +429,7 @@ export class AgentPool {
 
 const POOLS = Symbol.for("opencode-acp-provider.agent-pools")
 /** Bump when AgentPool or AcpClient change incompatibly; copies only share a pool with the same ABI and version. */
-const AGENT_POOL_ABI = 2
+const AGENT_POOL_ABI = 3
 
 const { version } = createRequire(import.meta.url)("../package.json") as { version: string }
 

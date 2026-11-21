@@ -72,13 +72,7 @@ function finishReason(stopReason: string) {
   return "stop"
 }
 
-/**
- * ACP agents execute their own tools, so there is no OpenCode tool part to
- * render. Show each finished tool call as a compact transcript line instead.
- */
-function toolCallLine(update: SessionUpdate, states: Map<string, AcpToolState>) {
-  const state = applyToolUpdate(update, states)
-  if (!state?.done) return ""
+function toolCallLabel(state: AcpToolState) {
   let detail = ""
   for (const key of ["command", "path", "query", "url", "pattern", "id", "code"]) {
     const value = state.input[key]
@@ -88,12 +82,20 @@ function toolCallLine(update: SessionUpdate, states: Map<string, AcpToolState>) 
     }
   }
   if (!detail) detail = state.title ? truncate(state.title, 120) : ""
+  return !detail || detail.toLowerCase().startsWith(state.name.toLowerCase())
+    ? detail || state.name
+    : `${state.name}: ${detail}`
+}
+
+/**
+ * ACP agents execute their own tools, so there is no OpenCode tool part to
+ * render. Show each finished tool call as a compact transcript line instead.
+ */
+function toolCallLine(update: SessionUpdate, states: Map<string, AcpToolState>) {
+  const state = applyToolUpdate(update, states)
+  if (!state?.done) return ""
   const icon = state.isError ? "✗" : "✓"
-  const label =
-    !detail || detail.toLowerCase().startsWith(state.name.toLowerCase())
-      ? detail || state.name
-      : `${state.name}: ${detail}`
-  return `\n\n> ${icon} ${label}\n\n`
+  return `\n\n> ${icon} ${toolCallLabel(state)}\n\n`
 }
 
 function truncate(text: string, max: number) {
@@ -200,7 +202,13 @@ export async function createShim(options: ShimOptions) {
     // render native tool cards; the OpenAI-compatible route keeps inline lines.
     const structuredTools = req.headers["x-acp-tool-events"] === "1"
     const prompt = buildPrompts(messages, limits, auxiliary || options.includeSystem === true)
-    if (!prompt.fresh.trim()) {
+    const continuationHeader = req.headers["x-acp-continuation"]
+    let continuation =
+      !auxiliary && typeof continuationHeader === "string" && continuationHeader ? continuationHeader : undefined
+    if (!continuation && !auxiliary && key && typeof manager.findContinuationByText === "function") {
+      continuation = manager.findContinuationByText(key, prompt.reused)
+    }
+    if (!continuation && !prompt.fresh.trim()) {
       sendError(res, 400, "Empty prompt")
       return
     }
@@ -257,6 +265,7 @@ export async function createShim(options: ShimOptions) {
         prompt,
         key,
         sessionKey: key,
+        continuation,
         signal: controller.signal,
         onUpdate: (update: SessionUpdate) => {
           if (update.sessionUpdate === "agent_thought_chunk" && update.content?.type === "text") {
@@ -324,6 +333,34 @@ export async function createShim(options: ShimOptions) {
           }
         },
       })
+
+      // Tools left running when a prompt returns normally were backgrounded by the agent.
+      if (result.stopReason !== "cancelled") {
+        for (const state of acpTools.values()) {
+          if (state.done || state.hidden) continue
+          if (structuredTools) {
+            const note = state.name === "shell" ? "Running in background." : "Still running in background."
+            const output = state.output ? `${state.output}\n${note}` : note
+            writeChunk({
+              _acp_tool: {
+                id: state.id,
+                name: state.name,
+                kind: state.kind,
+                title: state.title,
+                status: "running",
+                input: state.input,
+                output,
+                isError: false,
+                done: true,
+              },
+            })
+          } else if (toolCallDisplay) {
+            const line = `\n\n> ⋯ ${toolCallLabel(state)} (running in background)\n\n`
+            emitted += line
+            writeChunk({ content: line })
+          }
+        }
+      }
 
       if (!emitted && result.text) {
         emitted = result.text

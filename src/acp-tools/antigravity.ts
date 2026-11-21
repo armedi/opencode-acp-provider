@@ -38,6 +38,7 @@ export function resolveAntigravity(ctx: ToolContext): ResolvedTool | undefined {
           command: text(raw?.CommandLine),
           workdir: text(raw?.Cwd),
           timeout: finiteNumber(raw?.WaitMsBeforeAsync),
+          background: raw?.IsDaemon === true ? true : undefined,
         }),
       )
     case "read_file":

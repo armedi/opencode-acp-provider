@@ -200,7 +200,10 @@ interface SessionState {
    */
   turn?: Promise<unknown>
   onUpdate?: (update: SessionUpdate) => void
+  onUnsolicitedUpdate?: (update: SessionUpdate) => void
   requestPermission?: PermissionHandler
+  defaultRequestPermission?: PermissionHandler
+  onPermissionChange?: (delta: 1 | -1) => void
   /** Called when this session's command list is advertised. */
   onCommands?: (commands: AcpCommand[]) => void
 }
@@ -491,7 +494,9 @@ export class AcpClient {
         `ACP context for ${sessionId}: ${update.used ?? "?"}/${update.size ?? "?"} tokens, cost ${JSON.stringify(update.cost ?? null)}`,
       )
     }
-    this.sessions.get(sessionId)?.onUpdate?.(update)
+    const session = this.sessions.get(sessionId)
+    if (session?.onUpdate) session.onUpdate(update)
+    else session?.onUnsolicitedUpdate?.(update)
   }
 
   private async onRequest(message: RpcMessage) {
@@ -522,12 +527,20 @@ export class AcpClient {
           kind: params.toolCall?.kind,
           detail: readToolCallText(params.toolCall?.content),
         }
-        const handler = this.sessions.get(params.sessionId)?.requestPermission
+        const session = this.sessions.get(params.sessionId)
+        const handler = session?.requestPermission ?? session?.defaultRequestPermission
         const approved =
           this.options.autoApprove !== false
             ? Boolean(allow)
             : handler
-              ? await handler(info).catch(() => false)
+              ? await (async () => {
+                  session?.onPermissionChange?.(1)
+                  try {
+                    return await handler(info).catch(() => false)
+                  } finally {
+                    session?.onPermissionChange?.(-1)
+                  }
+                })()
               : false
         if (!approved || !allow?.optionId) {
           this.reply(message.id!, { outcome: { outcome: "cancelled" } }, undefined, undefined, child)
@@ -681,6 +694,12 @@ export class AcpClient {
       owner?: object
       /** Called when this session's command list is advertised, including one that arrived before registration. */
       onCommands?: (commands: AcpCommand[]) => void
+      /** Persistent listener for updates emitted when no `prompt()` turn is active. */
+      onUnsolicitedUpdate?: (update: SessionUpdate) => void
+      /** Fallback permission handler for unsolicited tool calls when `autoApprove` is false. */
+      requestPermission?: PermissionHandler
+      /** Notifies listeners when an unsolicited permission prompt starts (`1`) or settles (`-1`). */
+      onPermissionChange?: (delta: 1 | -1) => void
     } = {},
   ) {
     await this.start()
@@ -708,6 +727,9 @@ export class AcpClient {
       effortSet: false,
       owner: options.owner,
       onCommands: options.onCommands,
+      onUnsolicitedUpdate: options.onUnsolicitedUpdate,
+      defaultRequestPermission: options.requestPermission,
+      onPermissionChange: options.onPermissionChange,
     })
     // The notification can arrive before the response that names the session.
     const advertised = this.commands.get(sessionId)
@@ -758,6 +780,12 @@ export class AcpClient {
       owner?: object
       /** Called when this session's command list is advertised, including one that arrived before registration. */
       onCommands?: (commands: AcpCommand[]) => void
+      /** Persistent listener for updates emitted when no `prompt()` turn is active. */
+      onUnsolicitedUpdate?: (update: SessionUpdate) => void
+      /** Fallback permission handler for unsolicited tool calls when `autoApprove` is false. */
+      requestPermission?: PermissionHandler
+      /** Notifies listeners when an unsolicited permission prompt starts (`1`) or settles (`-1`). */
+      onPermissionChange?: (delta: 1 | -1) => void
     },
   ): Promise<"resumed" | "loaded" | undefined> {
     // Restores of one session run one at a time, so a takeover cannot interleave
@@ -785,6 +813,9 @@ export class AcpClient {
       meta?: Record<string, unknown>
       owner?: object
       onCommands?: (commands: AcpCommand[]) => void
+      onUnsolicitedUpdate?: (update: SessionUpdate) => void
+      requestPermission?: PermissionHandler
+      onPermissionChange?: (delta: 1 | -1) => void
     },
   ): Promise<"resumed" | "loaded" | undefined> {
     const capabilities = (await this.start()).agentCapabilities
@@ -817,6 +848,9 @@ export class AcpClient {
       effortSet: true,
       owner: options.owner,
       onCommands: options.onCommands,
+      onUnsolicitedUpdate: options.onUnsolicitedUpdate,
+      defaultRequestPermission: options.requestPermission,
+      onPermissionChange: options.onPermissionChange,
     })
     // The notification can arrive before the response that names the session.
     const advertised = this.commands.get(sessionId)

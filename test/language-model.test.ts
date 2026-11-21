@@ -37,6 +37,7 @@ type RunInput = {
   key?: string
   model?: string
   effort?: string
+  continuation?: string
   prompt?: unknown
   onUpdate?: (update: Record<string, unknown>) => void
 }
@@ -465,5 +466,71 @@ test("retries when the shim connection is reset before the response starts", asy
       server.close(() => resolve())
       server.closeAllConnections?.()
     })
+  }
+})
+
+test("settles backgrounded tools at normal end_turn with a background note, but not on cancel", async () => {
+  const { shim, model, calls } = await shimWith(async (input) => {
+    if (input.continuation === "cont-1") {
+      input.onUpdate?.({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "bg-1:result",
+        name: "run_command",
+        status: "completed",
+        rawInput: { CommandLine: "sleep 60" },
+        rawOutput: { output: "Command exited with code 0.\n\nCommand output:\ndone\r\n" },
+      })
+      input.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "finished" } })
+      return { stopReason: "end_turn", text: "finished" }
+    }
+    input.onUpdate?.({
+      sessionUpdate: "tool_call",
+      toolCallId: "bg-1",
+      name: "run_command",
+      kind: "execute",
+      status: "in_progress",
+      rawInput: { CommandLine: "sleep 60", WaitMsBeforeAsync: 500 },
+    })
+    input.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "waiting" } })
+    const prompt = input.prompt as { reused?: string }
+    return { stopReason: prompt.reused === "cancel" ? "cancelled" : "end_turn", text: "waiting" }
+  })
+  try {
+    const first = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "sleep" }] }],
+      headers: { "x-opencode-session-id": "ses_bg_card" },
+    })
+    const firstParts = await readAll(first.stream)
+    const firstResult = firstParts.find((part) => part.type === "tool-result")
+    expect(firstResult).toMatchObject({
+      toolCallId: "bg-1",
+      toolName: "shell",
+      result: "Running in background.",
+      isError: false,
+    })
+
+    const cancelled = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "cancel" }] }],
+      headers: { "x-opencode-session-id": "ses_bg_card" },
+    })
+    const cancelledParts = await readAll(cancelled.stream)
+    const cancelledResult = cancelledParts.find((part) => part.type === "tool-result")
+    expect(cancelledResult?.result).toBe("")
+
+    const resumed = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "wake" }] }],
+      headers: { "x-opencode-session-id": "ses_bg_card", "x-acp-continuation": "cont-1" },
+    })
+    const resumedParts = await readAll(resumed.stream)
+    expect(calls[2]?.continuation).toBe("cont-1")
+    const resumedResult = resumedParts.find((part) => part.type === "tool-result")
+    expect(resumedResult).toMatchObject({
+      toolCallId: "bg-1:result",
+      toolName: "shell",
+      result: "done",
+      isError: false,
+    })
+  } finally {
+    await shim.close()
   }
 })

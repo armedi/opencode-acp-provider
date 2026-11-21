@@ -298,6 +298,34 @@ describe("Antigravity tool mapping", () => {
     expect(state.input).toEqual({ command: "bun test", workdir: "/repo", timeout: 5000 })
   })
 
+  test("maps Antigravity IsDaemon=true to background=true while omitting IsDaemon=false", () => {
+    const daemon = mapped(
+      antigravity("run_command", {
+        CommandLine: "bun dev",
+        IsDaemon: true,
+        WaitMsBeforeAsync: 500,
+      }),
+    )
+    expect(daemon.input).toEqual({ command: "bun dev", timeout: 500, background: true })
+
+    const normal = mapped(
+      antigravity("run_command", {
+        CommandLine: "sleep 60",
+        IsDaemon: false,
+        WaitMsBeforeAsync: 500,
+      }),
+    )
+    expect(normal.input).toEqual({ command: "sleep 60", timeout: 500 })
+  })
+
+  test("strips headerless Antigravity background completion output wrappers", () => {
+    const zero = completeRunCommand("Command exited with code 0.\n\nCommand output:\nbg-ok\r\n")
+    expect(zero?.output).toBe("bg-ok")
+
+    const failed = completeRunCommand("Command exited with code 2.\n\nStderr:\nbad exit")
+    expect(failed?.output).toBe("Command exited with code 2.\nbad exit")
+  })
+
   test("strips a zero-exit header and shows only the command output", () => {
     const state = completeRunCommand(
       `${antigravityHeader}\r\nCommand exited with code 0.\r\nCommand output:\r\nalpha\r\nbeta`,

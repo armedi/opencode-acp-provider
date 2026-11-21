@@ -3,8 +3,9 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { AcpServerManager, type AcpSessionStore, type McpProvider } from "../src/server-manager.ts"
+import { AcpServerManager, type AcpSessionStore, type AcpUnsolicitedTurnInfo, type McpProvider } from "../src/server-manager.ts"
 import { AgentPool } from "../src/agent-pool.ts"
+import type { UnsolicitedTimingOptions } from "../src/unsolicited.ts"
 
 const agent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url))
 const dirs: string[] = []
@@ -99,6 +100,8 @@ function manager(
     mcp?: McpProvider
     agents?: AgentPool
     onModels?: (server: string) => void
+    onUnsolicited?: (turn: AcpUnsolicitedTurnInfo) => void
+    unsolicitedTiming?: UnsolicitedTimingOptions
     discoverCommands?: boolean
   } = {},
 ) {
@@ -117,6 +120,8 @@ function manager(
     mcp: options.mcp,
     agents: options.agents,
     onModels: options.onModels,
+    onUnsolicited: options.onUnsolicited,
+    unsolicitedTiming: options.unsolicitedTiming,
     discoverCommands: options.discoverCommands,
   })
   return { instance }
@@ -967,5 +972,120 @@ test("stops a running turn when its manager stops", async () => {
     await first.instance.stop()
     await second.instance.stop()
     await shared.stop()
+  }
+})
+
+test("captures background shell completion, remaps toolCallId, and streams without duplicate session/prompt", async () => {
+  const dir = await cwd()
+  const rpcFile = join(dir, "rpc.jsonl")
+  const woken: AcpUnsolicitedTurnInfo[] = []
+  const { instance } = manager({
+    defaultCwd: dir,
+    agentArgs: ["--rpc-log", rpcFile],
+    onUnsolicited: (turn) => woken.push(turn),
+    unsolicitedTiming: { awaitingResponseMs: 300, postUsageMs: 50, messageIdleMs: 150 },
+  })
+  try {
+    await instance.initialize()
+    const turn1Updates: Array<{ sessionUpdate: string; toolCallId?: unknown; status?: unknown }> = []
+    const turn1 = await instance.run({
+      server: "fake",
+      key: "ses_bg",
+      sessionKey: "ses_bg",
+      prompt: "background-shell",
+      onUpdate: (update) =>
+        turn1Updates.push({
+          sessionUpdate: update.sessionUpdate,
+          toolCallId: update.toolCallId,
+          status: update.status,
+        }),
+    })
+    expect(turn1).toEqual({ stopReason: "end_turn", text: "waiting" })
+    expect(turn1Updates).toContainEqual({
+      sessionUpdate: "tool_call",
+      toolCallId: "bg-1",
+      status: "in_progress",
+    })
+
+    expect(await until(() => woken.length === 1)).toBe(true)
+    const wake = woken[0]!
+    expect(wake.sessionKey).toBe("ses_bg")
+    expect(wake.description).toBe("Background command finished: sleep 1 && echo bg-ok")
+    expect(instance.hasContinuation("ses_bg", wake.token)).toBe(true)
+    expect(instance.findContinuationByText("ses_bg", wake.text)).toBe(wake.token)
+
+    const turn2Updates: Array<{ sessionUpdate: string; toolCallId?: unknown; status?: unknown; rawOutput?: unknown }> = []
+    const turn2 = await instance.run({
+      server: "fake",
+      key: "ses_bg",
+      sessionKey: "ses_bg",
+      prompt: { fresh: wake.text, reused: wake.text },
+      continuation: wake.token,
+      onUpdate: (update) =>
+        turn2Updates.push({
+          sessionUpdate: update.sessionUpdate,
+          toolCallId: update.toolCallId,
+          status: update.status,
+          rawOutput: update.rawOutput,
+        }),
+    })
+    expect(turn2).toEqual({ stopReason: "end_turn", text: "background done" })
+    expect(turn2Updates.find((item) => item.sessionUpdate === "tool_call_update")).toMatchObject({
+      toolCallId: "bg-1:result",
+      status: "completed",
+    })
+
+    const promptCalls = (await rpcRequests(rpcFile)).filter((request) => request.method === "session/prompt")
+    expect(promptCalls).toHaveLength(1)
+
+    // Expired or unknown continuation tokens never issue a fallback session/prompt.
+    const orphan = await instance.run({
+      server: "fake",
+      key: "ses_bg",
+      sessionKey: "ses_bg",
+      prompt: { fresh: "orphan", reused: "orphan" },
+      continuation: wake.token,
+    })
+    expect(orphan).toEqual({ stopReason: "end_turn", text: "" })
+    expect((await rpcRequests(rpcFile)).filter((request) => request.method === "session/prompt")).toHaveLength(1)
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("interrupts an attached unsolicited continuation and notifies the agent", async () => {
+  const dir = await cwd()
+  const rpcFile = join(dir, "rpc.jsonl")
+  const woken: AcpUnsolicitedTurnInfo[] = []
+  const { instance } = manager({
+    defaultCwd: dir,
+    agentArgs: ["--rpc-log", rpcFile],
+    onUnsolicited: (turn) => woken.push(turn),
+    unsolicitedTiming: { awaitingResponseMs: 5_000, postUsageMs: 5_000 },
+  })
+  try {
+    await instance.initialize()
+    await instance.run({
+      server: "fake",
+      key: "ses_bg_int",
+      sessionKey: "ses_bg_int",
+      prompt: "background-shell",
+    })
+    expect(await until(() => woken.length === 1)).toBe(true)
+
+    const attached = instance.run({
+      server: "fake",
+      key: "ses_bg_int",
+      sessionKey: "ses_bg_int",
+      prompt: { fresh: woken[0]!.text, reused: woken[0]!.text },
+      continuation: woken[0]!.token,
+    })
+    await wait(30)
+    expect(instance.running("ses_bg_int")).toBe(true)
+    instance.interrupt("ses_bg_int")
+    const result = await attached
+    expect(result.stopReason).toBe("cancelled")
+  } finally {
+    await instance.stop()
   }
 })

@@ -281,6 +281,30 @@ export function clip(value: string): string {
   return value.length > MAX_OUTPUT ? `${value.slice(0, MAX_OUTPUT - 1)}…` : value
 }
 
+const ANTIGRAVITY_STATUS_PATTERNS = [
+  /^Command exited with code (\d+)\.?$/,
+  /^No output from the command\.?$/,
+  /^Background command is still running after /,
+  /^Command timed out:/,
+  /^Step was canceled/i,
+]
+
+function isAntigravityStatusLine(line: string): boolean {
+  return ANTIGRAVITY_STATUS_PATTERNS.some((pattern) => pattern.test(line))
+}
+
+/**
+ * Antigravity foreground commands prefix output with `Created At:`, whereas
+ * late background completions begin directly with the status line (for
+ * example `Command exited with code 0.`).
+ */
+export function hasAntigravityOutputHeader(raw: string): boolean {
+  const normalized = raw.replace(/\r\n/g, "\n")
+  if (normalized.startsWith("Created At:")) return true
+  const firstLine = normalized.split("\n", 1)[0]?.trim() ?? ""
+  return isAntigravityStatusLine(firstLine)
+}
+
 /**
  * Antigravity prefixes command output with a "Created At:" header and a status
  * line that belongs to the tool card, not the output. Strip it so the card shows
@@ -288,10 +312,14 @@ export function clip(value: string): string {
  */
 export function stripAntigravityOutputHeader(raw: string): string {
   const normalized = raw.replace(/\r\n/g, "\n")
-  if (!normalized.startsWith("Created At:")) return raw
   const lines = normalized.split("\n")
-  let index = 1
-  if (lines[index]?.startsWith("Completed At:")) index++
+  let index = 0
+  if (normalized.startsWith("Created At:")) {
+    index = 1
+    if (lines[index]?.startsWith("Completed At:")) index++
+  } else if (!isAntigravityStatusLine(lines[0]?.trim() ?? "")) {
+    return raw
+  }
 
   let statusLine: string | undefined
   let isZeroExit = false
@@ -301,12 +329,7 @@ export function stripAntigravityOutputHeader(raw: string): string {
     statusLine = candidate
     isZeroExit = exit[1] === "0"
     index++
-  } else if (
-    /^No output from the command\.?$/.test(candidate) ||
-    /^Background command is still running after /.test(candidate) ||
-    /^Command timed out:/.test(candidate) ||
-    /^Step was canceled/i.test(candidate)
-  ) {
+  } else if (isAntigravityStatusLine(candidate)) {
     statusLine = candidate
     index++
   }
@@ -315,7 +338,7 @@ export function stripAntigravityOutputHeader(raw: string): string {
   const label = lines[index]?.trim()
   if (label === "Command output:" || label === "Output:" || label === "Stdout:" || label === "Stderr:") index++
 
-  const body = lines.slice(index).join("\n")
+  const body = lines.slice(index).join("\n").replace(/\n+$/, "")
   if (statusLine && !isZeroExit) return body ? `${statusLine}\n${body}` : statusLine
   return body
 }
@@ -343,7 +366,7 @@ export function extractOutput(
   let resolved: string | undefined
 
   if (typeof raw === "string") {
-    if (options.stripAntigravityHeader && raw.replace(/\r\n/g, "\n").startsWith("Created At:")) {
+    if (options.stripAntigravityHeader && hasAntigravityOutputHeader(raw)) {
       return clip(stripAntigravityOutputHeader(raw))
     }
     if (raw.length > 0) return clip(raw)
@@ -353,7 +376,7 @@ export function extractOutput(
     if (
       options.stripAntigravityHeader &&
       typeof rawRecord.output === "string" &&
-      rawRecord.output.replace(/\r\n/g, "\n").startsWith("Created At:")
+      hasAntigravityOutputHeader(rawRecord.output)
     ) {
       return clip(stripAntigravityOutputHeader(rawRecord.output))
     }

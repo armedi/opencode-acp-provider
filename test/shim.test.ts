@@ -196,3 +196,33 @@ test("close stops waiting after its drain timeout", async () => {
   await shim.close()
   await reader.cancel().catch(() => {})
 })
+
+test("renders backgrounded tools on the inline text fallback route", async () => {
+  const { shim } = await start({
+    run: async (input) => {
+      input.onUpdate?.({
+        sessionUpdate: "tool_call",
+        toolCallId: "bg-inline",
+        name: "run_command",
+        title: "run_command",
+        kind: "execute",
+        status: "in_progress",
+        rawInput: { CommandLine: "sleep 60" },
+      })
+      input.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "waiting" } })
+      return { stopReason: "end_turn", text: "waiting" }
+    },
+  })
+  try {
+    const response = await chat(shim.url, {
+      model: "fake::model-a",
+      messages: [{ role: "user", content: "hi" }],
+    })
+    const body = await response.json()
+    const content: string = body.choices[0].message.content
+    expect(content).toContain("waiting")
+    expect(content).toContain("\n\n> ⋯ shell: sleep 60 (running in background)\n\n")
+  } finally {
+    await shim.close()
+  }
+})

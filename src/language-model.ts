@@ -34,6 +34,7 @@ export function createAcpLanguageModel(options: AcpLanguageModelOptions) {
     async doStream(call: CallOptions) {
       const sessionID = header(call.headers, "x-opencode-session-id")
       const requestKind = header(call.headers, "x-acp-request-kind")
+      const continuation = header(call.headers, "x-acp-continuation")
       options.log?.(
         "debug",
         `acp language model ${options.server}/${options.model} session=${sessionID ?? "-"} kind=${requestKind ?? "primary"} messages=${call.prompt?.length ?? 0}`,
@@ -49,6 +50,7 @@ export function createAcpLanguageModel(options: AcpLanguageModelOptions) {
             ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
             ...(sessionID ? { "x-opencode-session-id": sessionID } : {}),
             ...(requestKind ? { "x-acp-request-kind": requestKind } : {}),
+            ...(continuation ? { "x-acp-continuation": continuation } : {}),
           },
           body: JSON.stringify({
             model: `${options.server}::${options.model}`,

@@ -12,9 +12,17 @@ import {
 import { AgentPool, type AgentLaunch, type AgentLease, type AgentSubscriber } from "./agent-pool.ts"
 import { applyCmdMods } from "./agents/cmd/index.ts"
 import { isCmdCommand } from "./agent-command.ts"
+import { commandOf, record, text } from "./acp-tools/shared.ts"
 import { effortLevels, inventoryKey, type AcpCatalog } from "./inventory.ts"
 import { runSetup } from "./setup.ts"
-import { errorMessage } from "./util.ts"
+import {
+  isUnsolicitedActivity,
+  unsolicitedSummary,
+  UnsolicitedTurn,
+  type BackgroundToolRecord,
+  type UnsolicitedTimingOptions,
+} from "./unsolicited.ts"
+import { agentName, errorMessage } from "./util.ts"
 
 export interface AcpServerConfig {
   /** Stable id used for the OpenCode provider and tool arguments. */
@@ -155,6 +163,7 @@ interface AcpSelection {
 interface PooledSession {
   server: string
   key: string
+  sessionKey: string
   sessionId: string
   client: AcpClient
   /** Undefined after a refused/uncertain config write; never assume it applied. */
@@ -171,6 +180,30 @@ interface PooledSession {
   failures: number
   broken: boolean
   mcpRelease?: () => void
+  /** Tools started in an earlier turn that had not settled when that turn returned. */
+  backgroundTools: Map<string, TrackedBackgroundTool>
+  /** Autonomous post-turn continuation currently streaming for this session, if any. */
+  activeUnsolicited?: UnsolicitedTurn
+  activeUnsolicitedTools?: Map<string, TurnToolRecord>
+  /** Buffered/live unsolicited turns keyed by their continuation token. */
+  pendingContinuations: Map<string, UnsolicitedTurn>
+}
+
+interface TrackedBackgroundTool extends BackgroundToolRecord {
+  kind?: string
+  meta?: Record<string, unknown>
+}
+
+interface TurnToolRecord extends TrackedBackgroundTool {
+  terminal: boolean
+}
+
+export interface AcpUnsolicitedTurnInfo {
+  readonly server: string
+  readonly sessionKey: string
+  readonly token: string
+  readonly description: string
+  readonly text: string
 }
 
 interface AcpRunResult {
@@ -197,6 +230,7 @@ const MAX_TURN_FAILURES = 3
 /** How long to wait for the command list an agent sends after `session/new`. */
 const COMMAND_SNAPSHOT_TIMEOUT_MS = 2_000
 const SWEEP_INTERVAL_MS = 60_000
+const MAX_BACKGROUND_TOOLS = 64
 
 export class AcpServerManager {
   readonly servers = new Map<string, AcpServerState>()
@@ -225,6 +259,8 @@ export class AcpServerManager {
   private cmdOrchestration: boolean
   private onCommands?: (server: string) => void
   private onModels?: (server: string) => void
+  private onUnsolicited?: (turn: AcpUnsolicitedTurnInfo) => void
+  private unsolicitedTiming?: UnsolicitedTimingOptions
   private discoverCommands: boolean
   private catalogs = new Map<string, { catalog: AcpCatalog; onModels: () => void }>()
   /** Pool that owns agent processes; shared with other OpenCode directories when passed in. */
@@ -261,6 +297,10 @@ export class AcpServerManager {
     discoverCommands?: boolean
     /** Called when a model's effort levels are learned, which changes its variants. */
     onModels?: (server: string) => void
+    /** Called when an idle pooled session emits unsolicited post-turn agent activity. */
+    onUnsolicited?: (turn: AcpUnsolicitedTurnInfo) => void
+    /** Override idle timers for unsolicited turns (primarily for testing). */
+    unsolicitedTiming?: UnsolicitedTimingOptions
     /**
      * Pool that owns agent processes. Pass `sharedAgentPool()` to share them
      * across OpenCode directories; defaults to a private pool.
@@ -286,6 +326,8 @@ export class AcpServerManager {
     this.onCommands = input.onCommands
     this.discoverCommands = input.discoverCommands !== false
     this.onModels = input.onModels
+    this.onUnsolicited = input.onUnsolicited
+    this.unsolicitedTiming = input.unsolicitedTiming
     this.agents = input.agents ?? new AgentPool()
     this.ownsAgents = input.agents === undefined
 
@@ -528,6 +570,8 @@ export class AcpServerManager {
           return undefined
         })
       : undefined
+    const sessionIdRef = { id: "" }
+    const callbacks = this.sessionCallbacks(state, poolKey, pooled.sessionKey, sessionIdRef)
     const session = await pooled.client
       .newSession(pooled.cwd, {
         model: selection.model,
@@ -536,11 +580,13 @@ export class AcpServerManager {
         additionalDirectories: this.sessionDirectories(state.config, pooled.client),
         owner: this,
         onCommands: (commands) => this.recordCommands(state, commands),
+        ...callbacks,
       })
       .catch((error) => {
         lease?.release()
         throw error
       })
+    sessionIdRef.id = session.sessionId
     if (this.disposed) {
       await pooled.client.closeSession(session.sessionId, this).catch(() => {})
       lease?.release()
@@ -566,6 +612,7 @@ export class AcpServerManager {
     pooled.sessionId = session.sessionId
     pooled.history = "fresh"
     pooled.selection = selection
+    pooled.backgroundTools.clear()
     if (lease) {
       pooled.mcpRelease?.()
       pooled.mcpServers = lease.servers
@@ -797,6 +844,7 @@ export class AcpServerManager {
     effort?: string
     key?: string
     sessionKey?: string
+    continuation?: string
     signal?: AbortSignal
     onUpdate?: (update: SessionUpdate) => void
   }): Promise<AcpRunResult> {
@@ -864,6 +912,50 @@ export class AcpServerManager {
 
       const poolKey = this.poolKey(input.server, input.key, cwd)
       const existing = this.pools.get(poolKey)
+      if (input.continuation) {
+        const turn = existing && !existing.broken ? existing.pendingContinuations.get(input.continuation) : undefined
+        if (!existing || existing.broken || !turn) {
+          this.log("debug", `ignoring expired ACP continuation ${input.continuation} for key ${input.key.slice(0, 24)}`)
+          return { stopReason: "end_turn", text: "" }
+        }
+        existing.pendingContinuations.delete(input.continuation)
+        existing.lastUsed = Date.now()
+        existing.pending += 1
+        const run = existing.queue.then(async () => {
+          if (existing.broken) throw new Error(`ACP session ${existing.sessionId} is no longer usable`)
+          if (input.signal?.aborted) {
+            turn.cancel()
+            return { stopReason: "cancelled", text: "" }
+          }
+          existing.active += 1
+          finishStarting()
+          try {
+            if (key && this.startCancels.delete(key)) {
+              existing.client.cancelTurn(existing.sessionId, this)
+              turn.cancel()
+            }
+            return await turn.attach(input.onUpdate, input.signal, () => {
+              existing.client.cancelTurn(existing.sessionId, this)
+            })
+          } finally {
+            existing.active = Math.max(0, existing.active - 1)
+          }
+        })
+        existing.queue = run.catch(() => {})
+        void run
+          .then(
+            () => {
+              existing.failures = 0
+            },
+            (error: unknown) => this.onTurnFailed(poolKey, existing, error),
+          )
+          .finally(() => {
+            existing.pending = Math.max(0, existing.pending - 1)
+            existing.lastUsed = Date.now()
+          })
+        return await run
+      }
+
       let negotiating = this.negotiating.get(poolKey)
       if (!existing && !negotiating) {
         const eviction = this.reserveCapacity()
@@ -872,6 +964,9 @@ export class AcpServerManager {
           if (eviction) await eviction
           this.assertLive()
           const sessionStartedAt = Date.now()
+          const resolvedSessionKey = input.sessionKey ?? input.key!
+          const sessionIdRef = { id: "" }
+          const callbacks = this.sessionCallbacks(state, poolKey, resolvedSessionKey, sessionIdRef)
           const lease = await this.mcp?.servers(input.key!, state.config)
           let session: { sessionId: string } | undefined
           let reused = false
@@ -892,6 +987,7 @@ export class AcpServerManager {
                   additionalDirectories: this.sessionDirectories(state.config, client),
                   owner: this,
                   onCommands: (commands) => this.recordCommands(state, commands),
+                  ...callbacks,
                 })
                 .catch(async (error) => {
                   this.log(
@@ -908,6 +1004,7 @@ export class AcpServerManager {
               }
               if (restored) {
                 session = { sessionId: stored }
+                sessionIdRef.id = stored
                 reused = true
                 await this.rememberSession(poolKey, stored)
                 this.log(
@@ -924,7 +1021,9 @@ export class AcpServerManager {
                 additionalDirectories: this.sessionDirectories(state.config, client),
                 owner: this,
                 onCommands: (commands) => this.recordCommands(state, commands),
+                ...callbacks,
               })
+              sessionIdRef.id = session.sessionId
               if (this.disposed) {
                 await client.closeSession(session.sessionId, this).catch(() => {})
                 lease?.release()
@@ -952,6 +1051,7 @@ export class AcpServerManager {
           const created: PooledSession = {
             server: input.server,
             key: input.key!,
+            sessionKey: resolvedSessionKey,
             sessionId: session.sessionId,
             client,
             selection: { model, effort },
@@ -965,6 +1065,8 @@ export class AcpServerManager {
             failures: 0,
             broken: false,
             mcpRelease: lease?.release,
+            backgroundTools: new Map(),
+            pendingContinuations: new Map(),
           }
           this.pools.set(poolKey, created)
           this.log(
@@ -995,6 +1097,9 @@ export class AcpServerManager {
       const run = pooled.queue.then(async () => {
         if (pooled.broken) throw new Error(`ACP session ${pooled.sessionId} is no longer usable`)
         if (input.signal?.aborted) return { stopReason: "cancelled", text: "" }
+        if (pooled.activeUnsolicited && !pooled.activeUnsolicited.attached) {
+          pooled.activeUnsolicited.finish("end_turn")
+        }
         await this.select(state, pooled, { model, effort }, poolKey)
         if (pooled.broken) throw new Error(`ACP session ${pooled.sessionId} is no longer usable`)
         if (input.signal?.aborted) return { stopReason: "cancelled", text: "" }
@@ -1005,12 +1110,20 @@ export class AcpServerManager {
         pooled.active += 1
         finishStarting()
         pooled.history = "retained"
+        const turnTools = new Map<string, TurnToolRecord>()
         const turn = pooled.client
           .prompt(pooled.sessionId, prompt, {
             owner: this,
-            onUpdate: input.onUpdate,
+            onUpdate: (update) => {
+              const mapped = this.trackAndRemapUpdate(pooled, update, turnTools)
+              input.onUpdate?.(mapped)
+            },
             signal: input.signal,
             requestPermission: onPermission,
+          })
+          .then((result) => {
+            this.recordUnfinishedTools(pooled, turnTools, result.stopReason)
+            return result
           })
           .finally(() => {
             pooled.active = Math.max(0, pooled.active - 1)
@@ -1079,8 +1192,199 @@ export class AcpServerManager {
   private async dropPool(poolKey: string, pooled: PooledSession) {
     pooled.broken = true
     if (this.pools.get(poolKey) === pooled) this.pools.delete(poolKey)
+    const turns = new Set(pooled.pendingContinuations.values())
+    if (pooled.activeUnsolicited) turns.add(pooled.activeUnsolicited)
+    pooled.pendingContinuations.clear()
+    pooled.activeUnsolicited = undefined
+    pooled.activeUnsolicitedTools = undefined
+    pooled.backgroundTools.clear()
+    const error = new Error(`ACP session ${pooled.sessionId} was closed`)
+    for (const turn of turns) turn.fail(error)
     pooled.mcpRelease?.()
     await pooled.client.closeSession(pooled.sessionId, this).catch(() => {})
+  }
+
+  /** Whether an unattached or active continuation exists for this OpenCode session and token. */
+  hasContinuation(sessionKey: string, token: string): boolean {
+    return [...this.pools.values()].some(
+      (pooled) => pooled.key === sessionKey && !pooled.broken && pooled.pendingContinuations.has(token),
+    )
+  }
+
+  /** Find an unattached continuation token matching a synthetic wake-up message's text. */
+  findContinuationByText(sessionKey: string, promptText: string): string | undefined {
+    for (const pooled of this.pools.values()) {
+      if (pooled.key !== sessionKey || pooled.broken) continue
+      for (const turn of pooled.pendingContinuations.values()) {
+        if (!turn.attached && turn.text === promptText) return turn.token
+      }
+    }
+    return undefined
+  }
+
+  /** Cancel and discard a pending continuation whose OpenCode wake-up could not proceed. */
+  dropContinuation(sessionKey: string, token: string): void {
+    for (const pooled of this.pools.values()) {
+      if (pooled.key !== sessionKey) continue
+      const turn = pooled.pendingContinuations.get(token)
+      if (!turn) continue
+      pooled.pendingContinuations.delete(token)
+      if (pooled.activeUnsolicited === turn) {
+        pooled.activeUnsolicited = undefined
+        pooled.activeUnsolicitedTools = undefined
+      }
+      turn.dispose()
+      return
+    }
+  }
+
+  private sessionCallbacks(
+    state: AcpServerState,
+    poolKey: string,
+    sessionKey: string,
+    sessionIdRef: { id: string },
+  ) {
+    return {
+      onUnsolicitedUpdate: (update: SessionUpdate) => {
+        const pooled = this.pools.get(poolKey)
+        if (!pooled || pooled.broken || pooled.sessionId !== sessionIdRef.id) return
+        this.handleUnsolicitedUpdate(state, pooled, update)
+      },
+      requestPermission: this.permissionHandler(state.config.id, sessionKey),
+      onPermissionChange: (delta: 1 | -1) => {
+        const pooled = this.pools.get(poolKey)
+        const active = pooled?.activeUnsolicited
+        if (!active || pooled.sessionId !== sessionIdRef.id) return
+        if (delta === 1) active.permissionStarted()
+        else active.permissionEnded()
+      },
+    }
+  }
+
+  private trackAndRemapUpdate(
+    pooled: PooledSession,
+    update: SessionUpdate,
+    turnTools: Map<string, TurnToolRecord>,
+  ): SessionUpdate {
+    if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") return update
+    const rawId = text(update.toolCallId)
+    if (!rawId) return update
+
+    const status = text(update.status)
+    const terminal = status === "completed" || status === "failed"
+    const incomingRaw = record(update.rawInput)
+    const hasIncomingRaw = incomingRaw !== undefined && Object.keys(incomingRaw).length > 0
+    const name = text(update.name)
+    const title = text(update.title)
+    const kind = text(update.kind)
+    const meta = record(update._meta)
+    const command = commandOf(incomingRaw?.CommandLine ?? incomingRaw?.command)
+
+    const background = pooled.backgroundTools.get(rawId)
+    if (background) {
+      const mergedRaw = hasIncomingRaw ? incomingRaw : background.rawInput
+      const remapped: SessionUpdate = {
+        ...update,
+        toolCallId: `${rawId}:result`,
+        ...(!name && background.name ? { name: background.name } : {}),
+        ...(!title && background.title ? { title: background.title } : {}),
+        ...(!kind && background.kind ? { kind: background.kind } : {}),
+        ...(!meta && background.meta ? { _meta: background.meta } : {}),
+        ...(mergedRaw ? { rawInput: mergedRaw } : {}),
+      }
+      if (terminal) pooled.backgroundTools.delete(rawId)
+      return remapped
+    }
+
+    const prior = turnTools.get(rawId)
+    turnTools.set(rawId, {
+      name: name ?? prior?.name,
+      title: title ?? prior?.title,
+      kind: kind ?? prior?.kind,
+      meta: meta ?? prior?.meta,
+      command: command ?? prior?.command,
+      rawInput: hasIncomingRaw ? incomingRaw : prior?.rawInput,
+      terminal: terminal || Boolean(prior?.terminal),
+    })
+    return update
+  }
+
+  private recordUnfinishedTools(
+    pooled: PooledSession,
+    turnTools: Map<string, TurnToolRecord>,
+    stopReason: string,
+  ) {
+    if (stopReason === "cancelled") return
+    for (const [id, info] of turnTools) {
+      if (info.terminal) {
+        pooled.backgroundTools.delete(id)
+        continue
+      }
+      if (pooled.backgroundTools.has(id)) pooled.backgroundTools.delete(id)
+      while (pooled.backgroundTools.size >= MAX_BACKGROUND_TOOLS) {
+        const oldest = pooled.backgroundTools.keys().next().value
+        if (oldest === undefined) break
+        pooled.backgroundTools.delete(oldest)
+      }
+      pooled.backgroundTools.set(id, {
+        name: info.name,
+        title: info.title,
+        command: info.command,
+        rawInput: info.rawInput,
+        kind: info.kind,
+        meta: info.meta,
+      })
+    }
+  }
+
+  private handleUnsolicitedUpdate(state: AcpServerState, pooled: PooledSession, update: SessionUpdate) {
+    if (this.disposed || pooled.broken) return
+
+    if (pooled.activeUnsolicited && pooled.activeUnsolicitedTools) {
+      pooled.lastUsed = Date.now()
+      const mapped = this.trackAndRemapUpdate(pooled, update, pooled.activeUnsolicitedTools)
+      pooled.activeUnsolicited.push(mapped)
+      return
+    }
+
+    if (!isUnsolicitedActivity(update)) return
+
+    const rawId = text(update.toolCallId)
+    const background = rawId ? pooled.backgroundTools.get(rawId) : undefined
+    const { description, text: summaryText } = unsolicitedSummary(update, background, agentName(state.config))
+    const turnTools = new Map<string, TurnToolRecord>()
+    const turn = new UnsolicitedTurn({
+      description,
+      text: summaryText,
+      timing: { maxTurnMs: this.promptTimeoutMs, ...this.unsolicitedTiming },
+      onSettled: (result) => {
+        if (pooled.activeUnsolicited === turn) {
+          pooled.activeUnsolicited = undefined
+          pooled.activeUnsolicitedTools = undefined
+        }
+        this.recordUnfinishedTools(pooled, turnTools, result.stopReason)
+        pooled.lastUsed = Date.now()
+      },
+      onExpire: () => {
+        if (pooled.pendingContinuations.get(turn.token) === turn) {
+          pooled.pendingContinuations.delete(turn.token)
+        }
+      },
+    })
+
+    pooled.activeUnsolicited = turn
+    pooled.activeUnsolicitedTools = turnTools
+    pooled.pendingContinuations.set(turn.token, turn)
+    pooled.lastUsed = Date.now()
+
+    turn.push(this.trackAndRemapUpdate(pooled, update, turnTools))
+    this.onUnsolicited?.({
+      server: state.config.id,
+      sessionKey: pooled.key,
+      token: turn.token,
+      description: turn.description,
+      text: turn.text,
+    })
   }
 
   /**
@@ -1104,6 +1408,7 @@ export class AcpServerManager {
     }
 
     pooled.client.cancelTurn(pooled.sessionId, this)
+    if (pooled.activeUnsolicited?.attached) pooled.activeUnsolicited.cancel()
     this.log("debug", `interrupted ACP session ${pooled.sessionId} so the queued message can be delivered`)
   }
 
@@ -1159,7 +1464,14 @@ export class AcpServerManager {
     let oldest: [string, PooledSession] | undefined
     for (const entry of this.pools) {
       const [key, pooled] = entry
-      if (pooled.pending > 0 || this.negotiating.has(key)) continue
+      if (
+        pooled.pending > 0 ||
+        this.negotiating.has(key) ||
+        pooled.activeUnsolicited !== undefined ||
+        pooled.pendingContinuations.size > 0
+      ) {
+        continue
+      }
       if (!oldest || pooled.lastUsed < oldest[1].lastUsed) oldest = entry
     }
     if (!oldest) throw new Error(`ACP session pool at capacity (${this.maxSessions}); retry after a turn finishes`)
@@ -1170,7 +1482,15 @@ export class AcpServerManager {
   private sweepIdleSessions() {
     const cutoff = Date.now() - this.sessionIdleMs
     for (const [key, pooled] of this.pools) {
-      if (pooled.pending > 0 || this.negotiating.has(key) || pooled.lastUsed > cutoff) continue
+      if (
+        pooled.pending > 0 ||
+        this.negotiating.has(key) ||
+        pooled.lastUsed > cutoff ||
+        pooled.activeUnsolicited !== undefined ||
+        pooled.pendingContinuations.size > 0
+      ) {
+        continue
+      }
       void this.dropPool(key, pooled)
       this.log("debug", `closed idle ACP session ${pooled.sessionId} after ${this.sessionIdleMs}ms`)
     }
@@ -1201,6 +1521,13 @@ export class AcpServerManager {
     // end the turn here, or a shared agent would keep running one nobody reads.
     for (const pooled of pools) {
       pooled.broken = true
+      const turns = new Set(pooled.pendingContinuations.values())
+      if (pooled.activeUnsolicited) turns.add(pooled.activeUnsolicited)
+      pooled.pendingContinuations.clear()
+      pooled.activeUnsolicited = undefined
+      pooled.activeUnsolicitedTools = undefined
+      pooled.backgroundTools.clear()
+      for (const turn of turns) turn.dispose()
       pooled.mcpRelease?.()
       pooled.client.cancelTurn(pooled.sessionId, this)
       void pooled.client.closeSession(pooled.sessionId, this).catch(() => {})

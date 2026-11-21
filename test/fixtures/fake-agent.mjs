@@ -295,6 +295,68 @@ function handle(message) {
         // Simulate the agent process dying mid-turn.
         process.exit(1)
       }
+      if (/\bbackground-shell(?:-permission)?\b/i.test(text)) {
+        const withPermission = /background-shell-permission/i.test(text)
+        update(sessionId, {
+          sessionUpdate: "tool_call",
+          toolCallId: "bg-1",
+          name: "run_command",
+          title: "sleep 1 && echo bg-ok",
+          kind: "execute",
+          status: "in_progress",
+          rawInput: { CommandLine: "sleep 1 && echo bg-ok", IsDaemon: false, WaitMsBeforeAsync: 500 },
+        })
+        update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "waiting" } })
+        send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
+        setTimeout(() => {
+          void (async () => {
+            update(sessionId, {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "bg-1",
+              name: "run_command",
+              title: "sleep 1 && echo bg-ok",
+              kind: "execute",
+              status: "completed",
+              rawInput: { CommandLine: "sleep 1 && echo bg-ok", IsDaemon: false, WaitMsBeforeAsync: 500 },
+              rawOutput: { output: "Command exited with code 0.\n\nCommand output:\nbg-ok\r\n", exit_code: 0 },
+            })
+            if (withPermission) {
+              const reply = await ask("session/request_permission", {
+                sessionId,
+                toolCall: {
+                  toolCallId: "followup-1",
+                  title: "Run follow-up",
+                  kind: "execute",
+                  status: "pending",
+                  rawInput: { CommandLine: "echo followup" },
+                },
+                options: [
+                  { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+                  { optionId: "reject_once", name: "Reject", kind: "reject_once" },
+                ],
+              })
+              const outcome = reply?.result?.outcome
+              const selected = outcome?.outcome === "selected" ? outcome.optionId : "cancelled"
+              update(sessionId, {
+                sessionUpdate: "tool_call",
+                toolCallId: "followup-1",
+                name: "run_command",
+                title: "echo followup",
+                kind: "execute",
+                status: "completed",
+                rawInput: { CommandLine: "echo followup" },
+                rawOutput: { output: `Command exited with code 0.\n\nCommand output:\nperm:${selected}\r\n`, exit_code: 0 },
+              })
+            }
+            update(sessionId, {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "background done" },
+            })
+            update(sessionId, { sessionUpdate: "usage_update", used: 42, size: 200 })
+          })()
+        }, 40)
+        return
+      }
       if (/\bpermission\b/i.test(text)) {        void (async () => {
           const reply = await ask("session/request_permission", {
             sessionId,

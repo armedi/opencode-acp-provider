@@ -10,10 +10,11 @@ import {
   type AcpServerConfig,
   type AcpServerState,
   type AcpSessionStore,
+  type AcpUnsolicitedTurnInfo,
 } from "./server-manager.ts"
 import { sharedAgentPool } from "./agent-pool.ts"
 import { createShim } from "./shim.ts"
-import { boundedMessages, historyLimits, recentConversation } from "./prompt.ts"
+import { boundedMessages, historyLimits, recentConversation, textOf } from "./prompt.ts"
 import { createAcpLanguageModel } from "./language-model.ts"
 import { createMcpServer } from "./mcp-server.ts"
 import { createSteering, type LocalService } from "./steering.ts"
@@ -86,6 +87,31 @@ function providerIDFor(id: string) {
 /** Storage key for one pooled ACP session; the manager's key is an opaque tuple. */
 function storedSessionKey(poolKey: string) {
   return `acp-session/${createHash("sha256").update(poolKey).digest("hex")}`
+}
+
+/**
+ * Resolve an ACP continuation token when OpenCode is running a turn prompted by
+ * a background-completion synthetic message rather than a new user prompt.
+ */
+function continuationTokenOf(
+  messages: ReadonlyArray<{
+    role: string
+    content?: string | ReadonlyArray<{ type?: string; text?: unknown }>
+    metadata?: Record<string, unknown>
+  }>,
+  sessionID: string,
+  manager: Pick<AcpServerManager, "findContinuationByText">,
+): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (!message) continue
+    if (message.role === "assistant") return undefined
+    if (message.role !== "user") continue
+    const token = message.metadata?.source === "acp-background" ? message.metadata.acpContinuation : undefined
+    if (typeof token === "string" && token) return token
+    return sessionID ? manager.findContinuationByText(sessionID, textOf(message)) : undefined
+  }
+  return undefined
 }
 
 
@@ -193,8 +219,48 @@ export default Plugin.define({
     // Assigned once the agents are up and their skills are known, but the
     // manager reports command updates from the first `session/new` onward.
     let commandBridge: Awaited<ReturnType<typeof createCommandBridge>> | undefined
+    const continuations = new Map<string, string>()
+    let disposed = false
+    let manager: AcpServerManager
+    let serverForProvider = new Map<string, string>()
 
-    const manager = new AcpServerManager({
+    const wakeSessionForUnsolicited = async (turn: AcpUnsolicitedTurnInfo) => {
+      if (disposed || typeof ctx.session?.synthetic !== "function") {
+        manager.dropContinuation(turn.sessionKey, turn.token)
+        return
+      }
+      try {
+        if (typeof ctx.session.get === "function") {
+          const session = await ctx.session.get({ sessionID: turn.sessionKey as any }).catch(() => undefined)
+          const providerID = session?.model?.providerID
+          if (providerID && serverForProvider.get(providerID) !== turn.server) {
+            log(
+              "debug",
+              `skipping ACP background wake for ${turn.sessionKey}: session switched to provider ${providerID}`,
+            )
+            manager.dropContinuation(turn.sessionKey, turn.token)
+            return
+          }
+        }
+        await ctx.session.synthetic({
+          sessionID: turn.sessionKey as any,
+          text: turn.text,
+          description: turn.description,
+          metadata: {
+            source: "acp-background",
+            server: turn.server,
+            acpContinuation: turn.token,
+          },
+          delivery: "queue",
+          resume: true,
+        })
+      } catch (error) {
+        log("warn", `could not wake OpenCode session ${turn.sessionKey} for ACP background task: ${errorMessage(error)}`)
+        manager.dropContinuation(turn.sessionKey, turn.token)
+      }
+    }
+
+    manager = new AcpServerManager({
       servers,
       defaultCwd: ctx.location.directory,
       log,
@@ -207,6 +273,9 @@ export default Plugin.define({
         const state = manager.get(server)
         if (!state || disposed || !registered.has(server)) return
         void publishInventory(state).then(() => persistInventory(state))
+      },
+      onUnsolicited: (turn) => {
+        if (!disposed) void wakeSessionForUnsolicited(turn)
       },
       mcp: mcp
         ? {
@@ -243,7 +312,6 @@ export default Plugin.define({
     const outputLimit = options.outputLimit ?? 32_000
     const shimToken = randomUUID()
 
-    let disposed = false
     const retryTimers = new Set<ReturnType<typeof setTimeout>>()
     const registrations: Awaited<ReturnType<typeof ctx.provider.transform>>[] = []
     const registered = new Set<string>()
@@ -445,6 +513,7 @@ export default Plugin.define({
 
     const cleanup = async () => {
       disposed = true
+      continuations.clear()
       for (const timer of retryTimers) clearTimeout(timer)
       retryTimers.clear()
       for (const registration of registrations) await registration.dispose().catch(() => {})
@@ -466,7 +535,7 @@ export default Plugin.define({
       // late cannot steal the id of one that already registered.
       for (const state of manager.list) providerIDForServer(state.config.id)
       // Every provider id is reserved above, so this reverse map is complete.
-      const serverForProvider = new Map([...providerIDs].map(([server, providerID]) => [providerID, server]))
+      serverForProvider = new Map([...providerIDs].map(([server, providerID]) => [providerID, server]))
 
       // A server whose models were discovered before, in another location or an
       // earlier process, is registered now, so this location resolves them
@@ -513,9 +582,37 @@ export default Plugin.define({
         await ctx.session.hook("model.request", (event) => {
           if (!serverForProvider.has(event.model.providerID)) return
           event.headers["x-acp-request-kind"] = event.kind
+          if (event.kind === "primary" && event.sessionID) {
+            const token = continuations.get(event.sessionID)
+            if (token) {
+              continuations.delete(event.sessionID)
+              event.headers["x-acp-continuation"] = token
+            }
+          }
         }),
       )
       const limits = historyLimits(options)
+      // Detect background continuation turns on every route, and trim fallback
+      // HTTP requests when the server cannot register an AI SDK provider.
+      registrations.push(
+        await ctx.session.hook("context", (event) => {
+          if (!serverForProvider.has(event.model.providerID)) return
+          if (event.sessionID) {
+            const token = continuationTokenOf(event.messages, event.sessionID, manager)
+            if (token) continuations.set(event.sessionID, token)
+            else continuations.delete(event.sessionID)
+          }
+          if (!nativeToolParts) {
+            const includeSystem = options.includeSystem === true
+            if (!includeSystem) event.system = []
+            const messages: typeof event.messages = []
+            for (const { message, text } of boundedMessages(event.messages, limits, includeSystem)) {
+              if (message.role !== "tool") messages.push({ ...message, content: [{ type: "text", text }] })
+            }
+            event.messages = messages
+          }
+        }),
+      )
       if (nativeToolParts) {
         registrations.push(
           await ctx.aisdk.hook("sdk", (evt) => {
@@ -541,13 +638,11 @@ export default Plugin.define({
       } else {
         // The native HTTP provider serializes these messages itself. Trim
         // its model request before that happens, without changing the transcript.
-        for (const kind of ["context", "generate", "title"] as const) {
+        for (const kind of ["generate", "title"] as const) {
           registrations.push(await ctx.session.hook(kind, (event) => {
             if (!serverForProvider.has(event.model.providerID)) return
-            const includeSystem = kind !== "context" || options.includeSystem === true
-            if (!includeSystem) event.system = []
             const messages: typeof event.messages = []
-            for (const { message, text } of boundedMessages(event.messages, limits, includeSystem)) {
+            for (const { message, text } of boundedMessages(event.messages, limits, true)) {
               if (message.role !== "tool") messages.push({ ...message, content: [{ type: "text", text }] })
             }
             event.messages = messages
