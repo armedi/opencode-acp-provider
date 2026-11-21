@@ -16,7 +16,6 @@ import { createShim } from "./shim.ts"
 import { boundedMessages, historyLimits, recentConversation } from "./prompt.ts"
 import { createAcpLanguageModel } from "./language-model.ts"
 import { createMcpServer } from "./mcp-server.ts"
-import { createOpenCodeMcpSource } from "./mcp-config.ts"
 import { createSteering, type LocalService } from "./steering.ts"
 import { createSkillMirror } from "./skills.ts"
 import { createCommandBridge } from "./commands.ts"
@@ -173,15 +172,6 @@ export default Plugin.define({
       }
     }
 
-    // Forward the MCP servers OpenCode is configured with so a server is set up
-    // once and reaches every ACP agent, alongside this plugin's own bridge.
-    let openCodeMcp: Awaited<ReturnType<typeof createOpenCodeMcpSource>> | undefined
-    try {
-      openCodeMcp = await createOpenCodeMcpSource(ctx, log)
-    } catch (error) {
-      log("warn", `OpenCode MCP servers disabled: ${errorMessage(error)}`)
-    }
-
     // A plugin reload or a crashed agent starts a new process with no in-memory
     // sessions. Persist which ACP session belongs to each OpenCode session so
     // the next process can resume it instead of losing the conversation.
@@ -218,27 +208,11 @@ export default Plugin.define({
         if (!state || disposed || !registered.has(server)) return
         void publishInventory(state).then(() => persistInventory(state))
       },
-      mcp:
-        mcp || openCodeMcp
-          ? {
-              servers: async (sessionKey, agent) => {
-                const lease = mcp?.issue(sessionKey)
-                try {
-                  const configured = (await openCodeMcp?.servers(agent)) ?? []
-                  // Let the plugin's own bridge win a name collision with a
-                  // configured server, since that is the one agents rely on.
-                  const taken = new Set(lease?.servers.map((server) => server.name) ?? [])
-                  return {
-                    servers: [...(lease?.servers ?? []), ...configured.filter((server) => !taken.has(server.name))],
-                    release: () => lease?.release(),
-                  }
-                } catch (error) {
-                  lease?.release()
-                  throw error
-                }
-              },
-            }
-          : undefined,
+      mcp: mcp
+        ? {
+            servers: async (sessionKey) => mcp.issue(sessionKey),
+          }
+        : undefined,
       additionalDirectories: skills ? [skills.root] : undefined,
       cmdSkillDir: skills?.agentsDir,
       cmdOrchestration: mcp !== undefined,
@@ -466,7 +440,6 @@ export default Plugin.define({
       await manager.stop().catch(() => {})
       await mcp?.close().catch(() => {})
       await skills?.close().catch(() => {})
-      await openCodeMcp?.close().catch(() => {})
       throw error
     }
 
@@ -485,7 +458,6 @@ export default Plugin.define({
         await manager.stop().catch(() => {})
         await skills?.close().catch(() => {})
         await mcp?.close().catch(() => {})
-        await openCodeMcp?.close().catch(() => {})
       })()
     }
 

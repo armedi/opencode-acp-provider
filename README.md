@@ -364,14 +364,11 @@ Restarting the service refreshes discovery. Slash commands are still discovered 
 Each agent signs in on its own; the plugin holds no credentials for it. To pass an agent a key, set
 it in that server's `env`.
 
-Remote MCP servers configured in OpenCode are forwarded to every ACP agent. When OpenCode holds an
-OAuth sign-in for one, the plugin resolves the active grant and passes it as an `Authorization:
-Bearer` header on `session/new`, so the agent reuses the same login, refreshing an expired grant as it
-resolves. A header set explicitly in the server's `headers` wins. A server not signed in to OpenCode
-still starts but keeps its tools unavailable; run `opencode mcp auth <name>` (or sign in through the
-agent's own CLI) and the next session picks the credential up. ACP cannot update headers on a live
-session, so a grant that expires mid-session is not replaced until that session is recycled or a new
-conversation starts.
+In `session/new`, the plugin only supplies its own `opencode` MCP bridge; it does not forward
+OpenCode's external MCP servers. Configure any additional MCP servers directly in each agent's own
+MCP configuration (for example, `agy mcp add` / `~/.gemini/config/mcp_config.json`, `claude mcp add`,
+`codex mcp add`, or `cmd mcp add`) so each agent handles its own credentials and tool loading (such
+as Antigravity's native lazy loading).
 
 ## Limits
 

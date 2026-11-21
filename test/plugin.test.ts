@@ -51,7 +51,6 @@ test("loads without waiting for ACP and publishes each agent's models as it beco
       async reload() {},
     },
     session: { hook: async () => registration },
-    mcp: { transform: async () => registration, list: async () => ({ data: [] }) },
   } as unknown as Plugin.Context
 
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -124,7 +123,6 @@ test("registers cached models before the agent starts and refreshes them after d
         async reload() {},
       },
       session: { hook: async () => registration },
-      mcp: { transform: async () => registration, list: async () => ({ data: [] }) },
       storage: {
         async get(key: string) {
           return values.get(key)
@@ -207,7 +205,6 @@ test("keeps cached models when the agent cannot start", async () => {
         async reload() {},
       },
       session: { hook: async () => registration },
-      mcp: { transform: async () => registration, list: async () => ({ data: [] }) },
       storage: {
         async get(key: string) {
           return values.get(key)
@@ -254,7 +251,6 @@ test("bounds fallback provider requests without rewriting other providers' promp
         return registration
       },
     },
-    mcp: { transform: async () => registration, list: async () => ({ data: [] }) },
   } as unknown as Plugin.Context)
   try {
     const request = (providerID: string): Request => ({

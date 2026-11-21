@@ -520,8 +520,8 @@ export class AcpServerManager {
 
     // Some agents cannot change a live selection or reset to the provider default.
     // Keep the conversation queue, but replay history into a new ACP session.
-    // Resolve the MCP servers again: a remote server's OAuth grant may have been
-    // refreshed since this session opened, and ACP cannot update it in place.
+    // Issue a fresh MCP bridge lease for the replacement ACP session so it
+    // starts with its own lease before the old session releases its token.
     const lease = this.mcp
       ? await this.mcp.servers(pooled.key, state.config).catch((error) => {
           this.log("warn", `could not refresh MCP servers for ${state.config.id}: ${errorMessage(error)}`)
