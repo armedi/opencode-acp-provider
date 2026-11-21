@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { Schema } from "effect"
 import { createMcpServer, bridgeCommand, parseModelRef } from "../src/mcp-server.ts"
 
 function context(overrides: Record<string, any> = {}) {
@@ -99,10 +100,76 @@ test("returns explicit tool guidance on initialize", async () => {
       params: { protocolVersion: "2025-06-18" },
     })
     const instructions = response.body.result.instructions
-    expect(instructions).toContain("Available tools: `question`, `subagent`, `models`")
+    expect(instructions).toContain("Available tools: `question`, `subagent`, `subagent_list`, `models`")
+    expect(instructions).toContain("Use `subagent_list`")
     expect(instructions).toContain("`mcp__opencode__question`")
     expect(instructions).toContain("`opencode.question`")
     expect(instructions).toContain("`mcp.opencode.question`")
+  } finally {
+    lease.release()
+    await server.close()
+  }
+})
+
+test("advertises native descriptions unchanged and discovers visible subagents on demand", async () => {
+  const nativeTools = [
+    {
+      name: "models",
+      description: "Find models.\n\nUse an exact model ID.",
+      input: { type: "object", properties: { query: { type: "string", description: "Native model search text" } } },
+    },
+    { name: "subagent", description: "Delegate to a subagent." },
+    {
+      name: "question",
+      description: "Ask the user a question.",
+      input: Schema.Struct({
+        questions: Schema.Array(Schema.Struct({
+          header: Schema.String.annotate({ description: "Native short title" }),
+        })),
+      }),
+    },
+    { name: "todowrite", description: "Update the todo list." },
+  ]
+  const ctx = context({
+    tool: { list: async () => nativeTools.map((tool) => ({ ...tool, execute: async () => ({}) })) },
+    agent: {
+      list: async () => ({
+        data: [
+          { id: "reviewer", mode: "subagent", description: "Reviews changes" },
+          { id: "internal", mode: "subagent", hidden: true },
+          { id: "build", mode: "primary" },
+          { id: "general", mode: "all", description: "Handles general tasks" },
+        ],
+      }),
+    },
+  })
+  const { server, lease, token } = await start(ctx)
+  try {
+    const catalog = await rpc(server.url, token, { jsonrpc: "2.0", id: 1, method: "tools/list" })
+    const tools = catalog.body.result.tools
+    for (const { name, description } of nativeTools) {
+      expect(tools.find((tool: any) => tool.name === name)?.description).toBe(description)
+    }
+    const modelFields = tools.find((tool: any) => tool.name === "models").inputSchema.properties
+    expect(modelFields.query.description).toBe("Native model search text")
+    expect(modelFields.limit.description).toBe("Maximum number of models to return. Defaults to 20.")
+    const questions = tools.find((tool: any) => tool.name === "question").inputSchema.properties.questions
+    expect(questions.items.properties.header.description).toBe("Native short title")
+    expect(questions.minItems).toBe(1)
+    expect(tools.some((tool: any) => tool.name === "subagent_list")).toBe(true)
+
+    const listing = await rpc(server.url, token, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "subagent_list", arguments: {} },
+    })
+    expect(listing.body.result.structuredContent).toEqual({
+      agents: [
+        { id: "general", description: "Handles general tasks" },
+        { id: "reviewer", description: "Reviews changes" },
+      ],
+    })
   } finally {
     lease.release()
     await server.close()

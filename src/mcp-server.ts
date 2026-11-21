@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { posix, win32 } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { Plugin } from "@opencode/plugin"
+import { Schema } from "effect"
 import packageJson from "../package.json" with { type: "json" }
 import type { AcpMcpServer } from "./acp-client.ts"
 import type { LogFn, McpLease } from "./server-manager.ts"
@@ -20,14 +21,6 @@ const MAX_CONTEXT_CHARS = 60_000
 /** Live tokens above this suggest leases are not being released. */
 const TOKEN_WARN_THRESHOLD = 256
 
-const SUBAGENT_DESCRIPTION = [
-  "Spawns an agent in a child session to work on the specified task.",
-  "Subagents always run in the background: the call returns immediately with a sessionID, and you receive a `<subagent>` message each time the child goes idle, including after later work.",
-  "Keep working on non-overlapping tasks, or briefly tell the user what you launched and end your response. Do not sleep, poll, or proactively check on the child's progress.",
-  "New child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.",
-  "Pass the returned sessionID to continue that specific child conversation. A follow-up to a running child joins its current run.",
-].join("\n")
-
 /**
  * Order used by the initialize instructions. Clients that defer MCP tools (Codex
  * shows only the server's `instructions` until a namespace is loaded, and appends
@@ -37,6 +30,7 @@ const SUBAGENT_DESCRIPTION = [
 const TOOL_ORDER = [
   "question",
   "subagent",
+  "subagent_list",
   "models",
   "todowrite",
   "session_create",
@@ -73,6 +67,7 @@ interface McpTool {
   name: string
   description: string
   inputSchema: Record<string, unknown>
+  nativeInput?: unknown
   call: (args: any, signal: AbortSignal) => Promise<any>
 }
 
@@ -95,6 +90,47 @@ const objectSchema = (properties: Record<string, unknown>, required: string[] = 
 })
 
 const stringSchema = (description?: string) => ({ type: "string", ...(description ? { description } : {}) })
+
+function schemaRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+}
+
+function nativeSchema(input: unknown) {
+  try {
+    if (Schema.isSchema(input)) {
+      return Schema.toJsonSchemaDocument(input, {
+        referencePolicy: () => undefined,
+        generateDescriptions: false,
+      }).schema
+    }
+    const schema = schemaRecord(input)
+    const jsonSchema = schemaRecord(schemaRecord(schema?.["~standard"])?.jsonSchema)
+    if (typeof jsonSchema?.input === "function") return jsonSchema.input({ target: "draft-2020-12" }) as unknown
+    return schema
+  } catch {
+    // Not every registry schema supports JSON Schema export.
+    return undefined
+  }
+}
+
+// Only copy annotations at existing field paths; the bridge owns the wire shape and constraints.
+function withNativeDescriptions(input: Record<string, unknown>, source: unknown): Record<string, unknown> {
+  const native = schemaRecord(source)
+  if (!native) return input
+  const result = { ...input }
+  if (typeof native.description === "string") result.description = native.description
+  const properties = schemaRecord(input.properties)
+  const nativeProperties = schemaRecord(native.properties)
+  if (properties && nativeProperties) {
+    result.properties = Object.fromEntries(Object.entries(properties).map(([key, value]) => {
+      const field = schemaRecord(value)
+      return [key, field ? withNativeDescriptions(field, nativeProperties[key]) : value]
+    }))
+  }
+  const items = schemaRecord(input.items)
+  if (items) result.items = withNativeDescriptions(items, native.items)
+  return result
+}
 
 /**
  * How to launch the stdio bridge. An absolute runtime runs directly; a bare
@@ -328,16 +364,14 @@ export async function createMcpServer(options: McpServerOptions): Promise<McpSer
             tools: tools.map((tool) => ({
               name: tool.name,
               description: tool.description,
-              inputSchema: tool.inputSchema,
+              inputSchema: withNativeDescriptions(tool.inputSchema, nativeSchema(tool.nativeInput)),
             })),
           })
         }
         case "tools/call": {
           const name = String(message.params?.name ?? "")
           const args = message.params?.arguments ?? {}
-          // A call needs the handler, not the descriptions, so skip the agent
-          // lookup that only feeds the subagent description.
-          const tools = await buildTools(ctx, sessionKey, options.localService, log, { describe: false })
+          const tools = await buildTools(ctx, sessionKey, options.localService, log)
           const tool = tools.find((candidate) => candidate.name === name)
           if (!tool) return fail(-32602, `Unknown tool: ${name}`)
           const startedAt = Date.now()
@@ -488,7 +522,7 @@ async function buildInstructions(
   log?: LogFn,
 ) {
   // Only the names are used here.
-  const tools = await buildTools(ctx, sessionKey, service, log, { describe: false })
+  const tools = await buildTools(ctx, sessionKey, service, log)
   if (!tools.length) return undefined
   const names = new Set(tools.map((tool) => tool.name))
   // Tools the model is most likely to need come first; some clients append this
@@ -511,7 +545,7 @@ async function buildInstructions(
   }
   if (names.has("subagent")) {
     lines.push(
-      "Use `subagent` for delegation instead of a native subagent or task tool: call it with { agent, description, prompt }.",
+      "Use `subagent_list` to discover agent IDs and descriptions, then delegate with `subagent` ({ agent, description, prompt }).",
       "It returns at once and reports back with a <subagent> message when the child goes idle; do not poll it.",
     )
   }
@@ -526,7 +560,6 @@ async function buildTools(
   sessionKey: string,
   localService?: LocalServiceSource,
   log?: LogFn,
-  { describe = true }: { describe?: boolean } = {},
 ): Promise<McpTool[]> {
   const tools: McpTool[] = []
   const available = await ctx.tool.list().catch(() => [])
@@ -563,7 +596,8 @@ async function buildTools(
   if (models) {
     tools.push({
       name: "models",
-      description: "Search the models available to use. Use this to turn a model name the user mentions into an exact reference for a tool that takes a model. Check your own provider first.",
+      description: models.description,
+      nativeInput: models.input,
       inputSchema: objectSchema({
         query: stringSchema("Text to search for in model names and IDs."),
         provider: stringSchema("Provider ID or name to filter by. Try your own provider first."),
@@ -588,7 +622,8 @@ async function buildTools(
   if (subagent) {
     tools.push({
       name: "subagent",
-      description: describe ? await subagentDescription(ctx) : SUBAGENT_DESCRIPTION,
+      description: subagent.description,
+      nativeInput: subagent.input,
       inputSchema: objectSchema(
         {
           agent: stringSchema(
@@ -610,28 +645,33 @@ async function buildTools(
         return toMcpResult(await invoke(subagent, input, signal))
       },
     })
+    tools.push({
+      name: "subagent_list",
+      description: "List visible OpenCode subagents and their descriptions. Use an agent ID from this list with `subagent`.",
+      inputSchema: objectSchema({}),
+      call: async () => {
+        const { data } = await ctx.agent.list()
+        const agents = data
+          .filter((agent) => agent.mode !== "primary" && !agent.hidden)
+          .sort((left, right) => left.id.localeCompare(right.id))
+          .map(({ id, description }) => ({
+            id,
+            description,
+          }))
+        return toMcpResult({ agents })
+      },
+    })
   }
 
   const question = find("question")
   if (question) {
     tools.push({
       name: "question",
-      description: [
-        "Use this tool when you need to ask the user questions during execution. This allows you to:",
-        "1. Gather user preferences or requirements",
-        "2. Clarify ambiguous instructions",
-        "3. Get decisions on implementation choices as you work",
-        "4. Offer choices to the user about what direction to take.",
-        "",
-        "Usage notes:",
-        "- A \"Type your own answer\" option is added automatically; don't include a separate option for free form answers",
-        "- Set `multiple: true` to allow selecting more than one option",
-        "- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label",
-      ].join("\n"),
+      description: question.description,
+      nativeInput: question.input,
       inputSchema: objectSchema({
         questions: {
           type: "array",
-          minItems: 1,
           description: "Questions to ask",
           minItems: 1,
           items: objectSchema(
@@ -671,15 +711,8 @@ async function buildTools(
   if (todowrite) {
     tools.push({
       name: "todowrite",
-      description: [
-        "Create and update a todo list for the current session. The user sees it as your working plan.",
-        "",
-        "Use it proactively when a task has 3 or more distinct steps, or when the user gives several tasks or asks for a todo list. Skip it for a single simple task or a purely conversational request. When in doubt, use it.",
-        "",
-        "- Send the full list on every call; it replaces the previous one.",
-        "- Mark items `in_progress` when you start them and `completed` as soon as they're actually done.",
-        "- Only call it when the list changes.",
-      ].join("\n"),
+      description: todowrite.description,
+      nativeInput: todowrite.input,
       inputSchema: objectSchema({
         todos: {
           type: "array",
@@ -878,22 +911,6 @@ async function buildTools(
   return tools
 }
 
-async function subagentDescription(ctx: Ctx) {
-  const parts = [SUBAGENT_DESCRIPTION]
-  try {
-    const agents = (await ctx.agent.list()).data
-    const available = agents
-      .filter((agent) => agent.mode !== "primary" && !agent.hidden)
-      .sort((left, right) => left.id.localeCompare(right.id))
-    if (available.length) {
-      parts.push("", "Available subagents:", ...available.map((agent) => `- ${agent.id}: ${agent.description ?? "This subagent should only be called when explicitly requested."}`))
-    }
-  } catch {
-    // agent discovery is best effort
-  }
-  return parts.join("\n")
-}
-
 /**
  * Ask for a `session` or `worktree` permission on a target. Listing spans
  * targets, so it is asserted against `"*"` and needs an explicit permission of
@@ -1000,4 +1017,3 @@ function boundContext(messages: any[]) {
   }
   return { messages: messages.slice(start), truncated: true, omittedMessages: start }
 }
-
