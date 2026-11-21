@@ -1,10 +1,28 @@
+import { randomUUID } from "node:crypto"
 import type { SessionUpdate } from "./acp-client.ts"
+import { resolveAntigravity } from "./acp-tools/antigravity.ts"
+import { resolveClaude } from "./acp-tools/claude.ts"
+import { resolveCodex } from "./acp-tools/codex.ts"
+import { resolveCommandCode } from "./acp-tools/command-code.ts"
+import { resolveFallback } from "./acp-tools/fallback.ts"
+import {
+  clip,
+  diffsOf,
+  extractOutput,
+  locationPath,
+  record,
+  terminalOutputDelta,
+  text,
+  todowriteTodos,
+  type AgentId,
+  type ToolContext,
+} from "./acp-tools/shared.ts"
 
 /**
  * ACP agents run their own tools and report the call through the protocol.
  * OpenCode can only draw a native tool card if the tool is named like one of
- * its own tools and carries the matching input shape, so translate the ACP
- * call into that shape here. Anything unknown stays a generic tool.
+ * its own tools and carries the matching input shape, so each agent's resolver
+ * translates the ACP call into that shape. Anything unknown stays a generic card.
  */
 export interface AcpToolState {
   readonly id: string
@@ -20,220 +38,41 @@ export interface AcpToolState {
   hidden?: boolean
 }
 
-const MAX_OUTPUT = 32_000
-
-function text(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined
+/** What the first update of a call told us, so later updates keep the mapping. */
+interface CallMeta {
+  agent: AgentId
+  rawName?: string
+  rawInput?: Record<string, unknown>
+  /** The call streamed terminal output, which outranks a structured `rawOutput`. */
+  streamedTerminal?: boolean
 }
 
-/** File contents must keep their exact whitespace: the edit card renders a diff. */
-function literal(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined
-}
+const callMeta = new WeakMap<Map<string, AcpToolState>, Map<string, CallMeta>>()
 
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
-}
-
-/** codex-acp reports the file path of a read call here instead of in `rawInput`. */
-function locationPath(update: SessionUpdate) {
-  const locations = Array.isArray(update.locations) ? update.locations : []
-  for (const item of locations) {
-    const path = firstText(record(item)?.path)
-    if (path) return path
+function metaFor(states: Map<string, AcpToolState>): Map<string, CallMeta> {
+  let meta = callMeta.get(states)
+  if (!meta) {
+    meta = new Map()
+    callMeta.set(states, meta)
   }
-  return undefined
+  return meta
 }
 
-/** codex-acp streams shell and read output through `_meta` rather than `content`. */
-function terminalOutputDelta(update: SessionUpdate) {
-  const data = record(record(update._meta)?.terminal_output_delta)?.data
-  return typeof data === "string" ? data : undefined
-}
-
-function firstText(...values: unknown[]): string | undefined {
-  for (const value of values) {
-    const found = text(value)
-    if (found) return found
+/** Agents report their todo list as a `plan` session update. */
+export function planToToolState(update: SessionUpdate): AcpToolState | undefined {
+  if (update.sessionUpdate !== "plan") return undefined
+  const todos = todowriteTodos(update.entries)
+  if (!todos) return undefined
+  return {
+    id: `plan-${randomUUID()}`,
+    name: "todowrite",
+    kind: "think",
+    title: "Update todos",
+    input: { todos },
+    status: "completed",
+    isError: false,
+    done: true,
   }
-  return undefined
-}
-
-/** Codex sends `["bash", "-lc", "ls"]`; Claude sends the command as a string. */
-function commandOf(value: unknown): string | undefined {
-  if (typeof value === "string") return text(value)
-  if (!Array.isArray(value)) return undefined
-  const parts = value.filter((item): item is string => typeof item === "string")
-  if (!parts.length) return undefined
-  if (parts.length === 3 && parts[0].endsWith("sh") && parts[1].startsWith("-")) return text(parts[2])
-  return text(parts.join(" "))
-}
-
-function toolName(kind: string | undefined, title: string | undefined): string {
-  switch (kind) {
-    case "execute":
-      return "shell"
-    case "read":
-      return "read"
-    case "edit":
-      if (title && /write|create/i.test(title)) return "write"
-      return "edit"
-    case "search":
-      return title && /glob/i.test(title) ? "glob" : "grep"
-    case "fetch":
-      return "webfetch"
-    default:
-      return "tool"
-  }
-}
-
-interface McpCall {
-  server: string
-  tool: string
-  arguments?: Record<string, unknown>
-}
-
-/** Agents name MCP tools as `mcp__server__tool` or `mcp.server.tool`. */
-function parseMcpName(name: string): { server: string; tool: string } | undefined {
-  if (name.startsWith("mcp__")) {
-    const [server, ...rest] = name.slice(5).split("__")
-    const tool = rest.join("__")
-    if (server && tool) return { server, tool }
-  }
-  if (name.startsWith("mcp.")) {
-    const [server, ...rest] = name.slice(4).split(".")
-    const tool = rest.join(".")
-    if (server && tool) return { server, tool }
-  }
-  return undefined
-}
-
-function mcpCall(
-  update: SessionUpdate,
-  raw: Record<string, unknown> | undefined,
-  fallbackTitle?: string,
-): McpCall | undefined {
-  const meta = record(update._meta)
-  if (meta?.is_mcp_tool_call === true && raw) {
-    const server = firstText(raw.server)
-    const tool = firstText(raw.tool)
-    if (server && tool) return { server, tool, arguments: record(raw.arguments) }
-  }
-  const names = [
-    firstText(update.name),
-    firstText(update.title),
-    fallbackTitle,
-    firstText(record(record(meta?.claudeCode)?.toolName)),
-  ]
-  for (const name of names) {
-    if (!name) continue
-    const parsed = parseMcpName(name)
-    if (parsed) return { ...parsed, arguments: raw }
-  }
-  return undefined
-}
-
-function normalize(name: string, raw: Record<string, unknown>, fallbackPath?: string) {
-  const input: Record<string, unknown> = { ...raw }
-  const path = firstText(raw.path, raw.file_path, raw.filePath, raw.file) ?? fallbackPath
-  const command = commandOf(raw.command) ?? firstText(raw.cmd, raw.shell_command)
-  const workdir = firstText(raw.workdir, raw.cwd, raw.working_directory)
-  switch (name) {
-    case "shell":
-      if (command) input.command = command
-      if (workdir) input.workdir = workdir
-      break
-    case "read":
-    case "edit":
-    case "write":
-      if (path) input.path = path
-      if (name === "edit") {
-        const oldString =
-          literal(raw.oldString) ?? literal(raw.old_string) ?? literal(raw.oldText) ?? literal(raw.old_text)
-        const newString =
-          literal(raw.newString) ?? literal(raw.new_string) ?? literal(raw.newText) ?? literal(raw.new_text)
-        if (oldString !== undefined) input.oldString = oldString
-        if (newString !== undefined) input.newString = newString
-      }
-      if (name === "write" && input.content === undefined) {
-        const content = literal(raw.content)
-        if (content !== undefined) input.content = content
-      }
-      break
-    case "grep":
-    case "glob": {
-      const pattern = firstText(raw.pattern, raw.query, raw.glob)
-      if (pattern) input.pattern = pattern
-      if (path) input.path = path
-      break
-    }
-    case "webfetch": {
-      const url = firstText(raw.url, raw.uri)
-      if (url) input.url = url
-      break
-    }
-  }
-  return input
-}
-
-/** Human-readable output from an ACP tool update, bounded for the card. */
-function textFromContent(content: unknown): string | undefined {
-  if (!Array.isArray(content)) return undefined
-  const parts: string[] = []
-  for (const item of content) {
-    const entry = record(item)
-    if (!entry) continue
-    const nested = record(entry.content)
-    const value = firstText(entry.text, nested?.text, entry.output, entry.stdout)
-    if (value) {
-      parts.push(value)
-      continue
-    }
-    if (entry.type === "diff") {
-      const path = firstText(entry.path)
-      const oldText = typeof entry.oldText === "string" ? entry.oldText : undefined
-      const newText = typeof entry.newText === "string" ? entry.newText : undefined
-      parts.push([path, oldText && `-${oldText}`, newText && `+${newText}`].filter(Boolean).join("\n"))
-    }
-  }
-  return parts.length ? parts.join("\n") : undefined
-}
-
-function outputOf(update: SessionUpdate): string | undefined {
-  const raw = update.rawOutput
-  if (typeof raw === "string") return clip(raw)
-  const rawRecord = record(raw)
-  if (rawRecord) {
-    const value = firstText(rawRecord.output, rawRecord.stdout, rawRecord.text, rawRecord.result, rawRecord.content)
-    if (value) return clip(value)
-    // MCP tool results arrive as `{ result: { content: [{ type: "text", text }] } }`.
-    const result = record(rawRecord.result)
-    if (result) {
-      const nested = firstText(result.output, result.stdout, result.text) ?? textFromContent(result.content)
-      if (nested) return clip(nested)
-    }
-  }
-  const content = textFromContent(update.content)
-  return content ? clip(content) : undefined
-}
-
-function clip(value: string) {
-  return value.length > MAX_OUTPUT ? `${value.slice(0, MAX_OUTPUT - 1)}…` : value
-}
-
-/** The file-level diff an ACP agent reports for an edit. */
-function diffOf(update: SessionUpdate) {
-  if (!Array.isArray(update.content)) return undefined
-  for (const item of update.content) {
-    const entry = record(item)
-    if (!entry || entry.type !== "diff") continue
-    return {
-      path: text(entry.path),
-      oldText: literal(entry.oldText),
-      newText: literal(entry.newText),
-    }
-  }
-  return undefined
 }
 
 /**
@@ -246,12 +85,32 @@ export function applyToolUpdate(update: SessionUpdate, states: Map<string, AcpTo
   if (!id) return undefined
   const existing = states.get(id)
   if (existing?.done) return undefined
-  const kind = text(update.kind) ?? existing?.kind
-  // `think` calls (for example codex's Guardian Review) are internal reasoning,
-  // not actions on the workspace, and their raw input is not card-friendly.
-  // Remember the id so later updates cannot surface the call as a generic card.
   if (existing?.hidden) return undefined
-  if (!existing && kind === "think") {
+
+  const meta = metaFor(states).get(id)
+  const kind = text(update.kind) ?? existing?.kind
+  const title = text(update.title) ?? existing?.title
+  const incomingRaw = record(update.rawInput)
+  const hasIncomingRaw = incomingRaw !== undefined && Object.keys(incomingRaw).length > 0
+  const effectiveRaw = hasIncomingRaw ? incomingRaw : meta?.rawInput ?? incomingRaw
+  const diffs = diffsOf(update)
+  const ctx: ToolContext = {
+    update,
+    raw: effectiveRaw,
+    kind,
+    title,
+    topName: text(update.name),
+    locationPath: locationPath(update),
+    diffs,
+    priorAgent: meta?.agent,
+    priorRawName: meta?.rawName,
+  }
+
+  let resolved = resolveClaude(ctx) ?? resolveCodex(ctx) ?? resolveAntigravity(ctx) ?? resolveCommandCode(ctx)
+  if (!resolved && !existing && kind === "think") {
+    // `think` calls (for example codex's Guardian Review) are internal reasoning,
+    // not actions on the workspace, and their raw input is not card-friendly.
+    // Remember the id so later updates cannot surface the call as a generic card.
     states.set(id, {
       id,
       name: "tool",
@@ -264,37 +123,52 @@ export function applyToolUpdate(update: SessionUpdate, states: Map<string, AcpTo
     })
     return undefined
   }
-  const title = text(update.title) ?? existing?.title
-  const status = text(update.status) ?? existing?.status ?? "pending"
-  const raw = record(update.rawInput)
-  const mcp = mcpCall(update, raw, existing?.title)
-  const name = existing?.name ?? (mcp ? "shell" : toolName(kind, title))
-  const path = locationPath(update)
-  const input = raw ? normalize(name, raw, path) : { ...(existing?.input ?? {}) }
-  if (path && !input.path) input.path = path
-  if (mcp) {
-    // OpenCode's generic tool card has no detail view, so render the bridge call
-    // as a console card where the command names the MCP tool and its arguments.
-    const args = mcp.arguments
-    const rendered = args && Object.keys(args).length ? ` ${JSON.stringify(args)}` : ""
-    if (rendered) {
-      input.command = `mcp.${mcp.server}.${mcp.tool}${rendered}`
-    } else if (!input.command && (status === "completed" || status === "failed")) {
-      input.command = `mcp.${mcp.server}.${mcp.tool}`
+  if (!resolved) {
+    if (existing && !hasIncomingRaw && diffs.length === 0) {
+      resolved = {
+        agent: meta?.agent ?? "fallback",
+        rawName: meta?.rawName,
+        name: existing.name,
+        input: { ...existing.input },
+      }
+    } else {
+      resolved = resolveFallback(ctx)
     }
+  } else if (
+    existing &&
+    !hasIncomingRaw &&
+    diffs.length === 0 &&
+    Object.keys(resolved.input).length === 0 &&
+    Object.keys(existing.input).length > 0
+  ) {
+    // A status/output-only update can hit a resolver path with no fields (for
+    // example a bare `webfetch` name); keep the input of the first call.
+    resolved = { ...resolved, name: existing.name, input: { ...existing.input } }
   }
-  if (name === "edit" && input.oldString === undefined) {
+
+  const name = resolved.name
+  const input = { ...resolved.input }
+  if (name === "edit" && input.oldString === undefined && diffs[0]) {
     // Agents that send no edit fields in `rawInput` still report the change as
     // a diff, which is what the edit card renders.
-    const diff = diffOf(update)
-    if (diff) {
-      if (diff.path && !input.path) input.path = diff.path
-      if (diff.oldText !== undefined) input.oldString = diff.oldText
-      if (diff.newText !== undefined) input.newString = diff.newText
-    }
+    const diff = diffs[0]
+    if (diff.path && !input.path) input.path = diff.path
+    input.oldString = diff.oldText === null ? "" : diff.oldText
+    input.newString = diff.newText
   }
+
   const delta = terminalOutputDelta(update)
+  const streamedTerminal = Boolean(meta?.streamedTerminal || delta !== undefined)
   const streamed = delta === undefined ? existing?.output : clip(`${existing?.output ?? ""}${delta}`)
+
+  metaFor(states).set(id, {
+    agent: resolved.agent,
+    rawName: resolved.rawName,
+    rawInput: effectiveRaw,
+    streamedTerminal,
+  })
+
+  const status = text(update.status) ?? existing?.status ?? "pending"
   const state: AcpToolState = {
     id,
     name,
@@ -304,7 +178,11 @@ export function applyToolUpdate(update: SessionUpdate, states: Map<string, AcpTo
     status,
     isError: status === "failed",
     done: status === "completed" || status === "failed",
-    output: outputOf(update) ?? streamed,
+    output: extractOutput(update, {
+      streamed,
+      streamedTerminal,
+      stripAntigravityHeader: resolved.agent === "antigravity" && resolved.rawName === "run_command",
+    }),
   }
   states.set(id, state)
   return state

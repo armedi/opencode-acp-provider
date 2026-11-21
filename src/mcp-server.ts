@@ -631,6 +631,7 @@ async function buildTools(
       inputSchema: objectSchema({
         questions: {
           type: "array",
+          minItems: 1,
           description: "Questions to ask",
           minItems: 1,
           items: objectSchema(
