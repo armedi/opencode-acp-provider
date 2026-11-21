@@ -95,7 +95,9 @@ function update(sessionId, payload) {
 
 function optionsFor(sessionId) {
   const selection = sessionSelections.get(sessionId) ?? { model: "fast", effort: "medium" }
-  return configOptions.map((option) => ({
+  // Like Antigravity's orchestrator models, `--effortless-model` offers no effort select.
+  const effortless = selection.model === argument("--effortless-model")
+  return configOptions.filter((option) => !effortless || option.category !== "thought_level").map((option) => ({
     ...option,
     id: option.category === "model" ? argument("--model-option-id") ?? option.id : option.id,
     currentValue: option.category === "model" ? selection.model : selection.effort,
@@ -227,7 +229,15 @@ function handle(message) {
         selection.model = value
         // Model changes may reset reasoning effort.
         selection.effort = "medium"
-      } else if (message.params?.configId === "effort") selection.effort = value
+      } else if (message.params?.configId === "effort") {
+        if (selection.model === argument("--effortless-model")) {
+          return send({
+            jsonrpc: "2.0", id: message.id,
+            error: { code: -32602, message: `Thinking level "${value}" is not offered for model "${selection.model}"` },
+          })
+        }
+        selection.effort = value
+      }
       else return send({
         jsonrpc: "2.0", id: message.id,
         error: { code: -32602, message: "unknown config option" },

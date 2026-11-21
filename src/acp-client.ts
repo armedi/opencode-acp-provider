@@ -119,7 +119,7 @@ function readQuestionText(params: any, options: Array<{ optionId?: string }>): s
   return question
 }
 
-function readEffortConfig(configOptions: AcpConfigOption[]): AcpEffortConfig | undefined {
+export function readEffortConfig(configOptions: AcpConfigOption[]): AcpEffortConfig | undefined {
   const option =
     configOptions.find((candidate) => candidate.id === "effort") ??
     configOptions.find((candidate) => candidate.category === "thought_level")
@@ -181,6 +181,13 @@ interface SessionState {
   /** Extra directories granted at session/new; readable through client fs. */
   additionalDirectories?: string[]
   configOptions: AcpConfigOption[]
+  /**
+   * The agent reported the session's options after its latest model change, so
+   * `configOptions` reflects the selected model's effort select (or its absence).
+   */
+  optionsConfirmed: boolean
+  /** An effort was set in this session, so the current effort is no longer the model's default. */
+  effortSet: boolean
   /**
    * The object that opened this session, usually the server manager. A call
    * matches the session when it passes no owner, when the session has no
@@ -697,6 +704,8 @@ export class AcpClient {
       cwd,
       additionalDirectories: options.additionalDirectories,
       configOptions,
+      optionsConfirmed: Array.isArray(result.configOptions),
+      effortSet: false,
       owner: options.owner,
       onCommands: options.onCommands,
     })
@@ -803,6 +812,9 @@ export class AcpClient {
       cwd: options.cwd,
       additionalDirectories: options.additionalDirectories,
       configOptions: result.configOptions ?? [],
+      optionsConfirmed: Array.isArray(result.configOptions),
+      // An earlier process may have changed the effort of a restored session.
+      effortSet: true,
       owner: options.owner,
       onCommands: options.onCommands,
     })
@@ -840,6 +852,19 @@ export class AcpClient {
   async setModel(sessionId: string, modelId: string, configId = "model") {
     return this.setConfigOption(sessionId, this.configOption(sessionId, "model")?.id ?? configId, modelId)
   }
+  /**
+   * The effort select the session's current model offers, as last reported by
+   * the agent. Undefined when the agent has not reported the options since the
+   * last model change; `config` is undefined when the model offers no effort.
+   * `defaultValue` is the model's own effort, known only until one is set.
+   */
+  observedEffort(sessionId: string) {
+    const session = this.sessions.get(sessionId)
+    if (!session?.optionsConfirmed) return undefined
+    const config = readEffortConfig(session.configOptions)
+    return { config, defaultValue: session.effortSet ? undefined : config?.currentValue }
+  }
+
   /** Set the agent's reasoning effort for a session. */
   async setEffort(sessionId: string, effort: string, configId = "effort") {
     return this.setConfigOption(sessionId, this.configOption(sessionId, "thought_level")?.id ?? configId, effort)
@@ -852,6 +877,10 @@ export class AcpClient {
     if (option?.currentValue === value) return
     const result = await this.request("session/set_config_option", { sessionId, configId, value })
     if (session) {
+      if (option?.category === "model" || configId === "model") session.optionsConfirmed = Array.isArray(result.configOptions)
+      if (option?.category === "thought_level" || configId === readEffortConfig(session.configOptions)?.configId) {
+        session.effortSet = true
+      }
       session.configOptions = Array.isArray(result.configOptions)
         ? result.configOptions
         : session.configOptions.map((current) => {

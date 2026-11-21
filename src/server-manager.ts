@@ -12,6 +12,7 @@ import {
 import { AgentPool, type AgentLaunch, type AgentLease, type AgentSubscriber } from "./agent-pool.ts"
 import { applyCmdMods } from "./agents/cmd/index.ts"
 import { isCmdCommand } from "./agent-command.ts"
+import { effortLevels, inventoryKey, type AcpCatalog } from "./inventory.ts"
 import { runSetup } from "./setup.ts"
 import { errorMessage } from "./util.ts"
 
@@ -66,6 +67,15 @@ export interface AcpModelInfo {
   id: string
   name: string
   description?: string
+  /**
+   * Effort levels this model offers, excluding the implicit default. Agents such
+   * as Antigravity offer different levels per model, and some models none at
+   * all. Learned when the model is first selected; until then it is undefined
+   * and the server-wide list applies.
+   */
+  efforts?: string[]
+  /** The agent's own effort for this model, as reported before any effort was set. */
+  defaultEffort?: string
 }
 
 export interface AcpServerState {
@@ -77,7 +87,6 @@ export interface AcpServerState {
   /** Reasoning effort levels advertised by the agent, excluding the implicit default. */
   efforts: string[]
   effortConfigID?: string
-  defaultEffort?: string
   error?: string
   /** False when retrying cannot help, e.g. a `models` allowlist that matches nothing. */
   retryable?: boolean
@@ -215,6 +224,9 @@ export class AcpServerManager {
   private cmdSkillDir?: string
   private cmdOrchestration: boolean
   private onCommands?: (server: string) => void
+  private onModels?: (server: string) => void
+  private discoverCommands: boolean
+  private catalogs = new Map<string, { catalog: AcpCatalog; onModels: () => void }>()
   /** Pool that owns agent processes; shared with other OpenCode directories when passed in. */
   private agents: AgentPool
   private ownsAgents: boolean
@@ -245,6 +257,10 @@ export class AcpServerManager {
     cmdOrchestration?: boolean
     /** Called when a server's advertised command list changes. */
     onCommands?: (server: string) => void
+    /** Open a local session to discover this location's slash commands. */
+    discoverCommands?: boolean
+    /** Called when a model's effort levels are learned, which changes its variants. */
+    onModels?: (server: string) => void
     /**
      * Pool that owns agent processes. Pass `sharedAgentPool()` to share them
      * across OpenCode directories; defaults to a private pool.
@@ -268,6 +284,8 @@ export class AcpServerManager {
     this.cmdSkillDir = input.cmdSkillDir
     this.cmdOrchestration = input.cmdOrchestration === true
     this.onCommands = input.onCommands
+    this.discoverCommands = input.discoverCommands !== false
+    this.onModels = input.onModels
     this.agents = input.agents ?? new AgentPool()
     this.ownsAgents = input.agents === undefined
 
@@ -358,10 +376,43 @@ export class AcpServerManager {
     this.onCommands?.(state.config.id)
   }
 
-  /** Effort to apply for a run: explicit request, then server config, then agent default. */
-  private resolveEffort(state: AcpServerState, requested?: string) {
-    const effort = requested ?? state.config.effort ?? state.defaultEffort
+  /** Effort levels and default for a model, falling back to the server-wide list until it is learned. */
+  private effortsFor(state: AcpServerState, model: string | undefined) {
+    const info = state.models.find((candidate) => candidate.id === (model ?? state.defaultModel))
+    if (info?.efforts) return { values: info.efforts, defaultValue: info.defaultEffort, known: true }
+    return { values: state.efforts, defaultValue: undefined, known: false }
+  }
+
+  /** The effort a run asks for: the request, then the server config. Nothing means the agent's default. */
+  private requestedEffort(state: AcpServerState, requested?: string) {
+    const effort = requested ?? state.config.effort
     return effort && effort !== "default" ? effort : undefined
+  }
+
+  /**
+   * Record what the session reports for its current model's effort select.
+   * Efforts are learned per model on first selection rather than by switching
+   * through every model at discovery.
+   */
+  private learnEfforts(state: AcpServerState, model: string | undefined, client: AcpClient, sessionId: string) {
+    const id = model ?? state.defaultModel
+    const catalog = this.catalogs.get(state.config.id)?.catalog
+    const current = catalog?.models.find((candidate) => candidate.id === id)
+    if (!catalog || !current || current.efforts !== undefined) return
+    const observed = client.observedEffort(sessionId)
+    if (!observed) return
+    const efforts = effortLevels(observed.config?.values ?? [])
+    catalog.models = catalog.models.map((candidate) =>
+      candidate === current ? { ...current, efforts, ...(observed.defaultValue ? { defaultEffort: observed.defaultValue } : {}) } : candidate,
+    )
+    this.log("debug", `ACP model "${id}" offers effort levels: ${efforts.join(", ") || "none"}`)
+    for (const onModels of catalog.onModels) onModels()
+  }
+
+  private forgetCatalog(server: string) {
+    const subscription = this.catalogs.get(server)
+    subscription?.catalog.onModels.delete(subscription.onModels)
+    this.catalogs.delete(server)
   }
 
   private sessionDirectories(config: AcpServerConfig, client?: AcpClient) {
@@ -403,15 +454,27 @@ export class AcpServerManager {
     return setup ? runSetup(setup, this.log) : Promise.resolve()
   }
 
+  /**
+   * Set a requested effort once the session's model is selected. Learns the
+   * model's levels first, and sends nothing to a model that has no effort
+   * select or does not offer the level.
+   */
   private async applyEffort(
     state: AcpServerState,
     client: AcpClient,
     sessionId: string,
+    model: string | undefined,
     effort: string | undefined,
   ) {
+    this.learnEfforts(state, model, client, sessionId)
     if (!effort) return
-    if (state.efforts.length && !state.efforts.includes(effort)) {
-      this.log("warn", `ACP server "${state.config.id}" does not support effort "${effort}" (available: ${state.efforts.join(", ")})`)
+    const { values, known } = this.effortsFor(state, model)
+    if (known && !values.includes(effort) && effort !== "default") {
+      this.log(
+        "debug",
+        `ACP model "${model ?? state.defaultModel ?? "default"}" does not offer effort "${effort}"` +
+          (values.length ? ` (available: ${values.join(", ")})` : "; it has no effort levels"),
+      )
       return
     }
     await client.setEffort(sessionId, effort, state.effortConfigID)
@@ -428,20 +491,27 @@ export class AcpServerManager {
     const previous = pooled.selection
     if (previous && previous.model === selection.model && previous.effort === selection.effort) return
     pooled.selection = undefined
-    const resetDefault =
-      (!selection.model && previous?.model !== undefined) ||
-      (!selection.effort && previous?.effort !== undefined)
-    if (previous && !resetDefault) {
+    if (previous && (selection.model || previous.model === undefined)) {
       try {
         const modelChanged = previous.model !== selection.model
         if (modelChanged && selection.model) {
           await pooled.client.setModel(pooled.sessionId, selection.model, state.modelConfigID)
         }
-        if (modelChanged || previous.effort !== selection.effort) {
-          await this.applyEffort(state, pooled.client, pooled.sessionId, selection.effort)
+        // After a model switch the agent picks the new model's effort itself.
+        // Going back to the default on the same model needs that default.
+        let effort = selection.effort
+        let live = true
+        if (!effort && !modelChanged && previous.effort) {
+          this.learnEfforts(state, selection.model, pooled.client, pooled.sessionId)
+          const { values, defaultValue, known } = this.effortsFor(state, selection.model)
+          if (defaultValue) effort = defaultValue
+          else live = known && !values.length
         }
-        pooled.selection = selection
-        return
+        if (live) {
+          await this.applyEffort(state, pooled.client, pooled.sessionId, selection.model, effort)
+          pooled.selection = selection
+          return
+        }
       } catch (error) {
         if (!isAcpError(error) || ![-32601, -32602].includes(error.code)) throw error
         this.log("debug", `ACP session refused a selection change; replaying in a fresh session: ${error.message}`)
@@ -478,7 +548,7 @@ export class AcpServerManager {
     }
     try {
       if (state.config.mode) await pooled.client.setMode(session.sessionId, state.config.mode).catch(() => {})
-      await this.applyEffort(state, pooled.client, session.sessionId, selection.effort)
+      await this.applyEffort(state, pooled.client, session.sessionId, selection.model, selection.effort)
     } catch (error) {
       lease?.release()
       await pooled.client.closeSession(session.sessionId, this).catch(() => {})
@@ -569,6 +639,32 @@ export class AcpServerManager {
     return promise
   }
 
+  private async withDiscoverySession<T>(
+    state: AcpServerState,
+    client: AcpClient,
+    read: (session: Awaited<ReturnType<AcpClient["newSession"]>>) => T,
+  ) {
+    const config = state.config
+    const session = await client.newSession(config.cwd ?? this.defaultCwd, {
+      meta: config.meta,
+      additionalDirectories: this.sessionDirectories(config, client),
+      owner: this,
+      onCommands: this.discoverCommands ? (commands) => this.recordCommands(state, commands) : undefined,
+    })
+    try {
+      this.assertLive()
+      const result = read(session)
+      if (this.discoverCommands) {
+        // Commands are location-specific and may arrive just after session/new.
+        const commands = await client.waitForCommands(session.sessionId, COMMAND_SNAPSHOT_TIMEOUT_MS)
+        if (commands) this.recordCommands(state, commands)
+      }
+      return result
+    } finally {
+      await client.closeSession(session.sessionId, this).catch(() => {})
+    }
+  }
+
   private async doPrepare(state: AcpServerState) {
     const config = state.config
     this.assertLive()
@@ -586,6 +682,7 @@ export class AcpServerManager {
     this.assertLive()
 
     const skillDir = config.skills === false ? undefined : this.cmdSkillDir
+    const launch = this.launchFor(config, skillDir)
     const subscriber: AgentSubscriber = {
       onLog: (level, message) => this.log(level, `[${config.id}] ${message}`),
       onExit: (error) => {
@@ -596,66 +693,84 @@ export class AcpServerManager {
     const dedicated = isCmdCommand(config.command) || config.share === false
     const lease = dedicated
       ? this.agents.dedicated({ launch: (dir) => this.launchFor(config, dir), skillDir }, subscriber)
-      : this.agents.acquire(this.launchFor(config, skillDir), subscriber)
+      : this.agents.acquire(launch, subscriber)
     this.leases.set(config.id, lease)
     const client = lease.client
     state.client = client
     state.retryable = true
 
     try {
-      const session = await client.newSession(config.cwd ?? this.defaultCwd, {
-        meta: config.meta,
-        additionalDirectories: this.sessionDirectories(config, client),
-        owner: this,
-        onCommands: (commands) => this.recordCommands(state, commands),
-      })
-      try {
-        this.assertLive()
-        const defaultModel = session.currentModel ?? (session.modelConfigID ? undefined : "default")
-        let models = session.models.length
-          ? session.models
-          : defaultModel ? [{ id: defaultModel, name: session.currentModel ?? "Agent default" }] : []
-        if (!session.modelConfigID && config.model && config.model !== defaultModel) {
-          state.retryable = false
-          throw new Error(`ACP server "${config.id}" does not expose an ACP model selector; use "default" or omit "model"`)
-        }
-        if (config.models?.length) {
-          const allow = new Set(config.models)
-          models = models.filter((model) => allow.has(model.id))
-          if (!models.length) {
-            state.retryable = false
-            throw new Error(
-              `ACP server "${config.id}" advertised no model matching "models" (${config.models.join(", ")})`,
-            )
+      // The allowlist is a local view, not part of what the agent advertises.
+      const { command, args } = normalizeCommand(config.command)
+      const agent = inventoryKey({ ...config, command: [command, ...args], models: undefined })
+      const commandCwd = !isAbsolute(launch.command) && /[\\/]/.test(launch.command) ? launch.cwd : undefined
+      const key = JSON.stringify([agent, config.cwd ?? commandCwd])
+      const cached = this.agents.catalogs.get(key)
+      let discovery = cached
+      if (!discovery) {
+        discovery = this.withDiscoverySession(state, client, (session): AcpCatalog => {
+          const defaultModel = session.currentModel ?? (session.modelConfigID ? undefined : "default")
+          const models = session.models.length
+            ? session.models
+            : defaultModel ? [{ id: defaultModel, name: session.currentModel ?? "Agent default" }] : []
+          if (!models.length) throw new Error(`ACP server "${config.id}" advertised no models`)
+          const observed = client.observedEffort(session.sessionId)
+          return {
+            models: models.map((model) => observed && model.id === defaultModel
+              ? { ...model, efforts: effortLevels(observed.config?.values ?? []), defaultEffort: observed.defaultValue }
+              : model),
+            defaultModel,
+            modelConfigID: session.modelConfigID,
+            efforts: effortLevels(session.efforts ?? []),
+            effortConfigID: session.effort?.configId,
+            onModels: new Set(),
           }
-        }
-        if (config.model && models.length && !models.some((model) => model.id === config.model)) {
-          this.log(
-            "warn",
-            `ACP server "${config.id}" does not advertise the configured model "${config.model}"; it will be sent anyway`,
-          )
-        }
-        state.models = models
-        state.defaultModel = defaultModel
-        state.modelConfigID = session.modelConfigID
-        state.efforts = (session.efforts ?? []).filter((value) => value !== "default")
-        state.effortConfigID = session.effort?.configId
-        state.defaultEffort = session.effort?.currentValue
-        state.initialized = true
-        state.error = undefined
-        // The command list arrives as a notification just after `session/new`, so
-        // wait for it before this discovery session is closed: once it is gone,
-        // the only way to learn the list is to open another session.
-        const commands = await client.waitForCommands(session.sessionId, COMMAND_SNAPSHOT_TIMEOUT_MS)
-        if (commands) this.recordCommands(state, commands)
-        this.log(
-          "info",
-          `ACP server "${config.id}" ready with ${models.length} model(s)` +
-            (state.efforts.length ? ` and effort levels: ${state.efforts.join(", ")}` : ""),
-        )
-      } finally {
-        await client.closeSession(session.sessionId, this).catch(() => {})
+        })
+        this.agents.catalogs.set(key, discovery)
+        void discovery.catch(() => {
+          if (this.agents.catalogs.get(key) === discovery) this.agents.catalogs.delete(key)
+        })
       }
+      const catalog = await discovery
+      this.assertLive()
+      const allow = config.models?.length ? new Set(config.models) : undefined
+      const visible = () => allow ? catalog.models.filter((model) => allow.has(model.id)) : catalog.models
+      const models = visible()
+      if (!catalog.modelConfigID && config.model && config.model !== catalog.defaultModel) {
+        state.retryable = false
+        throw new Error(`ACP server "${config.id}" does not expose an ACP model selector; use "default" or omit "model"`)
+      }
+      if (!models.length) {
+        state.retryable = false
+        throw new Error(`ACP server "${config.id}" advertised no model matching "models" (${config.models?.join(", ")})`)
+      }
+      if (config.model && !models.some((model) => model.id === config.model)) {
+        this.log(
+          "warn",
+          `ACP server "${config.id}" does not advertise the configured model "${config.model}"; it will be sent anyway`,
+        )
+      }
+      if (cached && this.discoverCommands) {
+        await this.withDiscoverySession(state, client, () => {}).catch((error) => {
+          this.log("debug", `could not discover ACP commands for "${config.id}": ${errorMessage(error)}`)
+        })
+        this.assertLive()
+      }
+      state.models = visible()
+      state.defaultModel = catalog.defaultModel
+      state.modelConfigID = catalog.modelConfigID
+      state.efforts = catalog.efforts
+      state.effortConfigID = catalog.effortConfigID
+      const onModels = () => {
+        state.models = visible()
+        this.onModels?.(config.id)
+      }
+      this.forgetCatalog(config.id)
+      catalog.onModels.add(onModels)
+      this.catalogs.set(config.id, { catalog, onModels })
+      state.initialized = true
+      state.error = undefined
+      this.log("info", `ACP server "${config.id}" ready with ${models.length} model(s)`)
     } catch (error) {
       if (this.leases.get(config.id) === lease) {
         lease.release()
@@ -717,7 +832,7 @@ export class AcpServerManager {
       }
       const model = state.modelConfigID ? requestedModel : undefined
       const mode = state.config.mode
-      const effort = this.resolveEffort(state, input.effort)
+      const effort = this.requestedEffort(state, input.effort)
       const onPermission = this.permissionHandler(input.server, input.sessionKey)
 
       if (!input.key) {
@@ -735,7 +850,7 @@ export class AcpServerManager {
         }
         try {
           if (mode) await client.setMode(session.sessionId, mode).catch(() => {})
-          await this.applyEffort(state, client, session.sessionId, effort)
+          await this.applyEffort(state, client, session.sessionId, model, effort)
           return await client.prompt(session.sessionId, prompt, {
             owner: this,
             onUpdate: input.onUpdate,
@@ -823,7 +938,7 @@ export class AcpServerManager {
               await client.setModel(session.sessionId, model, state.modelConfigID)
             }
             // Set effort after model: changing models can reset it.
-            await this.applyEffort(state, client, session.sessionId, effort)
+            await this.applyEffort(state, client, session.sessionId, model, effort)
           } catch (error) {
             lease?.release()
             if (session) await client.closeSession(session.sessionId, this).catch(() => {})
@@ -1077,6 +1192,7 @@ export class AcpServerManager {
     this.sweeper = undefined
     this.preparing.clear()
     this.negotiating.clear()
+    for (const server of this.catalogs.keys()) this.forgetCatalog(server)
     const pools = [...this.pools.values()]
     this.pools.clear()
     // Best effort: the agent may be shared with another directory, so do not

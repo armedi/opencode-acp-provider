@@ -135,9 +135,11 @@ Ships its own ACP stdio server, so it needs no adapter package:
 
 - **Model ids.** The session's `model` select lists base ids without the thinking level, while
   `agy models` appends it (`<model>-high`). Use the base ids the selector lists.
-- **Reasoning effort.** Effort is not part of the model id: its `thought_level` select (`low`,
-  `medium`, `high`) becomes the model variants, so `acp-agy/<base-id>#high` sets it. There is no
-  `off` variant.
+- **Reasoning effort.** Effort is not part of the model id: its `thought_level` select becomes the
+  model variants, so `acp-agy/<base-id>#high` sets it. The levels differ per model (some add
+  `xhigh`), and the orchestrator models offer none, so they show no variants and no effort is
+  sent. A model's own levels replace the default model's list once it is first selected, and are
+  cached. There is no `off` variant.
 - **Mode.** Its `mode` select (`default`, `accept-edits`, `auto`, `plan`) is not a variant; pin it
   with the server's `mode` option. Permission requests in `default` mode go through `autoApprove`.
 - **Native tools.** `agy` keeps `ask_question` plus its own subagent family (`invoke_subagent`,
@@ -307,6 +309,10 @@ Command Code (`cmd`) binds a process to one directory, so it keeps one process p
 plugin keeps one pre-started spare `cmd` process (about 180 MB) that the next new directory adopts,
 skipping its ~3 s startup, with its skills linked in on adoption. Set `"share": false` for other
 agents that serve one directory per process.
+
+Model discovery runs once per agent configuration per OpenCode service process. Per-model
+variants are learned on first selection and shared across locations and plugin reloads.
+Restarting the service refreshes discovery. Slash commands are still discovered per location.
 
 ## Server options
 

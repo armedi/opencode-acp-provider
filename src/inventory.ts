@@ -11,6 +11,14 @@ export interface AcpInventory {
   efforts: string[]
 }
 
+/** Live discovery, shared by locations for the lifetime of the service. */
+export interface AcpCatalog extends AcpInventory {
+  defaultModel?: string
+  modelConfigID?: string
+  effortConfigID?: string
+  onModels: Set<() => void>
+}
+
 /** Bump when the payload shape changes; an older entry is treated as a miss. */
 const VERSION = 1
 const MAX_MODELS = 1_000
@@ -29,6 +37,8 @@ function cacheInput(config: AcpServerConfig) {
   return {
     command: Array.isArray(config.command) ? config.command : [config.command],
     env: Object.entries(config.env ?? {}).sort(([a], [b]) => a.localeCompare(b)),
+    ...(config.meta ? { meta: config.meta } : {}),
+    ...(config.setup?.trim() ? { setup: config.setup.trim() } : {}),
     models: config.models ?? null,
   }
 }
@@ -62,6 +72,10 @@ export function parseInventory(value: unknown): AcpInventory | undefined {
     if (typeof entry.name !== "string" || !entry.name) return undefined
     const model: AcpModelInfo = { id: entry.id, name: entry.name }
     if (typeof entry.description === "string" && entry.description) model.description = entry.description
+    if (Array.isArray(entry.efforts)) {
+      model.efforts = effortLevels(entry.efforts.filter((effort): effort is string => typeof effort === "string"))
+    }
+    if (typeof entry.defaultEffort === "string" && entry.defaultEffort) model.defaultEffort = entry.defaultEffort
     models.push(model)
   }
 

@@ -105,8 +105,13 @@ test("registers cached models before the agent starts and refreshes them after d
     }
 
     const values = new Map<string, unknown>()
-    const config = { id: "cmd", command: [process.execPath, agent, "--initialize-gate", gate] }
-    values.set(inventoryKey(config), { v: 1, models: [{ id: "cached", name: "Cached" }], efforts: ["high"] })
+    const config = { id: "cmd", command: [process.execPath, agent, "--initialize-gate", gate, "--effortless-model", "slow"] }
+    // `slow` was selected by an earlier process, which learned it has no efforts.
+    values.set(inventoryKey(config), {
+      v: 1,
+      models: [{ id: "cached", name: "Cached" }, { id: "slow", name: "Slow", efforts: [] }],
+      efforts: ["high"],
+    })
     const registration = { dispose: async () => {} }
     const ctx = {
       location: { directory },
@@ -145,12 +150,16 @@ test("registers cached models before the agent starts and refreshes them after d
     try {
       expect(cleanup).toBeFunction()
       // The cached model is selectable before the agent has answered.
-      expect([...registered().keys()]).toEqual(["cmd::cached"])
+      expect([...registered().keys()]).toEqual(["cmd::cached", "cmd::slow"])
       expect(registered().get("cmd::cached")).toEqual(["high"])
+      expect(registered().get("cmd::slow")).toEqual([])
 
       await writeFile(gate, "")
       expect(await waitFor(() => registered().has("cmd::fast") && registered().has("cmd::slow"))).toBe(true)
       expect(registered().has("cmd::cached")).toBe(false)
+      // A service restart refreshes the catalog. Other models are learned on selection.
+      expect(registered().get("cmd::fast")).toEqual(["low", "medium", "high"])
+      expect(registered().get("cmd::slow")).toEqual(["low", "medium", "high"])
 
       // Discovery replaces the cached entry with what the agent advertises.
       expect(await waitFor(() => {

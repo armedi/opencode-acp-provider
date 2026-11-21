@@ -632,6 +632,7 @@ async function buildTools(
         questions: {
           type: "array",
           description: "Questions to ask",
+          minItems: 1,
           items: objectSchema(
             {
               header: stringSchema("Very short label (max 30 chars)"),

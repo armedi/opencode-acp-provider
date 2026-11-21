@@ -6,6 +6,7 @@ import { join } from "node:path"
 import {
   AcpServerManager,
   type AcpCompactResult,
+  type AcpModelInfo,
   type AcpServerConfig,
   type AcpServerState,
   type AcpSessionStore,
@@ -209,7 +210,14 @@ export default Plugin.define({
       log,
       sessions: sessionStore,
       agents: sharedAgentPool(),
+      discoverCommands: options.commands !== false,
       onCommands: (server) => void commandBridge?.sync(server),
+      // A model's effort levels are learned when it is first selected; refresh its variants.
+      onModels: (server) => {
+        const state = manager.get(server)
+        if (!state || disposed || !registered.has(server)) return
+        void publishInventory(state).then(() => persistInventory(state))
+      },
       mcp:
         mcp || openCodeMcp
           ? {
@@ -282,10 +290,12 @@ export default Plugin.define({
     }
 
     const providerModels = (state: AcpServerState, providerID: ReturnType<typeof Provider.ID.make>, inventory: AcpInventory) => {
-      const variants = effortLevels(inventory.efforts).map((effort) => ({
-        id: Model.VariantID.make(effort),
-        settings: { reasoningEffort: effort },
-      }))
+      // Efforts can differ per model, and a model may offer none at all.
+      const variantsFor = (model: AcpModelInfo) =>
+        effortLevels(model.efforts ?? inventory.efforts).map((effort) => ({
+          id: Model.VariantID.make(effort),
+          settings: { reasoningEffort: effort },
+        }))
       return inventory.models.map((model) => ({
         ...Model.Info.default(providerID, Model.ID.make(model.id)),
         modelID: Model.ID.make(`${state.config.id}::${model.id}`),
@@ -300,7 +310,7 @@ export default Plugin.define({
           output: ["text"],
           temperature: false,
         },
-        variants,
+        variants: variantsFor(model),
         // The agent keeps the conversation in its reused ACP session and
         // compacts it itself. A known window would let OpenCode auto-compact,
         // which only spends a turn on a summary the agent never reads. OpenCode
@@ -351,7 +361,15 @@ export default Plugin.define({
       if (left.models.length !== right.models.length || left.efforts.length !== right.efforts.length) return false
       const modelsMatch = left.models.every((model, index) => {
         const other = right.models[index]
-        return other !== undefined && model.id === other.id && model.name === other.name && model.description === other.description
+        return (
+          other !== undefined &&
+          model.id === other.id &&
+          model.name === other.name &&
+          model.description === other.description &&
+          model.defaultEffort === other.defaultEffort &&
+          (model.efforts ?? []).join("\u0000") === (other.efforts ?? []).join("\u0000") &&
+          (model.efforts === undefined) === (other.efforts === undefined)
+        )
       })
       return modelsMatch && left.efforts.every((effort, index) => effort === right.efforts[index])
     }

@@ -98,6 +98,8 @@ function manager(
     maxSessions?: number
     mcp?: McpProvider
     agents?: AgentPool
+    onModels?: (server: string) => void
+    discoverCommands?: boolean
   } = {},
 ) {
   const instance = new AcpServerManager({
@@ -114,6 +116,8 @@ function manager(
     maxSessions: options.maxSessions,
     mcp: options.mcp,
     agents: options.agents,
+    onModels: options.onModels,
+    discoverCommands: options.discoverCommands,
   })
   return { instance }
 }
@@ -314,6 +318,51 @@ test("model and effort changes preserve history and serialize settings with thei
     const requests = (await readFile(rpcLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line))
     const lastPrompt = requests.findLastIndex((request) => request.method === "session/prompt")
     expect(requests[lastPrompt - 1].method).toBe("session/prompt")
+  } finally {
+    await instance.stop()
+  }
+})
+
+test("a model without an effort select gets no effort, even the server default", async () => {
+  const dir = await cwd()
+  const rpcLog = join(dir, "rpc.jsonl")
+  const learned: string[] = []
+  const { instance } = manager({
+    defaultCwd: dir,
+    agentArgs: ["--echo-history", "--effortless-model", "slow", "--rpc-log", rpcLog],
+    onModels: (server) => learned.push(server),
+  })
+  try {
+    await instance.initialize()
+    // Discovery reads only the default model; it does not switch through the others.
+    expect(instance.get("fake")?.models).toEqual([
+      { id: "fast", name: "Fast", efforts: ["low", "medium", "high"], defaultEffort: "medium" },
+      { id: "slow", name: "Slow" },
+    ])
+    const discovery = (await readFile(rpcLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line))
+    expect(discovery.some((request) => request.method === "session/set_config_option")).toBe(false)
+    const turn = async (key: string, model: string, effort: string | undefined, text: string) =>
+      JSON.parse((await instance.run({ server: "fake", key, model, effort, prompt: text })).text)
+
+    expect(await turn("ses_plain", "slow", undefined, "plain")).toMatchObject({ model: "slow" })
+    // Selecting the model reveals that it has no effort levels.
+    expect(instance.get("fake")?.models[1]).toEqual({ id: "slow", name: "Slow", efforts: [] })
+    expect(learned).toEqual(["fake"])
+    // A variant carried over from another model is dropped, not sent.
+    expect(await turn("ses_carried", "slow", "high", "carried")).toMatchObject({ model: "slow" })
+    // Switching a live session onto the model keeps the session instead of replaying it.
+    const first = await turn("ses_switch", "fast", "high", "first")
+    const second = await turn("ses_switch", "slow", undefined, "second")
+    expect(second).toMatchObject({ sessionId: first.sessionId, model: "slow", prompts: ["first", "second"] })
+
+    const requests = (await readFile(rpcLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line))
+    const sessions = new Set([first.sessionId])
+    const effortSets = requests.filter(
+      (request) => request.method === "session/set_config_option" && request.params.configId === "effort",
+    )
+    expect(effortSets.map((request) => [sessions.has(request.params.sessionId), request.params.value])).toEqual([
+      [true, "high"],
+    ])
   } finally {
     await instance.stop()
   }
@@ -693,24 +742,27 @@ test("resumes the stored session after the agent process crashes", async () => {
   }
 })
 
-test("shares one agent process across managers with a shared pool", async () => {
+test("shares agent discovery and learned variants across locations and reloads", async () => {
   const root = await cwd()
   const pidFile = join(root, "pids")
   const rpcFile = join(root, "rpc.jsonl")
   const dirOne = await cwd()
   const dirTwo = await cwd()
   const shared = agentPool()
-  const agentArgs = ["--pid-log", pidFile, "--rpc-log", rpcFile]
-  const first = manager({ defaultCwd: dirOne, agentArgs, agents: shared })
-  const second = manager({ defaultCwd: dirTwo, agentArgs, agents: shared })
+  const agentArgs = ["--pid-log", pidFile, "--rpc-log", rpcFile, "--effortless-model", "slow"]
+  const options = { agentArgs, agents: shared, discoverCommands: false }
+  const first = manager({ ...options, defaultCwd: dirOne })
+  const second = manager({ ...options, defaultCwd: dirTwo })
+  const reloaded = manager({ ...options, defaultCwd: dirOne })
   try {
-    await first.instance.initialize()
-    await second.instance.initialize()
-    await first.instance.run({ server: "fake", prompt: "hi", key: "k1" })
+    await Promise.all([first.instance.initialize(), second.instance.initialize()])
+    expect(newSessions(await rpcRequests(rpcFile))).toHaveLength(1)
+    await first.instance.run({ server: "fake", model: "slow", prompt: "hi", key: "k1" })
+    expect(second.instance.get("fake")?.models.find((model) => model.id === "slow")?.efforts).toEqual([])
     await second.instance.run({ server: "fake", prompt: "hi", key: "k1" })
 
     expect(await pids(pidFile)).toHaveLength(1)
-    // Discovery and the turn both opened in each manager's own directory.
+    // Conversation sessions still open in each manager's own directory.
     const directories = new Set(newSessions(await rpcRequests(rpcFile)).map((session) => session.cwd))
     expect([...directories].sort()).toEqual([dirOne, dirTwo].sort())
 
@@ -718,9 +770,17 @@ test("shares one agent process across managers with a shared pool", async () => 
     const again = await second.instance.run({ server: "fake", prompt: "again", key: "k1" })
     expect(again.text).toBe("got:again")
     expect(await pids(pidFile)).toHaveLength(1)
+    await second.instance.stop()
+
+    await reloaded.instance.initialize()
+    expect(reloaded.instance.get("fake")?.models.find((model) => model.id === "slow")?.efforts).toEqual([])
+    expect(newSessions(await rpcRequests(rpcFile))).toHaveLength(3)
+    expect((await reloaded.instance.run({ server: "fake", prompt: "after reload" })).text).toBe("got:after reload")
+    expect(await pids(pidFile)).toHaveLength(2)
   } finally {
     await first.instance.stop()
     await second.instance.stop()
+    await reloaded.instance.stop()
     await shared.stop()
   }
 })

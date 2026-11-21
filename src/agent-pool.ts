@@ -3,6 +3,7 @@ import { createRequire } from "node:module"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { AcpClient } from "./acp-client.ts"
+import type { AcpCatalog } from "./inventory.ts"
 import { errorMessage } from "./util.ts"
 
 /**
@@ -125,6 +126,8 @@ function launchKey(launch: AgentLaunch) {
 }
 
 export class AgentPool {
+  /** Discovery outlives individual clients and location leases. */
+  readonly catalogs = new Map<string, Promise<AcpCatalog>>()
   private readonly lingerMs: number
   private readonly spares: boolean
   private readonly tmpDir: string
@@ -280,6 +283,7 @@ export class AgentPool {
     const clients = [...this.knownClients()]
     const dirs = [...this.dirs]
     this.shared.clear()
+    this.catalogs.clear()
     for (const state of this.dedicatedStates.values()) {
       state.spare = undefined
       state.interest = 0
@@ -425,7 +429,7 @@ export class AgentPool {
 
 const POOLS = Symbol.for("opencode-acp-provider.agent-pools")
 /** Bump when AgentPool or AcpClient change incompatibly; copies only share a pool with the same ABI and version. */
-const AGENT_POOL_ABI = 1
+const AGENT_POOL_ABI = 2
 
 const { version } = createRequire(import.meta.url)("../package.json") as { version: string }
 
