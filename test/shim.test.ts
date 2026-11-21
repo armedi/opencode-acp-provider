@@ -81,6 +81,82 @@ test("keys the session by x-opencode-session-id, not the affinity header", async
   }
 })
 
+test("labels finished tool calls with their resolved OpenCode names in the text transcript", async () => {
+  const { shim } = await start({
+    run: async (input) => {
+      input.onUpdate?.({
+        sessionUpdate: "tool_call",
+        toolCallId: "claude-1",
+        title: "WebSearch",
+        kind: "search",
+        status: "pending",
+        _meta: { claudeCode: { toolName: "WebSearch" } },
+        rawInput: { query: "opencode acp" },
+      })
+      input.onUpdate?.({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "claude-1",
+        status: "completed",
+        rawOutput: { output: "results" },
+      })
+      input.onUpdate?.({
+        sessionUpdate: "tool_call",
+        toolCallId: "antigravity-1",
+        name: "run_command",
+        title: "run_command",
+        kind: "execute",
+        status: "in_progress",
+        rawInput: { CommandLine: "git status", Cwd: "/tmp" },
+      })
+      input.onUpdate?.({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "antigravity-1",
+        status: "completed",
+        rawOutput: { output: "clean" },
+      })
+      input.onUpdate?.({
+        sessionUpdate: "tool_call",
+        toolCallId: "codex-1",
+        title: "mcp.opencode.models",
+        kind: "other",
+        status: "in_progress",
+        _meta: { is_mcp_tool_call: true },
+        rawInput: { server: "opencode", tool: "models", arguments: { query: "gpt" } },
+      })
+      input.onUpdate?.({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "codex-1",
+        status: "completed",
+        rawOutput: { result: { content: [{ type: "text", text: "[]" }] } },
+      })
+      input.onUpdate?.({
+        sessionUpdate: "tool_call",
+        toolCallId: "think-1",
+        title: "Guardian Review",
+        kind: "think",
+        status: "completed",
+      })
+      return { stopReason: "end_turn", text: "" }
+    },
+  })
+  try {
+    const response = await chat(shim.url, {
+      model: "fake::model-a",
+      messages: [{ role: "user", content: "hi" }],
+    })
+    const body = await response.json()
+    const content: string = body.choices[0].message.content
+    expect(content).toContain("\n\n> ✓ websearch: opencode acp\n\n")
+    expect(content).toContain("\n\n> ✓ shell: git status\n\n")
+    expect(content).toContain("\n\n> ✓ mcp.opencode.models\n\n")
+    expect(content).not.toContain("Guardian Review")
+    expect(content).not.toContain("WebSearch")
+    expect(content).not.toContain("run_command")
+  } finally {
+    await shim.close()
+  }
+})
+
 test("close lets an in-flight turn finish instead of resetting it", async () => {
   let release: () => void = () => {}
   const gate = new Promise<void>((resolve) => (release = resolve))

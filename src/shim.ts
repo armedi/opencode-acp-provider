@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto"
 import type { AcpServerManager } from "./server-manager.ts"
 import type { SessionUpdate } from "./acp-client.ts"
-import { applyToolUpdate, type AcpToolState } from "./acp-tools.ts"
+import { applyToolUpdate, planToToolState, type AcpToolState } from "./acp-tools.ts"
 import { buildPrompts, historyLimits, isAuxiliaryRequest, type ChatMessage } from "./prompt.ts"
 import { BodyTooLargeError, endFailedResponse, errorMessage, listenLocal, readBody } from "./util.ts"
 
@@ -72,43 +72,28 @@ function finishReason(stopReason: string) {
   return "stop"
 }
 
-interface ToolCallState {
-  title: string
-  kind?: string
-  status: string
-  shown: boolean
-}
-
 /**
  * ACP agents execute their own tools, so there is no OpenCode tool part to
  * render. Show each finished tool call as a compact transcript line instead.
  */
-function toolCallLine(update: SessionUpdate, states: Map<string, ToolCallState>) {
-  const id = typeof update.toolCallId === "string" ? update.toolCallId : undefined
-  if (!id) return ""
-  const state = states.get(id) ?? { title: "tool", status: "pending", shown: false }
-  if (typeof update.title === "string" && update.title.trim()) state.title = update.title.trim()
-  if (typeof update.kind === "string" && update.kind) state.kind = update.kind
-  if (typeof update.status === "string" && update.status) state.status = update.status
-  states.set(id, state)
-  if (state.shown || (state.status !== "completed" && state.status !== "failed")) return ""
-  state.shown = true
-  const kind = state.kind === "execute" ? "shell" : state.kind ?? "tool"
-  const icon = state.status === "failed" ? "✗" : "✓"
-  const detail = toolDetail(update) || state.title
-  const label = detail.toLowerCase().startsWith(kind.toLowerCase()) ? detail : `${kind}: ${detail}`
-  return `\n\n> ${icon} ${label}\n\n`
-}
-
-function toolDetail(update: SessionUpdate) {
-  const raw = update.rawInput
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const key of ["command", "path", "file_path", "query", "url", "pattern"]) {
-      const value = (raw as Record<string, unknown>)[key]
-      if (typeof value === "string" && value.trim()) return truncate(value.trim(), 120)
+function toolCallLine(update: SessionUpdate, states: Map<string, AcpToolState>) {
+  const state = applyToolUpdate(update, states)
+  if (!state?.done) return ""
+  let detail = ""
+  for (const key of ["command", "path", "query", "url", "pattern", "id", "code"]) {
+    const value = state.input[key]
+    if (typeof value === "string" && value.trim()) {
+      detail = truncate(value.trim(), 120)
+      break
     }
   }
-  return ""
+  if (!detail) detail = state.title ? truncate(state.title, 120) : ""
+  const icon = state.isError ? "✗" : "✓"
+  const label =
+    !detail || detail.toLowerCase().startsWith(state.name.toLowerCase())
+      ? detail || state.name
+      : `${state.name}: ${detail}`
+  return `\n\n> ${icon} ${label}\n\n`
 }
 
 function truncate(text: string, max: number) {
@@ -263,7 +248,6 @@ export async function createShim(options: ShimOptions) {
     let firstChunkAt: number | undefined
     let firstThoughtAt: number | undefined
     const startedAt = Math.round(performance.now())
-    const toolCalls = new Map<string, ToolCallState>()
     const acpTools = new Map<string, AcpToolState>()
     try {
       const result = await manager.run({
@@ -312,10 +296,29 @@ export async function createShim(options: ShimOptions) {
                 })
               }
             } else if (toolCallDisplay) {
-              const line = toolCallLine(update, toolCalls)
+              const line = toolCallLine(update, acpTools)
               if (line) {
                 emitted += line
                 writeChunk({ content: line })
+              }
+            }
+          } else if (update.sessionUpdate === "plan") {
+            if (structuredTools) {
+              const state = planToToolState(update)
+              if (state) {
+                writeChunk({
+                  _acp_tool: {
+                    id: state.id,
+                    name: state.name,
+                    kind: state.kind,
+                    title: state.title,
+                    status: state.status,
+                    input: state.input,
+                    output: state.output,
+                    isError: state.isError,
+                    done: state.done,
+                  },
+                })
               }
             }
           }
