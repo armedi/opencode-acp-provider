@@ -288,7 +288,8 @@ function translate(body: ReadableStream<Uint8Array>, log?: LogFn) {
         (current.name === "edit" && (input.oldString === undefined || input.newString === undefined)) ||
         (current.name === "write" && input.content === undefined) ||
         (current.name === "patch" && input.patchText === undefined)
-      if (!partial || done) {
+      const ready = done || (keys.length > 0 && !partial)
+      if (ready) {
         closeText()
         closeReasoning()
         if (!current.started) {
@@ -296,7 +297,7 @@ function translate(body: ReadableStream<Uint8Array>, log?: LogFn) {
           current.started = true
         }
       }
-      if (!current.called && (done || (keys.length > 0 && !partial))) {
+      if (!current.called && ready) {
         callTool(event.id, current, input)
         current.called = true
       }

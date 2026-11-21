@@ -43,6 +43,8 @@ interface CallMeta {
   agent: AgentId
   rawName?: string
   rawInput?: Record<string, unknown>
+  /** The call streamed terminal output, which outranks a structured `rawOutput`. */
+  streamedTerminal?: boolean
 }
 
 const callMeta = new WeakMap<Map<string, AcpToolState>, Map<string, CallMeta>>()
@@ -57,12 +59,12 @@ function metaFor(states: Map<string, AcpToolState>): Map<string, CallMeta> {
 }
 
 /** Agents report their todo list as a `plan` session update. */
-export function planToToolState(update: SessionUpdate, id = `plan-${randomUUID()}`): AcpToolState | undefined {
+export function planToToolState(update: SessionUpdate): AcpToolState | undefined {
   if (update.sessionUpdate !== "plan") return undefined
   const todos = todowriteTodos(update.entries)
   if (!todos) return undefined
   return {
-    id,
+    id: `plan-${randomUUID()}`,
     name: "todowrite",
     kind: "think",
     title: "Update todos",
@@ -155,11 +157,18 @@ export function applyToolUpdate(update: SessionUpdate, states: Map<string, AcpTo
     input.newString = diff.newText
   }
 
-  metaFor(states).set(id, { agent: resolved.agent, rawName: resolved.rawName, rawInput: effectiveRaw })
+  const delta = terminalOutputDelta(update)
+  const streamedTerminal = Boolean(meta?.streamedTerminal || delta !== undefined)
+  const streamed = delta === undefined ? existing?.output : clip(`${existing?.output ?? ""}${delta}`)
+
+  metaFor(states).set(id, {
+    agent: resolved.agent,
+    rawName: resolved.rawName,
+    rawInput: effectiveRaw,
+    streamedTerminal,
+  })
 
   const status = text(update.status) ?? existing?.status ?? "pending"
-  const delta = terminalOutputDelta(update)
-  const streamed = delta === undefined ? existing?.output : clip(`${existing?.output ?? ""}${delta}`)
   const state: AcpToolState = {
     id,
     name,
@@ -171,6 +180,7 @@ export function applyToolUpdate(update: SessionUpdate, states: Map<string, AcpTo
     done: status === "completed" || status === "failed",
     output: extractOutput(update, {
       streamed,
+      streamedTerminal,
       stripAntigravityHeader: resolved.agent === "antigravity" && resolved.rawName === "run_command",
     }),
   }

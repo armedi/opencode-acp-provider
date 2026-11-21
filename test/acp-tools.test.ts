@@ -523,6 +523,14 @@ describe("Command Code tool mapping", () => {
     })
   })
 
+  test("maps run_command to shell even when its top-level name matches Antigravity", () => {
+    const state = mapped(
+      commandCode("run_command", { command: "npm test", cwd: "/repo" }, { name: "run_command" }),
+    )
+    expect(state.name).toBe("shell")
+    expect(state.input).toEqual({ command: "npm test", workdir: "/repo" })
+  })
+
   test("maps Monitor to shell", () => {
     const state = mapped(
       commandCode("Monitor: bun run dev", {
@@ -770,6 +778,13 @@ describe("Command Code tool mapping", () => {
     expect(state.input).toEqual(rawInput)
   })
 
+  test("keeps an MCP execute call generic instead of mapping its command to shell", () => {
+    const rawInput = { command: "echo test" }
+    const state = mapped(commandCode("mcp__example__lookup", rawInput, { kind: "execute" }))
+    expect(state.name).toBe("mcp__example__lookup")
+    expect(state.input).toEqual(rawInput)
+  })
+
   test("keeps ask_user_question visible despite its think kind", () => {
     const questions = [{ question: "Continue?", options: [{ label: "Yes" }] }]
     const state = mapped(commandCode("ask_user_question", { questions }, { kind: "think" }))
@@ -784,6 +799,15 @@ describe("Command Code tool mapping", () => {
     expect(state.name).toBe("Agent: Explore")
     expect(state.name).not.toBe("task")
     expect(state.input).toEqual(rawInput)
+  })
+
+  test("keeps an Agent card visible despite its think kind", () => {
+    const rawInput = { prompt: "Find the ACP tool mapping tests" }
+    const state = mapped(commandCode("Agent: Explore", rawInput, { kind: "think" }))
+    expect(state.name).toBe("Agent: Explore")
+    expect(state.name).not.toBe("task")
+    expect(state.input).toEqual(rawInput)
+    expect(state.hidden).toBeUndefined()
   })
 
   test("hides an Updating todos think call", () => {
@@ -1272,18 +1296,13 @@ describe("Shared tool state behavior", () => {
       isError: false,
       done: true,
     })
-  })
-
-  test("generates unique plan ids across calls", () => {
-    const update = {
+    const again = planToToolState({
       sessionUpdate: "plan",
       entries: [{ content: "One", status: "pending" }],
-    }
-    const first = planToToolState(update)
-    const second = planToToolState(update)
-    expect(first?.id).toMatch(/^plan-/)
-    expect(second?.id).toMatch(/^plan-/)
-    expect(first?.id).not.toBe(second?.id)
+    })
+    expect(state?.id).toMatch(/^plan-/)
+    expect(again?.id).toMatch(/^plan-/)
+    expect(again?.id).not.toBe(state?.id)
   })
 
   test("ignores non-plan updates", () => {
@@ -1348,6 +1367,61 @@ describe("Shared tool state behavior", () => {
       states,
     )
     expect(completed?.output).toBe(JSON.stringify({ total: 9, items: ["a"] }, null, 2))
+  })
+
+  test("prefers structured completion output over non-terminal progress text", () => {
+    const states = toolStates()
+    const toolCallId = "command-code-mcp-progress"
+    applyToolUpdate(
+      commandCode(
+        "mcp__example__lookup",
+        { query: "acp" },
+        { toolCallId, status: "in_progress", rawOutput: { output: "Working" } },
+      ),
+      states,
+    )
+    const completed = applyToolUpdate(
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status: "completed",
+        rawOutput: { result: { count: 9 } },
+      },
+      states,
+    )
+    expect(completed?.output).toBe(JSON.stringify({ count: 9 }, null, 2))
+
+    const codexStates = toolStates()
+    const codexCallId = "codex-shell-stream"
+    applyToolUpdate(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: codexCallId,
+        name: "exec_command",
+        kind: "execute",
+        status: "in_progress",
+        rawInput: { command: "ls" },
+      },
+      codexStates,
+    )
+    applyToolUpdate(
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: codexCallId,
+        _meta: { terminal_output_delta: { data: "alpha\n" } },
+      },
+      codexStates,
+    )
+    const codexCompleted = applyToolUpdate(
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: codexCallId,
+        status: "completed",
+        rawOutput: { exit_code: 0 },
+      },
+      codexStates,
+    )
+    expect(codexCompleted?.output).toBe("alpha\n")
   })
 
   test("clips output at 32000 characters", () => {

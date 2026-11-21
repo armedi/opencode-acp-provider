@@ -29,6 +29,9 @@ export function resolveAntigravity(ctx: ToolContext): ResolvedTool | undefined {
 
   switch (name) {
     case "run_command":
+      // Command Code also names its shell tool `run_command`, but with a
+      // `command` field instead of Antigravity's `CommandLine`.
+      if (raw && "command" in raw && !("CommandLine" in raw)) return undefined
       return resolved(
         "shell",
         shellInput({

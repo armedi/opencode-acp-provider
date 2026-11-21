@@ -336,7 +336,7 @@ function textFromContent(content: unknown): string | undefined {
 /** Human-readable output from an ACP tool update, bounded for the card. */
 export function extractOutput(
   update: SessionUpdate,
-  options: { streamed?: string; stripAntigravityHeader?: boolean } = {},
+  options: { streamed?: string; streamedTerminal?: boolean; stripAntigravityHeader?: boolean } = {},
 ): string | undefined {
   const raw = update.rawOutput
   const rawRecord = record(raw)
@@ -385,7 +385,9 @@ export function extractOutput(
     return clip(value)
   }
 
-  if (options.streamed !== undefined) return options.streamed
+  // Codex streams a command's stdout through terminal deltas, so a completion
+  // that only reports `{ exit_code: 0 }` must not replace the real output.
+  if (options.streamed !== undefined && options.streamedTerminal) return options.streamed
 
   if (raw !== undefined && raw !== null && raw !== "") {
     const target =
@@ -397,13 +399,15 @@ export function extractOutput(
         ? rawRecord.result
         : raw
     const targetRecord = record(target)
-    if (targetRecord && Object.keys(targetRecord).length === 0) return undefined
-    try {
-      const json = JSON.stringify(target, null, 2)
-      if (json) return clip(json)
-    } catch {
-      return undefined
+    if (!targetRecord || Object.keys(targetRecord).length > 0) {
+      try {
+        const json = JSON.stringify(target, null, 2)
+        if (json) return clip(json)
+      } catch {
+        // fall through to the streamed output
+      }
     }
   }
+  if (options.streamed !== undefined) return options.streamed
   return undefined
 }

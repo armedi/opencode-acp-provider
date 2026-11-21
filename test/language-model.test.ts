@@ -203,6 +203,22 @@ test("streaming edit, write, and patch defer their card until the input is compl
         { type: "diff", path: "b.ts", oldText: "three", newText: "four" },
       ],
     })
+    // Command Code starts a Search with `{}` before the query arrives; the
+    // card must wait so tool-input-start commits the final websearch name.
+    input.onUpdate?.({
+      sessionUpdate: "tool_call",
+      toolCallId: "cc-1",
+      title: "Search: opencode",
+      kind: "search",
+      status: "pending",
+      rawInput: {},
+    })
+    input.onUpdate?.({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "cc-1",
+      status: "completed",
+      rawInput: { query: "opencode" },
+    })
     return { stopReason: "end_turn", text: "" }
   })
   try {
@@ -218,21 +234,31 @@ test("streaming edit, write, and patch defer their card until the input is compl
       ["ag-1", "edit"],
       ["cx-1", "write"],
       ["cx-2", "patch"],
+      ["cc-1", "websearch"],
     ])
     expect(calls.map((part) => [part.toolCallId, part.toolName])).toEqual([
       ["ag-1", "edit"],
       ["cx-1", "write"],
       ["cx-2", "patch"],
+      ["cc-1", "websearch"],
     ])
     expect(results.map((part) => [part.toolCallId, part.toolName])).toEqual([
       ["ag-1", "edit"],
       ["cx-1", "write"],
       ["cx-2", "patch"],
+      ["cc-1", "websearch"],
     ])
     const index = (type: string, id: string) =>
       parts.findIndex((part) => part.type === type && (part.toolCallId ?? part.id) === id)
     expect(index("tool-input-start", "ag-1")).toBeLessThan(index("tool-call", "ag-1"))
     expect(index("tool-call", "ag-1")).toBeLessThan(index("tool-result", "ag-1"))
+    for (const type of ["tool-input-start", "tool-call", "tool-result"]) {
+      const part = parts.find((item) => item.type === type && (item.toolCallId ?? item.id) === "cc-1")
+      expect(part?.toolName).toBe("websearch")
+    }
+    expect(index("tool-input-start", "cc-1")).toBeLessThan(index("tool-call", "cc-1"))
+    expect(index("tool-call", "cc-1")).toBeLessThan(index("tool-result", "cc-1"))
+    expect(JSON.parse(calls.at(-1).input)).toEqual({ query: "opencode" })
 
     const append = JSON.parse(calls[0].input)
     expect(append).toMatchObject({ path: "notes.md", oldString: "old line", newString: "new line" })

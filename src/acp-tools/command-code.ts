@@ -125,6 +125,11 @@ export function resolveCommandCode(ctx: ToolContext): ResolvedTool | undefined {
   if (title === "activate_skill") return resolved("skill", skillInput({ id: text(raw?.name) }))
   if (title === "codemode") return resolved("execute", executeInput({ code: literal(raw?.code) }))
   if (isOpencodeQuestionName(title)) return resolved("question", questionInput(raw))
+  // MCP tools stay generic even when they carry a shell-like `command` field
+  // or arrive with an execute/think kind.
+  if (title?.startsWith("mcp__")) return unchanged(title)
+  // Command Code subagent calls keep their own label and stay visible.
+  if (title && (hasLabel(title, "Agent") || title === "task" || title === "agent")) return unchanged(title)
   if (title === "ask_user_question") return unchanged("ask_user_question")
   return undefined
 }

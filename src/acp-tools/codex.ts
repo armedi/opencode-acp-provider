@@ -183,6 +183,7 @@ export function resolveCodex(ctx: ToolContext): ResolvedTool | undefined {
   if (
     ctx.kind === "execute" &&
     !commandCodeShell &&
+    !title?.startsWith("mcp__") &&
     !(raw && ("timeout" in raw || "run_in_background" in raw)) &&
     (ctx.topName === "exec_command" ||
       ctx.topName === "write_stdin" ||
