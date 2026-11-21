@@ -335,13 +335,119 @@ test("creates a worktree for the caller's project and returns its directory", as
       method: "tools/call",
       params: {
         name: "worktree_create",
-        arguments: { from: "abc123", name: "task-a", branch: "" },
+        arguments: { from: "/tmp/caller", branch: "abc123", name: "task-a", directory: "" },
       },
     })
     expect(response.body.result.isError).toBeUndefined()
-    expect(created).toEqual({ projectID: "prj_1", from: "abc123", name: "task-a" })
+    expect(created).toEqual({ projectID: "prj_1", from: "/tmp/caller", branch: "abc123", name: "task-a" })
     expect(response.body.result.structuredContent).toEqual({ directory: "/tmp/wt/task-a" })
     expect(asserted).toMatchObject({ action: "worktree", resources: ["*"], metadata: { operation: "create" } })
+  } finally {
+    lease.release()
+    await server.close()
+  }
+})
+
+const WorktreeError = Schema.TaggedError()("WorktreeError", {
+  name: Schema.Literal("WorktreeError"),
+  data: Schema.Struct({ message: Schema.String, forceRequired: Schema.optional(Schema.Boolean) }),
+})
+
+test("surfaces structured WorktreeError messages and never returns empty tool errors", async () => {
+  const errorContext = (worktree: { create?: () => Promise<unknown>; remove?: () => Promise<unknown> }) => {
+    const base = context()
+    return context({
+      session: {
+        ...base.session,
+        get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, projectID: "prj_1" }),
+      },
+      permission: { assert: async () => {} },
+      worktree: {
+        create: worktree.create ?? (async () => ({ directory: "/tmp/wt" })),
+        remove: worktree.remove ?? (async () => {}),
+      },
+    })
+  }
+
+  const call = async (ctx: any, name: string, args: any) => {
+    const { server, lease, token } = await start(ctx)
+    try {
+      const response = await rpc(server.url, token, {
+        jsonrpc: "2.0",
+        id: 13,
+        method: "tools/call",
+        params: { name, arguments: args },
+      })
+      return response.body.result
+    } finally {
+      lease.release()
+      await server.close()
+    }
+  }
+
+  const createFailed = await call(
+    errorContext({
+      create: async () => {
+        throw new WorktreeError({
+          name: "WorktreeError",
+          data: { message: "Worktree directory unavailable: 9597ba7c53b3d1d7220f1e81fb340f6e83ad074a" },
+        })
+      },
+    }),
+    "worktree_create",
+    {},
+  )
+  expect(createFailed.isError).toBe(true)
+  expect(createFailed.content[0].text).toBe(
+    "Worktree directory unavailable: 9597ba7c53b3d1d7220f1e81fb340f6e83ad074a",
+  )
+
+  const removeFailed = await call(
+    errorContext({
+      remove: async () => {
+        throw new WorktreeError({
+          name: "WorktreeError",
+          data: { message: "Worktree has uncommitted changes", forceRequired: true },
+        })
+      },
+    }),
+    "worktree_remove",
+    { directory: "/tmp/wt" },
+  )
+  expect(removeFailed.isError).toBe(true)
+  expect(removeFailed.content[0].text).toBe("Worktree has uncommitted changes")
+
+  const emptyFailed = await call(
+    errorContext({
+      create: async () => {
+        throw new Error("")
+      },
+    }),
+    "worktree_create",
+    {},
+  )
+  expect(emptyFailed.isError).toBe(true)
+  expect(emptyFailed.content[0].text).toBe("Error")
+  expect(emptyFailed.content[0].text.length).toBeGreaterThan(0)
+})
+
+test("advertises OpenCode worktree.create parameter semantics on tools/list", async () => {
+  const { server, lease, token } = await start()
+  try {
+    const response = await rpc(server.url, token, { jsonrpc: "2.0", id: 14, method: "tools/list" })
+    const tool = response.body.result.tools.find((candidate: any) => candidate.name === "worktree_create")
+    expect(tool.description).toContain("detached")
+    expect(tool.description).toContain("existing checkout/worktree directory")
+    expect(tool.description).toContain("existing starting ref")
+    expect(tool.description).not.toContain("specific commit or ref")
+
+    const properties = tool.inputSchema.properties
+    expect(properties.from.description).toContain("existing checkout")
+    expect(properties.from.description).toContain("worktree directory")
+    expect(properties.from.description).not.toContain("Commit, branch, or tag to start from")
+    expect(properties.branch.description).toContain("Existing git ref")
+    expect(properties.branch.description).not.toContain("Branch for the worktree")
+    expect(properties.directory.description).toContain("Parent directory")
   } finally {
     lease.release()
     await server.close()
