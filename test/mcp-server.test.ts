@@ -109,6 +109,27 @@ test("returns explicit tool guidance on initialize", async () => {
   }
 })
 
+test("requires at least one question in the advertised question schema", async () => {
+  const ctx = context({
+    tool: {
+      list: async () => [{ name: "question", execute: async () => ({}) }],
+    },
+  })
+  const { server, lease, token } = await start(ctx)
+  try {
+    const response = await rpc(server.url, token, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+    })
+    const question = response.body.result.tools.find((tool: any) => tool.name === "question")
+    expect(question.inputSchema.properties.questions.minItems).toBe(1)
+  } finally {
+    lease.release()
+    await server.close()
+  }
+})
+
 test("scopes session reads to the calling session", async () => {
   const { server, lease, token } = await start()
   try {
