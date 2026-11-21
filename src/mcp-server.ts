@@ -647,7 +647,7 @@ async function buildTools(
     })
     tools.push({
       name: "subagent_list",
-      description: "List visible OpenCode subagents and their descriptions. Use an agent ID from this list with `subagent`.",
+      description: "List available OpenCode subagents and their descriptions. Call before delegating with `subagent` to pick a valid `agent` ID.",
       inputSchema: objectSchema({}),
       call: async () => {
         const { data } = await ctx.agent.list()

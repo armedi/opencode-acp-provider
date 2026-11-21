@@ -226,7 +226,7 @@ token per ACP session. Every tool is a 1:1 wrapper:
 | --- | --- |
 | `models` | OpenCode's `models` tool (search, variants, pagination) |
 | `subagent` | builtin `subagent` (native child session; async with native `<subagent>` wake) |
-| `subagent_list` | List visible OpenCode subagents with IDs and descriptions on demand |
+| `subagent_list` | List available OpenCode subagents with IDs and descriptions on demand |
 | `question` | builtin `question` (native session form) |
 | `todowrite` | builtin `todowrite` (only with `experimental.todo`) |
 | `session_create` | `session.create`, then `session.prompt` when `prompt` is set (independent top-level session) |
