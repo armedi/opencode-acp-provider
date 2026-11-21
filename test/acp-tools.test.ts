@@ -89,7 +89,7 @@ test("maps codex read calls from locations and terminal output", () => {
   expect(completed?.output).toBe("alpha\nbeta\n")
 })
 
-test("renders MCP calls as console cards and reads their result", () => {
+test("keeps MCP calls as generic cards with their real names and reads their result", () => {
   const states = new Map<string, AcpToolState>()
   const state = applyToolUpdate(
     {
@@ -103,8 +103,8 @@ test("renders MCP calls as console cards and reads their result", () => {
     },
     states,
   )
-  expect(state?.name).toBe("shell")
-  expect(state?.input.command).toBe('mcp.opencode.models {"query":"gpt-6"}')
+  expect(state?.name).toBe("mcp.opencode.models")
+  expect(state?.input).toEqual({ server: "opencode", tool: "models", arguments: { query: "gpt-6" } })
 
   const completed = applyToolUpdate(
     {
@@ -115,6 +115,7 @@ test("renders MCP calls as console cards and reads their result", () => {
     },
     states,
   )
+  expect(completed?.name).toBe("mcp.opencode.models")
   expect(completed?.output).toBe('{"total":9}')
 
   // Agents that name the tool `mcp__server__tool` send arguments with a later update.
@@ -130,7 +131,8 @@ test("renders MCP calls as console cards and reads their result", () => {
     },
     states,
   )
-  expect(named?.input.command).toBeUndefined()
+  expect(named?.name).toBe("mcp__opencode__models")
+  expect(named?.input).toEqual({})
 
   const args = applyToolUpdate(
     {
@@ -140,7 +142,8 @@ test("renders MCP calls as console cards and reads their result", () => {
     },
     states,
   )
-  expect(args?.input.command).toBe('mcp.opencode.models {"query":"claude","limit":1}')
+  expect(args?.name).toBe("mcp__opencode__models")
+  expect(args?.input).toEqual({ query: "claude", limit: 1 })
 })
 
 test("does not surface internal think calls as tool cards", () => {
