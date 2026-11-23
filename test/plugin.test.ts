@@ -349,142 +349,174 @@ test("only a lone background wake attaches its continuation to the turn", async 
   }
 })
 
-test("wakes OpenCode via session.synthetic when a background task completes and streams the continuation", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "acp-plugin-bg-"))
-  const registration = { dispose: async () => {} }
-  const hooks = new Map<string, (event: any) => Promise<void> | void>()
-  let sdkHook: ((event: any) => void) | undefined
-  const synthetics: Array<Record<string, unknown>> = []
-  let activeProviderID = "acp-fake"
+const backgroundScenarios = [
+  {
+    agent: "Antigravity",
+    prompt: "background-shell",
+    toolCallId: "bg-1",
+    running: "Running in background.",
+    result: "bg-ok",
+  },
+  {
+    // The Bash call reports `completed` at once; only its open terminal says it still runs.
+    agent: "Claude",
+    prompt: "claude-background-shell",
+    toolCallId: "cbg-1",
+    running: "Command running in background with ID: b1.\nRunning in background.",
+    result: "",
+  },
+]
 
-  const cleanup = await plugin.setup({
-    location: { directory },
-    options: {
-      skills: false,
-      mcp: false,
-      commands: false,
-      logLevel: "error",
-      servers: [{ id: "fake", command: [process.execPath, agent] }],
-    },
-    provider: {
-      async transform() {
-        return registration
+test.each(backgroundScenarios)(
+  "wakes OpenCode via session.synthetic when a $agent background task completes and streams the continuation",
+  async ({ prompt, toolCallId, running, result }) => {
+    const directory = await mkdtemp(join(tmpdir(), "acp-plugin-bg-"))
+    const registration = { dispose: async () => {} }
+    const hooks = new Map<string, (event: any) => Promise<void> | void>()
+    let sdkHook: ((event: any) => void) | undefined
+    const synthetics: Array<Record<string, unknown>> = []
+    let activeProviderID = "acp-fake"
+
+    const cleanup = await plugin.setup({
+      location: { directory },
+      options: {
+        skills: false,
+        mcp: false,
+        commands: false,
+        logLevel: "error",
+        servers: [{ id: "fake", command: [process.execPath, agent] }],
       },
-      async reload() {},
-    },
-    aisdk: {
-      async hook(_name: string, handler: (event: any) => void) {
-        sdkHook = handler
-        return registration
-      },
-    },
-    session: {
-      async hook(name: string, handler: (event: any) => Promise<void> | void) {
-        hooks.set(name, handler)
-        return registration
-      },
-      async get() {
-        return { model: { providerID: activeProviderID, modelID: "fast" } }
-      },
-      async synthetic(input: Record<string, unknown>) {
-        synthetics.push(input)
-      },
-    },
-  } as unknown as Plugin.Context)
-
-  try {
-    expect(sdkHook).toBeFunction()
-    const sdkEvent: any = {
-      package: "acp",
-      model: { providerID: "acp-fake", modelID: "fake::fast" },
-    }
-    sdkHook!(sdkEvent)
-    const model = sdkEvent.sdk.languageModel()
-
-    const readStream = async (stream: ReadableStream<any>) => {
-      const reader = stream.getReader()
-      const parts: any[] = []
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) return parts
-        parts.push(value)
-      }
-    }
-
-    const first = await model.doStream({
-      prompt: [{ role: "user", content: [{ type: "text", text: "background-shell" }] }],
-      headers: { "x-opencode-session-id": "ses_e2e_bg" },
-    })
-    const firstParts = await readStream(first.stream)
-    expect(firstParts.find((part) => part.type === "tool-result")).toMatchObject({
-      toolCallId: "bg-1",
-      toolName: "shell",
-      result: "Running in background.",
-    })
-
-    const deadline = Date.now() + 2_000
-    while (synthetics.length === 0 && Date.now() < deadline) await delay(15)
-    expect(synthetics).toHaveLength(1)
-    const wake = synthetics[0]!
-    expect(wake.sessionID).toBe("ses_e2e_bg")
-    expect(wake.description).toBe("Background command finished: sleep 1 && echo bg-ok")
-    expect(wake.delivery).toBe("queue")
-    expect(wake.resume).toBe(true)
-
-    // Simulate OpenCode running the woken turn through context -> model.request -> doStream.
-    await hooks.get("context")!({
-      sessionID: "ses_e2e_bg",
-      model: { providerID: "acp-fake", modelID: "fake::fast" },
-      system: [],
-      messages: [
-        { role: "user", content: [{ type: "text", text: "background-shell" }] },
-        { role: "assistant", content: [{ type: "text", text: "waiting" }] },
-        {
-          role: "user",
-          content: [{ type: "text", text: String(wake.text) }],
-          metadata: wake.metadata,
+      provider: {
+        async transform() {
+          return registration
         },
-      ],
-    })
-    const reqEvent: any = {
-      sessionID: "ses_e2e_bg",
-      model: { providerID: "acp-fake", modelID: "fake::fast" },
-      kind: "primary",
-      headers: {},
-    }
-    await hooks.get("model.request")!(reqEvent)
-    expect(reqEvent.headers["x-acp-continuation"]).toBeString()
-
-    const second = await model.doStream({
-      prompt: [{ role: "user", content: [{ type: "text", text: String(wake.text) }] }],
-      headers: {
-        "x-opencode-session-id": "ses_e2e_bg",
-        ...reqEvent.headers,
+        async reload() {},
       },
-    })
-    const secondParts = await readStream(second.stream)
-    expect(secondParts.find((part) => part.type === "tool-result")).toMatchObject({
-      toolCallId: "bg-1:result",
-      toolName: "shell",
-      result: "bg-ok",
-    })
-    const textDeltas = secondParts
-      .filter((part) => part.type === "text-delta")
-      .map((part) => part.delta)
-      .join("")
-    expect(textDeltas).toBe("background done")
+      aisdk: {
+        async hook(_name: string, handler: (event: any) => void) {
+          sdkHook = handler
+          return registration
+        },
+      },
+      session: {
+        async hook(name: string, handler: (event: any) => Promise<void> | void) {
+          hooks.set(name, handler)
+          return registration
+        },
+        async get() {
+          return { model: { providerID: activeProviderID, modelID: "fast" } }
+        },
+        async synthetic(input: Record<string, unknown>) {
+          synthetics.push(input)
+        },
+      },
+    } as unknown as Plugin.Context)
 
-    // Switching providers skips waking the session for late ACP updates.
-    activeProviderID = "openai"
-    const switched = await model.doStream({
-      prompt: [{ role: "user", content: [{ type: "text", text: "background-shell" }] }],
-      headers: { "x-opencode-session-id": "ses_e2e_switched" },
-    })
-    await readStream(switched.stream)
-    await delay(150)
-    expect(synthetics).toHaveLength(1)
-  } finally {
-    await cleanup?.()
-    await rm(directory, { recursive: true, force: true })
-  }
-}, 10_000)
+    try {
+      expect(sdkHook).toBeFunction()
+      const sdkEvent: any = {
+        package: "acp",
+        model: { providerID: "acp-fake", modelID: "fake::fast" },
+      }
+      sdkHook!(sdkEvent)
+      const model = sdkEvent.sdk.languageModel()
+
+      const readStream = async (stream: ReadableStream<any>) => {
+        const reader = stream.getReader()
+        const parts: any[] = []
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) return parts
+          parts.push(value)
+        }
+      }
+
+      const first = await model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+        headers: { "x-opencode-session-id": "ses_e2e_bg" },
+      })
+      const firstParts = await readStream(first.stream)
+      expect(firstParts.find((part) => part.type === "tool-result")).toMatchObject({
+        toolCallId,
+        toolName: "shell",
+        result: running,
+      })
+
+      // The session stays busy while the command runs and until its wake-up continues it.
+      let idled = false
+      void Promise.resolve(hooks.get("experimental.idle")!({ sessionID: "ses_e2e_bg", background: [] })).then(() => {
+        idled = true
+      })
+
+      const deadline = Date.now() + 2_000
+      while (synthetics.length === 0 && Date.now() < deadline) await delay(15)
+      expect(synthetics).toHaveLength(1)
+      expect(idled).toBe(false)
+      const wake = synthetics[0]!
+      expect(wake.sessionID).toBe("ses_e2e_bg")
+      expect(wake.description).toBe("Background command finished: sleep 1 && echo bg-ok")
+      expect(wake.delivery).toBe("queue")
+      expect(wake.resume).toBe(true)
+
+      // Simulate OpenCode running the woken turn through context -> model.request -> doStream.
+      await hooks.get("context")!({
+        sessionID: "ses_e2e_bg",
+        model: { providerID: "acp-fake", modelID: "fake::fast" },
+        system: [],
+        messages: [
+          { role: "user", content: [{ type: "text", text: prompt }] },
+          { role: "assistant", content: [{ type: "text", text: "waiting" }] },
+          {
+            role: "user",
+            content: [{ type: "text", text: String(wake.text) }],
+            metadata: wake.metadata,
+          },
+        ],
+      })
+      const reqEvent: any = {
+        sessionID: "ses_e2e_bg",
+        model: { providerID: "acp-fake", modelID: "fake::fast" },
+        kind: "primary",
+        headers: {},
+      }
+      await hooks.get("model.request")!(reqEvent)
+      expect(reqEvent.headers["x-acp-continuation"]).toBeString()
+
+      const second = await model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: String(wake.text) }] }],
+        headers: {
+          "x-opencode-session-id": "ses_e2e_bg",
+          ...reqEvent.headers,
+        },
+      })
+      const secondParts = await readStream(second.stream)
+      expect(secondParts.find((part) => part.type === "tool-result")).toMatchObject({
+        toolCallId: `${toolCallId}:result`,
+        toolName: "shell",
+        result,
+      })
+      const textDeltas = secondParts
+        .filter((part) => part.type === "text-delta")
+        .map((part) => part.delta)
+        .join("")
+      expect(textDeltas).toBe("background done")
+      const idleDeadline = Date.now() + 2_000
+      while (!idled && Date.now() < idleDeadline) await delay(15)
+      expect(idled).toBe(true)
+
+      // Switching providers skips waking the session for late ACP updates.
+      activeProviderID = "openai"
+      const switched = await model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+        headers: { "x-opencode-session-id": "ses_e2e_switched" },
+      })
+      await readStream(switched.stream)
+      await delay(150)
+      expect(synthetics).toHaveLength(1)
+    } finally {
+      await cleanup?.()
+      await rm(directory, { recursive: true, force: true })
+    }
+  },
+  10_000,
+)

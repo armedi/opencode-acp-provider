@@ -1053,6 +1053,49 @@ test("captures background shell completion, remaps toolCallId, and streams witho
   }
 })
 
+test("settles a Codex background completion without waiting for a reply Codex never sends", async () => {
+  const dir = await cwd()
+  const woken: AcpUnsolicitedTurnInfo[] = []
+  const { instance } = manager({
+    defaultCwd: dir,
+    agentArgs: ["--agent-name", "@agentclientprotocol/codex-acp"],
+    onUnsolicited: (turn) => woken.push(turn),
+  })
+  try {
+    await instance.initialize()
+    await instance.run({ server: "fake", key: "ses_codex", sessionKey: "ses_codex", prompt: "silent-background-shell" })
+    expect(await until(() => woken.length === 1)).toBe(true)
+    const wake = woken[0]!
+    const startedAt = Date.now()
+    const turn = await instance.run({
+      server: "fake",
+      key: "ses_codex",
+      sessionKey: "ses_codex",
+      prompt: { fresh: wake.text, reused: wake.text },
+      continuation: wake.token,
+    })
+    expect(turn.stopReason).toBe("end_turn")
+    // Other agents get a minute to answer a background completion.
+    expect(Date.now() - startedAt).toBeLessThan(5_000)
+    expect(instance.pendingBackgroundWork("ses_codex")).toEqual([])
+  } finally {
+    await instance.stop()
+  }
+}, 10_000)
+
+test("counts a Command Code background task as pending until its process exits", async () => {
+  const dir = await cwd()
+  const { instance } = manager({ defaultCwd: dir })
+  try {
+    await instance.initialize()
+    await instance.run({ server: "fake", key: "ses_cmd", sessionKey: "ses_cmd", prompt: "cmd-background-shell" })
+    expect(instance.pendingBackgroundWork("ses_cmd")).toEqual(["process:s1"])
+    expect(await until(() => instance.pendingBackgroundWork("ses_cmd").length === 0)).toBe(true)
+  } finally {
+    await instance.stop()
+  }
+})
+
 test("interrupts an attached unsolicited continuation and notifies the agent", async () => {
   const dir = await cwd()
   const rpcFile = join(dir, "rpc.jsonl")

@@ -12,7 +12,8 @@ import {
 import { AgentPool, type AgentLaunch, type AgentLease, type AgentSubscriber } from "./agent-pool.ts"
 import { applyCmdMods } from "./agents/cmd/index.ts"
 import { isCmdCommand } from "./agent-command.ts"
-import { commandOf, record, text } from "./acp-tools/shared.ts"
+import { commandCodeBackgroundTask } from "./acp-tools/command-code.ts"
+import { commandOf, record, terminalEvents, text, toolUpdateStatus } from "./acp-tools/shared.ts"
 import { effortLevels, inventoryKey, type AcpCatalog } from "./inventory.ts"
 import { runSetup } from "./setup.ts"
 import {
@@ -182,6 +183,12 @@ interface PooledSession {
   mcpRelease?: () => void
   /** Tools started in an earlier turn that had not settled when that turn returned. */
   backgroundTools: Map<string, TrackedBackgroundTool>
+  /**
+   * Processes the agent left running whose end it never reports (Command
+   * Code's background shell tasks), by task id. Only the process id tells
+   * whether one still runs.
+   */
+  backgroundProcesses: Map<string, number>
   /** Autonomous post-turn continuation currently streaming for this session, if any. */
   activeUnsolicited?: UnsolicitedTurn
   activeUnsolicitedTools?: Map<string, TurnToolRecord>
@@ -196,6 +203,18 @@ interface TrackedBackgroundTool extends BackgroundToolRecord {
 
 interface TurnToolRecord extends TrackedBackgroundTool {
   terminal: boolean
+  /** The call's display terminal is open, so its command still runs. */
+  terminalOpen: boolean
+}
+
+/**
+ * A call's `_meta` without its terminal events, so a later remapped update
+ * cannot replay the output or exit of the call that started it.
+ */
+function withoutTerminalMeta(meta: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!meta) return undefined
+  const { terminal_info, terminal_output, terminal_output_delta, terminal_exit, ...rest } = meta
+  return Object.keys(rest).length ? rest : undefined
 }
 
 export interface AcpUnsolicitedTurnInfo {
@@ -231,6 +250,20 @@ const MAX_TURN_FAILURES = 3
 const COMMAND_SNAPSHOT_TIMEOUT_MS = 2_000
 const SWEEP_INTERVAL_MS = 60_000
 const MAX_BACKGROUND_TOOLS = 64
+/** The `agentInfo.name` of codex-acp. */
+const CODEX_AGENT = "@agentclientprotocol/codex-acp"
+/** How long to wait for an answer from an agent that does not answer background completions. */
+const NO_REPLY_AWAIT_MS = 1_500
+
+/** Whether process `pid` still exists. `EPERM` means it does, under another user. */
+function processRuns(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
 
 export class AcpServerManager {
   readonly servers = new Map<string, AcpServerState>()
@@ -613,6 +646,7 @@ export class AcpServerManager {
     pooled.history = "fresh"
     pooled.selection = selection
     pooled.backgroundTools.clear()
+    pooled.backgroundProcesses.clear()
     if (lease) {
       pooled.mcpRelease?.()
       pooled.mcpServers = lease.servers
@@ -1066,6 +1100,7 @@ export class AcpServerManager {
             broken: false,
             mcpRelease: lease?.release,
             backgroundTools: new Map(),
+            backgroundProcesses: new Map(),
             pendingContinuations: new Map(),
           }
           this.pools.set(poolKey, created)
@@ -1198,6 +1233,7 @@ export class AcpServerManager {
     pooled.activeUnsolicited = undefined
     pooled.activeUnsolicitedTools = undefined
     pooled.backgroundTools.clear()
+    pooled.backgroundProcesses.clear()
     const error = new Error(`ACP session ${pooled.sessionId} was closed`)
     for (const turn of turns) turn.fail(error)
     pooled.mcpRelease?.()
@@ -1209,6 +1245,23 @@ export class AcpServerManager {
     return [...this.pools.values()].some(
       (pooled) => pooled.key === sessionKey && !pooled.broken && pooled.pendingContinuations.has(token),
     )
+  }
+
+  /**
+   * Ids of this OpenCode session's unfinished ACP background work: tools still
+   * running after their turn returned, and wake-ups no turn has attached yet.
+   */
+  pendingBackgroundWork(sessionKey: string): string[] {
+    const ids: string[] = []
+    for (const pooled of this.pools.values()) {
+      if (pooled.key !== sessionKey || pooled.broken) continue
+      ids.push(...pooled.backgroundTools.keys(), ...pooled.pendingContinuations.keys())
+      for (const [taskId, pid] of pooled.backgroundProcesses) {
+        if (processRuns(pid)) ids.push(`process:${taskId}`)
+        else pooled.backgroundProcesses.delete(taskId)
+      }
+    }
+    return ids
   }
 
   /** Find an unattached continuation token matching a synthetic wake-up message's text. */
@@ -1263,15 +1316,17 @@ export class AcpServerManager {
 
   private trackAndRemapUpdate(
     pooled: PooledSession,
-    update: SessionUpdate,
+    incoming: SessionUpdate,
     turnTools: Map<string, TurnToolRecord>,
   ): SessionUpdate {
-    if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") return update
-    const rawId = text(update.toolCallId)
-    if (!rawId) return update
+    if (incoming.sessionUpdate !== "tool_call" && incoming.sessionUpdate !== "tool_call_update") return incoming
+    const rawId = text(incoming.toolCallId)
+    if (!rawId) return incoming
 
-    const status = text(update.status)
-    const terminal = status === "completed" || status === "failed"
+    // A bare `terminal_exit` ends the call, so give it the status it implies.
+    const status = toolUpdateStatus(incoming)
+    const update = status && !text(incoming.status) ? { ...incoming, status } : incoming
+    const settled = status === "completed" || status === "failed"
     const incomingRaw = record(update.rawInput)
     const hasIncomingRaw = incomingRaw !== undefined && Object.keys(incomingRaw).length > 0
     const name = text(update.name)
@@ -1279,32 +1334,49 @@ export class AcpServerManager {
     const kind = text(update.kind)
     const meta = record(update._meta)
     const command = commandOf(incomingRaw?.CommandLine ?? incomingRaw?.command)
+    const events = terminalEvents(update)
 
     const background = pooled.backgroundTools.get(rawId)
     if (background) {
       const mergedRaw = hasIncomingRaw ? incomingRaw : background.rawInput
+      // The agent-native fields of the first call (such as Claude's tool name)
+      // keep the result on the same card type.
+      const mergedMeta = background.meta || meta ? { ...background.meta, ...meta } : undefined
       const remapped: SessionUpdate = {
         ...update,
         toolCallId: `${rawId}:result`,
         ...(!name && background.name ? { name: background.name } : {}),
         ...(!title && background.title ? { title: background.title } : {}),
         ...(!kind && background.kind ? { kind: background.kind } : {}),
-        ...(!meta && background.meta ? { _meta: background.meta } : {}),
+        ...(mergedMeta ? { _meta: mergedMeta } : {}),
         ...(mergedRaw ? { rawInput: mergedRaw } : {}),
       }
-      if (terminal) pooled.backgroundTools.delete(rawId)
+      if (settled) pooled.backgroundTools.delete(rawId)
       return remapped
     }
 
+    const task = commandCodeBackgroundTask(update)
+    if (task) {
+      while (pooled.backgroundProcesses.size >= MAX_BACKGROUND_TOOLS) {
+        const oldest = pooled.backgroundProcesses.keys().next().value
+        if (oldest === undefined) break
+        pooled.backgroundProcesses.delete(oldest)
+      }
+      pooled.backgroundProcesses.set(task.taskId, task.pid)
+    }
+
     const prior = turnTools.get(rawId)
+    const terminalOpen = (Boolean(prior?.terminalOpen) || events.opened) && !events.exited
     turnTools.set(rawId, {
       name: name ?? prior?.name,
       title: title ?? prior?.title,
       kind: kind ?? prior?.kind,
-      meta: meta ?? prior?.meta,
+      meta: withoutTerminalMeta(meta) ?? prior?.meta,
       command: command ?? prior?.command,
       rawInput: hasIncomingRaw ? incomingRaw : prior?.rawInput,
-      terminal: terminal || Boolean(prior?.terminal),
+      terminalOpen,
+      // A completed call whose terminal is still open went to the background.
+      terminal: status === "failed" || (status === "completed" && !terminalOpen) || Boolean(prior?.terminal),
     })
     return update
   }
@@ -1351,12 +1423,19 @@ export class AcpServerManager {
 
     const rawId = text(update.toolCallId)
     const background = rawId ? pooled.backgroundTools.get(rawId) : undefined
-    const { description, text: summaryText } = unsolicitedSummary(update, background, agentName(state.config))
     const turnTools = new Map<string, TurnToolRecord>()
+    const mapped = this.trackAndRemapUpdate(pooled, update, turnTools)
+    const { description, text: summaryText } = unsolicitedSummary(mapped, background, agentName(state.config))
     const turn = new UnsolicitedTurn({
       description,
       text: summaryText,
-      timing: { maxTurnMs: this.promptTimeoutMs, ...this.unsolicitedTiming },
+      timing: {
+        maxTurnMs: this.promptTimeoutMs,
+        // Codex reports a background command's end but never answers it on
+        // its own, so a long wait for its reply only keeps the session busy.
+        ...(pooled.client.agentName === CODEX_AGENT ? { awaitingResponseMs: NO_REPLY_AWAIT_MS } : {}),
+        ...this.unsolicitedTiming,
+      },
       onSettled: (result) => {
         if (pooled.activeUnsolicited === turn) {
           pooled.activeUnsolicited = undefined
@@ -1377,7 +1456,7 @@ export class AcpServerManager {
     pooled.pendingContinuations.set(turn.token, turn)
     pooled.lastUsed = Date.now()
 
-    turn.push(this.trackAndRemapUpdate(pooled, update, turnTools))
+    turn.push(mapped)
     this.onUnsolicited?.({
       server: state.config.id,
       sessionKey: pooled.key,
@@ -1527,6 +1606,7 @@ export class AcpServerManager {
       pooled.activeUnsolicited = undefined
       pooled.activeUnsolicitedTools = undefined
       pooled.backgroundTools.clear()
+      pooled.backgroundProcesses.clear()
       for (const turn of turns) turn.dispose()
       pooled.mcpRelease?.()
       pooled.client.cancelTurn(pooled.sessionId, this)

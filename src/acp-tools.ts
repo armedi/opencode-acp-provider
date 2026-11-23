@@ -11,9 +11,11 @@ import {
   extractOutput,
   locationPath,
   record,
-  terminalOutputDelta,
+  terminalEvents,
+  terminalOutputChunk,
   text,
   todowriteTodos,
+  toolUpdateStatus,
   type AgentId,
   type ToolContext,
 } from "./acp-tools/shared.ts"
@@ -45,6 +47,8 @@ interface CallMeta {
   rawInput?: Record<string, unknown>
   /** The call streamed terminal output, which outranks a structured `rawOutput`. */
   streamedTerminal?: boolean
+  /** The call's display terminal is open: its command still runs, even after a `completed` status. */
+  terminalOpen?: boolean
 }
 
 const callMeta = new WeakMap<Map<string, AcpToolState>, Map<string, CallMeta>>()
@@ -157,18 +161,27 @@ export function applyToolUpdate(update: SessionUpdate, states: Map<string, AcpTo
     input.newString = diff.newText
   }
 
-  const delta = terminalOutputDelta(update)
-  const streamedTerminal = Boolean(meta?.streamedTerminal || delta !== undefined)
-  const streamed = delta === undefined ? existing?.output : clip(`${existing?.output ?? ""}${delta}`)
+  const chunk = terminalOutputChunk(update)
+  const streamedTerminal = Boolean(meta?.streamedTerminal || chunk !== undefined)
+  const streamed =
+    chunk === undefined
+      ? existing?.output
+      : clip(chunk.replace ? chunk.data : `${existing?.output ?? ""}${chunk.data}`)
+  const terminal = terminalEvents(update)
+  const terminalOpen = (Boolean(meta?.terminalOpen) || terminal.opened) && !terminal.exited
 
   metaFor(states).set(id, {
     agent: resolved.agent,
     rawName: resolved.rawName,
     rawInput: effectiveRaw,
     streamedTerminal,
+    terminalOpen,
   })
 
-  const status = text(update.status) ?? existing?.status ?? "pending"
+  const reported = toolUpdateStatus(update) ?? existing?.status ?? "pending"
+  // A completed call whose terminal is still open went to the background: it
+  // runs on until the terminal exits.
+  const status = reported === "completed" && terminalOpen ? "in_progress" : reported
   const state: AcpToolState = {
     id,
     name,

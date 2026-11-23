@@ -2,6 +2,7 @@
 // Scripted ACP agent used by the tests. Speaks newline-delimited JSON-RPC on
 // stdio and implements just enough of the protocol for the client.
 
+import { spawn } from "node:child_process"
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs"
 import { basename } from "node:path"
 
@@ -146,7 +147,7 @@ function handle(message) {
         id: message.id,
         result: {
           protocolVersion: 1,
-          agentInfo: { name: "fake-agent", version: "1.0.0" },
+          agentInfo: { name: argument("--agent-name") ?? "fake-agent", version: "1.0.0" },
           agentCapabilities: {
             sessionCapabilities: { close: true, ...(canRestore ? { resume: {} } : {}) },
             ...(canRestore ? { loadSession: true } : {}),
@@ -294,6 +295,96 @@ function handle(message) {
       if (/\bcrash\b/i.test(text)) {
         // Simulate the agent process dying mid-turn.
         process.exit(1)
+      }
+      if (/\bsilent-background-shell\b/i.test(text)) {
+        // codex-acp reports a background command's end and nothing after it.
+        update(sessionId, {
+          sessionUpdate: "tool_call",
+          toolCallId: "sbg-1",
+          title: "sleep 1",
+          kind: "execute",
+          status: "in_progress",
+          rawInput: { command: "sleep 1" },
+        })
+        send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
+        setTimeout(() => {
+          update(sessionId, {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "sbg-1",
+            status: "completed",
+            rawOutput: { output: "slept" },
+          })
+        }, 40)
+        return
+      }
+      if (/\bcmd-background-shell\b/i.test(text)) {
+        // Command Code reports a background task only in its result text and
+        // never reports its end.
+        const child = spawn("sleep", ["0.4"], { stdio: "ignore" })
+        update(sessionId, {
+          sessionUpdate: "tool_call",
+          toolCallId: "cmdbg-1",
+          title: "Shell: sleep 0.4",
+          kind: "execute",
+          status: "pending",
+          rawInput: { command: "sleep 0.4", run_in_background: true },
+        })
+        update(sessionId, {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "cmdbg-1",
+          status: "completed",
+          content: [
+            {
+              type: "content",
+              content: {
+                type: "text",
+                text: `Started shell command in the background.\nTask: s1\nStatus: running\nPID: ${child.pid}\nUse shell_tasks to inspect active background commands.`,
+              },
+            },
+          ],
+        })
+        send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
+        return
+      }
+      if (/\bclaude-background-shell\b/i.test(text)) {
+        // claude-agent-acp reports a backgrounded Bash call `completed` at once
+        // and keeps its terminal open; a bare `terminal_exit` ends it later.
+        const terminal = { terminal_id: "cbg-1" }
+        const call = {
+          toolCallId: "cbg-1",
+          title: "sleep 1 && echo bg-ok",
+          kind: "execute",
+          rawInput: { command: "sleep 1 && echo bg-ok", run_in_background: true },
+          content: [{ type: "terminal", terminalId: "cbg-1" }],
+        }
+        update(sessionId, {
+          sessionUpdate: "tool_call",
+          ...call,
+          status: "pending",
+          _meta: { claudeCode: { toolName: "Bash" }, terminal_info: terminal },
+        })
+        update(sessionId, {
+          sessionUpdate: "tool_call_update",
+          ...call,
+          status: "completed",
+          _meta: {
+            claudeCode: { toolName: "Bash" },
+            terminal_info: terminal,
+            terminal_output_delta: { ...terminal, data: "Command running in background with ID: b1." },
+          },
+        })
+        update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "waiting" } })
+        send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } })
+        setTimeout(() => {
+          update(sessionId, {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "cbg-1",
+            _meta: { terminal_exit: { ...terminal, exit_code: null, signal: null } },
+          })
+          update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "background done" } })
+          update(sessionId, { sessionUpdate: "usage_update", used: 42, size: 200 })
+        }, 40)
+        return
       }
       if (/\bbackground-shell(?:-permission)?\b/i.test(text)) {
         const withPermission = /background-shell-permission/i.test(text)

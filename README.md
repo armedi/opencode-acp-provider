@@ -380,7 +380,7 @@ Restarting the service refreshes discovery. Slash commands are still discovered 
 | `outputLimit` | Output limit advertised for ACP models. Defaults to `32000`. |
 | `initTimeoutMs` | How long one agent may take to initialize. Defaults to `20000`; a failed server is retried in the background under the same bound. |
 | `requestTimeoutMs` | Timeout for the ACP handshake and control calls such as `session/new`. Defaults to `15000`; raise it for agents that start slowly. |
-| `promptTimeoutMs` | How long one ACP turn may run. Defaults to `1800000` (30 minutes); `0` disables the cap. |
+| `promptTimeoutMs` | How long one ACP turn may run, and how long a session stays busy waiting for a command the agent left running in the background. Defaults to `1800000` (30 minutes); `0` disables the cap. |
 | `toolCallDisplay` | `inline` (default) shows finished ACP tool calls as transcript lines on the fallback chat-completions route when OpenCode cannot render native tool cards; `off` hides them. |
 | `mcp` | Expose OpenCode tools to ACP agents through the MCP bridge. Defaults to `true`. |
 | `commands` | Register the agents' own slash commands as namespaced OpenCode commands. Defaults to `true`. See [Commands](#commands). |

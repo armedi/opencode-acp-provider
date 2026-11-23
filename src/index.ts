@@ -17,6 +17,7 @@ import { createShim } from "./shim.ts"
 import { boundedMessages, historyLimits, recentConversation, textOf } from "./prompt.ts"
 import { createAcpLanguageModel } from "./language-model.ts"
 import { createMcpServer } from "./mcp-server.ts"
+import { createBackgroundHold } from "./background-hold.ts"
 import { createSteering, type LocalService } from "./steering.ts"
 import { createSkillMirror } from "./skills.ts"
 import { createCommandBridge } from "./commands.ts"
@@ -518,8 +519,10 @@ export default Plugin.define({
       throw error
     }
 
+    let backgroundHold: ReturnType<typeof createBackgroundHold> | undefined
     const cleanup = async () => {
       disposed = true
+      backgroundHold?.dispose()
       continuations.clear()
       for (const timer of retryTimers) clearTimeout(timer)
       retryTimers.clear()
@@ -691,6 +694,28 @@ export default Plugin.define({
         log,
       })
       registrations.push(await ctx.session.hook("prompt", steer))
+
+      // The session stays busy while its agent's background command runs, and
+      // the command's wake-up continues that same execution.
+      backgroundHold = createBackgroundHold({
+        pending: (sessionID) => manager.pendingBackgroundWork(sessionID),
+        owns: async (sessionID) => {
+          if (typeof ctx.session.get !== "function") return true
+          const session = await ctx.session.get({ sessionID: sessionID as any })
+          return serverForProvider.has(session?.model?.providerID ?? "")
+        },
+        subscribe:
+          typeof ctx.event?.subscribe === "function"
+            ? (signal) =>
+                ctx.event.subscribe({
+                  types: ["session.inbox.enqueued", "session.execution.interrupted"],
+                  signal,
+                }) as AsyncIterable<{ type: string; data?: { sessionID?: unknown } }>
+            : undefined,
+        maxHoldMs: options.promptTimeoutMs,
+      })
+      const hold = backgroundHold
+      registrations.push(await ctx.session.hook("experimental.idle", (event) => hold.idle(event)))
 
       // Hooks must be in place before models become selectable. Discovery then
       // runs in parallel without holding up OpenCode or neighboring providers.

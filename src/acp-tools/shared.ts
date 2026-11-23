@@ -101,9 +101,40 @@ export function diffsOf(update: SessionUpdate): DiffItem[] {
   return diffs
 }
 
-/** codex-acp streams shell and read output through `_meta` rather than `content`. */
-export function terminalOutputDelta(update: SessionUpdate): string | undefined {
-  return literal(record(record(update._meta)?.terminal_output_delta)?.data)
+/**
+ * Agents stream command output through the `_meta` terminal extension rather
+ * than `content`: `terminal_output_delta` appends to what the terminal showed,
+ * and `terminal_output` replaces it.
+ */
+export function terminalOutputChunk(update: SessionUpdate): { data: string; replace: boolean } | undefined {
+  const meta = record(update._meta)
+  const delta = literal(record(meta?.terminal_output_delta)?.data)
+  if (delta !== undefined) return { data: delta, replace: false }
+  const whole = literal(record(meta?.terminal_output)?.data)
+  return whole === undefined ? undefined : { data: whole, replace: true }
+}
+
+/**
+ * Whether the update opens (`terminal_info`) or closes (`terminal_exit`) the
+ * call's display terminal. A command that went to the background reports its
+ * tool call `completed` but keeps its terminal open until the command ends.
+ */
+export function terminalEvents(update: SessionUpdate): { opened: boolean; exited: boolean } {
+  const meta = record(update._meta)
+  return { opened: record(meta?.terminal_info) !== undefined, exited: record(meta?.terminal_exit) !== undefined }
+}
+
+/**
+ * The call's status, including the end of a background command: claude-agent-acp
+ * reports it as a bare `terminal_exit` on the original call, with no status.
+ */
+export function toolUpdateStatus(update: SessionUpdate): string | undefined {
+  const status = text(update.status)
+  if (status) return status
+  const exit = record(record(update._meta)?.terminal_exit)
+  if (!exit) return undefined
+  const code = exit.exit_code
+  return typeof code === "number" && code !== 0 ? "failed" : "completed"
 }
 
 /** OpenCode's question tool is the only ACP tool name with a known native card. */

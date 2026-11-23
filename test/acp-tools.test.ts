@@ -73,6 +73,42 @@ describe("Claude tool mapping", () => {
     expect(state.input).toEqual({ command: "npm test -- --watch=false", timeout: 120000, background: true })
   })
 
+  test("follows a Bash terminal: a replacing chunk, an append, then the result's whole output", () => {
+    const states = toolStates()
+    const terminal = { terminal_id: "claude-Bash" }
+    const update = (overrides: Record<string, unknown>): ToolUpdate => ({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "claude-Bash",
+      ...overrides,
+    })
+    applyToolUpdate(
+      claude("Bash", { command: "bun test" }, {
+        status: "pending",
+        content: [{ type: "terminal", terminalId: "claude-Bash" }],
+        _meta: { claudeCode: { toolName: "Bash" }, terminal_info: terminal },
+      }),
+      states,
+    )
+    applyToolUpdate(update({ _meta: { terminal_output: { ...terminal, data: "1 pass\n" } } }), states)
+    const streaming = applyToolUpdate(update({ _meta: { terminal_output_delta: { ...terminal, data: "2 pass\n" } } }), states)
+    expect(streaming?.output).toBe("1 pass\n2 pass\n")
+    expect(streaming?.done).toBe(false)
+
+    const result = applyToolUpdate(
+      update({
+        status: "completed",
+        content: [{ type: "terminal", terminalId: "claude-Bash" }],
+        _meta: {
+          claudeCode: { toolName: "Bash" },
+          terminal_output: { ...terminal, data: "1 pass\n2 pass\n3 pass\n" },
+          terminal_exit: { ...terminal, exit_code: 0, signal: null },
+        },
+      }),
+      states,
+    )
+    expect(result).toMatchObject({ name: "shell", status: "completed", done: true, output: "1 pass\n2 pass\n3 pass\n" })
+  })
+
   test("maps PowerShell to shell", () => {
     const state = mapped(
       claude("PowerShell", {

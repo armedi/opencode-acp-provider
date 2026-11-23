@@ -291,6 +291,13 @@ export class AcpClient {
     return owner === undefined || session.owner === undefined || session.owner === owner
   }
 
+  /** The `agentInfo.name` the agent reported at `initialize`, such as `@agentclientprotocol/codex-acp`. */
+  get agentName(): string | undefined {
+    const info = this.handshake?.agentInfo
+    const name = info && typeof info === "object" ? (info as { name?: unknown }).name : undefined
+    return typeof name === "string" ? name : undefined
+  }
+
   /** Spawn the agent and run the ACP initialize handshake, restarting if it died. */
   start(): Promise<AgentHandshake> {
     if (this.disposed) return Promise.reject(new AcpError("ACP client stopped"))
@@ -356,6 +363,11 @@ export class AcpClient {
           clientCapabilities: {
             fs: { readTextFile: true, writeTextFile: true },
             terminal: false,
+            // Command output arrives as `_meta.terminal_output_delta` chunks, and
+            // a command's terminal stays open until it ends. That is how a
+            // command the agent sent to the background is told apart from a
+            // finished one: claude-agent-acp reports both as `completed`.
+            _meta: { terminal_output_delta: true },
           },
           clientInfo: { name: "opencode", version: "2" },
         },

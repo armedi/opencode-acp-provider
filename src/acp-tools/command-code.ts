@@ -1,9 +1,11 @@
+import type { SessionUpdate } from "../acp-client.ts"
 import type { ResolvedTool, ToolContext } from "./shared.ts"
 import {
   booleanOf,
   commandOf,
   editInput,
   executeInput,
+  extractOutput,
   finiteNumber,
   firstText,
   globInput,
@@ -132,4 +134,21 @@ export function resolveCommandCode(ctx: ToolContext): ResolvedTool | undefined {
   if (title && (hasLabel(title, "Agent") || title === "task" || title === "agent")) return unchanged(title)
   if (title === "ask_user_question") return unchanged("ask_user_question")
   return undefined
+}
+
+const BACKGROUND_STARTED = "Started shell command in the background."
+
+/**
+ * The task a Command Code shell call left running in the background. Command
+ * Code reports the start only as result text (`Task: …` and `PID: …` lines)
+ * and sends nothing when the command ends, so the process id is the only way
+ * to tell that it still runs.
+ */
+export function commandCodeBackgroundTask(update: SessionUpdate): { taskId: string; pid: number } | undefined {
+  if (text(update.status) !== "completed") return undefined
+  const output = extractOutput(update)
+  if (!output?.startsWith(BACKGROUND_STARTED)) return undefined
+  const taskId = /^Task: (\S+)$/m.exec(output)?.[1]
+  const pid = Number(/^PID: (\d+)$/m.exec(output)?.[1])
+  return taskId && Number.isInteger(pid) && pid > 0 ? { taskId, pid } : undefined
 }
