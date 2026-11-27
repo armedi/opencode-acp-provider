@@ -22,7 +22,7 @@ def api(method, path, data=None):
 
 
 def main():
-    provider, model = (sys.argv[1] if len(sys.argv) > 1 else "acp-claude/sonnet").split("/", 1)
+    provider, model = (sys.argv[1] if len(sys.argv) > 1 else "acp-agy/gemini-4-hydrogen").split("/", 1)
     trials = int(sys.argv[2]) if len(sys.argv) > 2 else 3
     if trials < 1:
         raise ValueError("trials must be positive")
